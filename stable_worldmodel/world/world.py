@@ -54,6 +54,7 @@ from ..wrapper import MegaWrapper
 
 
 RESET_MODES = ('auto', 'wait')
+SUBGOAL_ADVANCE_MODES = ('budget', 'reached', 'both')
 
 
 def _make_env(
@@ -198,6 +199,10 @@ class World:
         goal_offset: int | None = None,
         eval_budget: int | None = None,
         callables: list[dict] | None = None,
+        num_subgoals: int = 1,
+        subgoal_budget: int | None = None,
+        subgoal_advance: str = 'budget',
+        subgoal_tol: float = 0.04,
     ) -> dict:
         """Run the attached policy and return aggregated metrics.
 
@@ -214,6 +219,17 @@ class World:
           ``start_steps[i] + goal_offset``. Run length is capped at
           ``eval_budget`` steps. Requires ``num_envs == len(episodes_idx)``.
 
+        Dataset-driven eval optionally walks a *chain* of oracle subgoals
+        instead of a single one. With ``num_subgoals=K`` the goal shown to
+        the policy steps through the recorded states at
+        ``start + goal_offset``, ``start + 2*goal_offset``, ... so a planner
+        with a short horizon can still complete a long task. The environment's
+        own success target is always the **final** subgoal, so
+        ``success_rate`` keeps meaning "finished the whole replayed segment".
+        Each time the subgoal advances, ``_needs_flush`` is raised for that
+        env, which makes :class:`~stable_worldmodel.policy.WorldModelPolicy`
+        drop its buffered plan and replan against the new goal immediately.
+
         Args:
             episodes: Total episodes to roll out (episodic mode).
             seed: Base seed. Per-env seeds are derived by offsetting it.
@@ -226,7 +242,8 @@ class World:
             dataset: Source dataset for dataset-driven eval.
             episodes_idx: Dataset episode indices, one per env.
             start_steps: Starting step within each dataset episode.
-            goal_offset: Offset from each start step that defines the goal.
+            goal_offset: Offset from each start step that defines the goal
+                (and the spacing between consecutive subgoals).
             eval_budget: Max env steps per episode in dataset mode.
             callables: Per-env setup calls applied on the unwrapped env
                 after reset. Each spec is
@@ -234,10 +251,26 @@ class World:
                 'in_dataset': bool}}}``; if ``in_dataset`` is True, the
                 ``value`` names a key in the sliced dataset state and the
                 per-env value is deep-copied in.
+            num_subgoals: Number of chained oracle subgoals. ``1`` (default)
+                is the single-fixed-goal behavior.
+            subgoal_budget: Env steps to spend on each subgoal before moving
+                on. Defaults to ``goal_offset``.
+            subgoal_advance: When to move to the next subgoal --
+                ``'budget'`` (after ``subgoal_budget`` steps), ``'reached'``
+                (once the env reports the subgoal reached) or ``'both'``
+                (whichever comes first). ``'reached'``/``'both'`` need the
+                unwrapped env to implement
+                ``subgoal_reached(goal_row, tol) -> bool``; without it the
+                schedule silently degrades to ``'budget'``.
+            subgoal_tol: Tolerance handed to ``subgoal_reached``.
 
         Returns:
             A dict with ``'success_rate'`` (percent), ``'episode_successes'``
             (per-episode bool/uint array), and ``'seeds'`` used for reset.
+            Dataset-driven eval also returns ``'subgoal_index'`` (final
+            subgoal each env was working on) and ``'subgoals_reached'``
+            (how many subgoals each env actually reached, as opposed to
+            timing out on).
         """
         if dataset is not None:
             mode = reset_mode or 'wait'
@@ -250,6 +283,10 @@ class World:
                 callables,
                 video,
                 mode,
+                num_subgoals=num_subgoals,
+                subgoal_budget=subgoal_budget,
+                subgoal_advance=subgoal_advance,
+                subgoal_tol=subgoal_tol,
             )
         mode = reset_mode or 'auto'
         return self._evaluate(episodes, seed, options, video, mode)
@@ -532,15 +569,29 @@ class World:
         callables,
         video,
         mode,
+        num_subgoals=1,
+        subgoal_budget=None,
+        subgoal_advance='budget',
+        subgoal_tol=0.04,
     ) -> dict:
         n = len(episodes_idx)
         assert n == self.num_envs
+        if num_subgoals < 1:
+            raise ValueError(f'num_subgoals must be >= 1, got {num_subgoals}')
+        if subgoal_advance not in SUBGOAL_ADVANCE_MODES:
+            raise ValueError(
+                f'subgoal_advance must be one of {SUBGOAL_ADVANCE_MODES}, '
+                f'got {subgoal_advance!r}'
+            )
+        subgoal_budget = subgoal_budget or goal_offset
 
+        # goal_rows[i] is the chain of subgoals for env i, oldest first.
         init_rows, goal_rows, dataset_videos = _extract_init_goal(
             dataset,
             episodes_idx,
             start_steps,
             goal_offset,
+            num_subgoals,
         )
         episode_cols = set(
             getattr(dataset, 'episode_column_names', None) or []
@@ -553,6 +604,10 @@ class World:
                 for row in init_rows
             ]
 
+        # The env's own success target is the LAST subgoal: reaching an
+        # intermediate waypoint is progress, not task completion.
+        final_goal_rows = [rows[-1] for rows in goal_rows]
+
         # Prefer the env's own dataset->reset-options converter when present;
         # it returns the per-env `options` (e.g. `{'state': ...}`) that reset()
         # consumes, so a single batched reset restores every env. Envs without
@@ -564,7 +619,7 @@ class World:
         if has_method:
             opts_list = [
                 self.envs.envs[i].unwrapped.reset_options_from_dataset(
-                    init_rows[i], goal_rows[i]
+                    init_rows[i], final_goal_rows[i]
                 )
                 for i in range(n)
             ]
@@ -573,7 +628,7 @@ class World:
             self.reset(seed=seeds)
             if callables:
                 for i in range(n):
-                    env_init = {**init_rows[i], **goal_rows[i]}
+                    env_init = {**init_rows[i], **final_goal_rows[i]}
                     _apply_callables(
                         self.envs.envs[i].unwrapped, callables, env_init
                     )
@@ -583,11 +638,13 @@ class World:
         # broadcast over the time dim. Episode-scoped columns are excluded
         # by name and columns with per-episode shapes are skipped — those
         # exist for the env resets, not for the planner infos.
-        goal_keys = set(goal_rows[0]) if goal_rows else set()
+        goal_keys = set(goal_rows[0][0]) if goal_rows else set()
         shape_prefix = self.infos['pixels'].shape[:2]
-        for rows in (init_rows, goal_rows):
+
+        def _batch(rows):
+            out = {}
             if not rows:
-                continue
+                return out
             for key in rows[0]:
                 if key == 'action' or key in episode_cols:
                     continue
@@ -599,13 +656,45 @@ class World:
                 if len({v.shape for v in vals}) > 1:
                     continue
                 stacked = np.stack(vals)
-                self.infos[key] = np.broadcast_to(
+                out[key] = np.broadcast_to(
                     stacked[:, None, ...], shape_prefix + stacked.shape[1:]
                 ).copy()
+            return out
 
-        goal_snapshot = {
-            k: self.infos[k].copy() for k in goal_keys if k in self.infos
-        }
+        self.infos.update(_batch(init_rows))
+        # One batched snapshot per subgoal index; each env reads the slice
+        # matching its own position in the chain.
+        goal_snapshots = [
+            _batch([rows[k] for rows in goal_rows])
+            for k in range(num_subgoals)
+        ]
+        snapshot_keys = list(goal_snapshots[0])
+
+        sub_idx = np.zeros(n, dtype=int)
+        steps_on_sub = np.zeros(n, dtype=int)
+        reached_count = np.zeros(n, dtype=int)
+
+        def current_goal():
+            if num_subgoals == 1:
+                return deepcopy(goal_snapshots[0])
+            out = {}
+            for key in snapshot_keys:
+                arr = np.empty_like(goal_snapshots[0][key])
+                for i in range(n):
+                    arr[i] = goal_snapshots[sub_idx[i]][key][i]
+                out[key] = arr
+            return out
+
+        reach_fns = [
+            getattr(env.unwrapped, 'subgoal_reached', None)
+            for env in self.envs.envs
+        ]
+        use_reached = subgoal_advance in ('reached', 'both') and all(
+            fn is not None for fn in reach_fns
+        )
+        use_budget = subgoal_advance in ('budget', 'both') or not use_reached
+
+        self.infos.update(current_goal())
 
         results = {
             'success_rate': 0.0,
@@ -613,34 +702,71 @@ class World:
             'seeds': seeds,
         }
         frames: dict[int, list] = defaultdict(list) if video else None
+        goal_frames: dict[int, list] = defaultdict(list) if video else None
 
         def on_step(world, mask):
-            world.infos.update(deepcopy(goal_snapshot))
             results['episode_successes'] |= world.terminateds
+            steps_on_sub[:] += 1
+
+            advanced = np.zeros(n, dtype=bool)
+            for i in range(n):
+                reached = use_reached and bool(
+                    reach_fns[i](goal_rows[i][sub_idx[i]], subgoal_tol)
+                )
+                if reached:
+                    reached_count[i] = max(reached_count[i], sub_idx[i] + 1)
+                if sub_idx[i] >= num_subgoals - 1:
+                    continue
+                timed_out = use_budget and steps_on_sub[i] >= subgoal_budget
+                if reached or timed_out:
+                    sub_idx[i] += 1
+                    steps_on_sub[i] = 0
+                    advanced[i] = True
+
+            world.infos.update(current_goal())
+            if num_subgoals > 1:
+                # Make WorldModelPolicy drop its buffered plan so the next
+                # call replans against the goal that just changed. Written
+                # unconditionally so a previous step's flag cannot go stale.
+                world.infos['_needs_flush'] = advanced
+
             if frames is not None:
                 for i in range(world.num_envs):
                     f = world.infos['pixels'][i]
                     frame = f[-1] if f.ndim > 3 else f
                     frames[i].append(np.asarray(frame).copy())
+                    goal_frames[i].append(
+                        np.asarray(goal_rows[i][sub_idx[i]]['goal']).copy()
+                    )
 
         self._run(max_steps=eval_budget, mode=mode, on_step=on_step)
 
         results['success_rate'] = (
             float(results['episode_successes'].sum()) / n * 100.0
         )
+        results['subgoal_index'] = sub_idx.copy()
+        results['subgoals_reached'] = reached_count.copy()
+
         if frames:
+            goal_panel = (
+                [rows[-1]['goal'] for rows in goal_rows]
+                if num_subgoals == 1
+                else [np.stack(goal_frames[i]) for i in range(n)]
+            )
             save_panel_videos(
                 Path(video),
                 {
                     'agent': frames,
                     'dataset': dataset_videos,
-                    'goal': [row['goal'] for row in goal_rows],
+                    'goal': goal_panel,
                 },
             )
         return results
 
 
-def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
+def _extract_init_goal(
+    dataset, episodes_idx, start_steps, goal_offset, num_subgoals=1
+):
     """Build per-episode init/goal rows for a dataset-driven evaluation.
 
     Returns ``(init_rows, goal_rows, dataset_videos)``:
@@ -648,15 +774,17 @@ def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
     - ``init_rows[i]``: the requested episode's first-step value per
       per-step column, plus the episode-scoped columns (constants like a
       scene XML — reported by ``dataset.episode_column_names``).
-    - ``goal_rows[i]``: the last chunk step per per-step column, remapped to
-      ``'goal'`` for ``pixels`` and ``'goal_<col>'`` otherwise.
+    - ``goal_rows[i]``: the chain of ``num_subgoals`` goal dicts for episode
+      ``i``, taken at steps ``start + k*goal_offset`` for ``k = 1..K``. Each
+      dict maps ``pixels`` to ``'goal'`` and every other column to
+      ``'goal_<col>'``. With the default ``num_subgoals=1`` the chain holds a
+      single dict for the step at ``start + goal_offset``.
     - ``dataset_videos[i]``: the ``pixels`` window, for the eval panel video.
     """
     ep_idx_arr = np.array(episodes_idx)
     start_arr = np.array(start_steps)
-    data = dataset.load_chunk(
-        ep_idx_arr, start_arr, start_arr + goal_offset + 1
-    )
+    span = goal_offset * num_subgoals
+    data = dataset.load_chunk(ep_idx_arr, start_arr, start_arr + span + 1)
 
     episode_cols = list(getattr(dataset, 'episode_column_names', None) or [])
     episode_data = (
@@ -664,12 +792,12 @@ def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
     )
 
     init_rows: list[dict] = []
-    goal_rows: list[dict] = []
+    goal_rows: list[list[dict]] = []
     dataset_videos: list = []
 
     for i, ep in enumerate(data):
         init_row: dict = {}
-        goal_row: dict = {}
+        chain: list[dict] = [{} for _ in range(num_subgoals)]
         for col in dataset.column_names:
             if col.startswith('goal'):
                 continue
@@ -680,13 +808,18 @@ def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
                 continue
             arr = val.numpy() if isinstance(val, torch.Tensor) else val
             init_row[col] = arr[0]
-            goal_row['goal' if col == 'pixels' else f'goal_{col}'] = arr[-1]
+            goal_key = 'goal' if col == 'pixels' else f'goal_{col}'
+            for k in range(num_subgoals):
+                # Clamp: a short chunk (episode ended early) repeats its last
+                # step rather than raising, so eval degrades instead of dying.
+                idx = min((k + 1) * goal_offset, len(arr) - 1)
+                chain[k][goal_key] = arr[idx]
             if col == 'pixels':
                 dataset_videos.append(arr)
         for col in episode_cols:
             init_row[col] = episode_data[col][i]
         init_rows.append(init_row)
-        goal_rows.append(goal_row)
+        goal_rows.append(chain)
 
     return init_rows, goal_rows, dataset_videos
 

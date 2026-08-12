@@ -2,7 +2,9 @@
 
 import os
 
-os.environ['MUJOCO_GL'] = 'egl'
+# egl is the right default for headless Linux nodes, but it does not exist on
+# macOS -- let an explicitly exported MUJOCO_GL win.
+os.environ.setdefault('MUJOCO_GL', 'egl')
 
 import time
 from pathlib import Path
@@ -142,9 +144,13 @@ def run(cfg: DictConfig):
         else Path(__file__).parent
     )
 
-    # sample the episodes and the starting indices
+    # sample the episodes and the starting indices. With a chain of K oracle
+    # subgoals the replayed window is K * goal_offset long, so a start step is
+    # only valid if the whole chain still fits inside its episode.
+    num_subgoals = int(cfg.eval.get('num_subgoals', 1))
+    goal_span = cfg.eval.goal_offset_steps * num_subgoals
     episode_len = get_episodes_length(dataset, ep_indices)
-    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
+    max_start_idx = episode_len - goal_span - 1
     max_start_idx_dict = {
         ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
     }
@@ -194,6 +200,21 @@ def run(cfg: DictConfig):
         enabled=cfg.get('bf16', False),
     )
 
+    # Envs implementing `reset_options_from_dataset` need no `callables`
+    # block at all, so treat a missing/None entry as "no callables".
+    raw_callables = cfg.eval.get('callables')
+    callables = (
+        OmegaConf.to_container(raw_callables, resolve=True)
+        if raw_callables is not None
+        else None
+    )
+    subgoal_kwargs = dict(
+        num_subgoals=num_subgoals,
+        subgoal_budget=cfg.eval.get('subgoal_budget'),
+        subgoal_advance=cfg.eval.get('subgoal_advance', 'budget'),
+        subgoal_tol=cfg.eval.get('subgoal_tol', 0.04),
+    )
+
     if cfg.get('compile', False):
         print('Warming up compiled model...')
         warmup_autocast_ctx = torch.autocast(
@@ -209,10 +230,9 @@ def run(cfg: DictConfig):
                 goal_offset=cfg.eval.goal_offset_steps,
                 eval_budget=cfg.eval.eval_budget,
                 episodes_idx=eval_episodes.tolist()[:n],
-                callables=OmegaConf.to_container(
-                    cfg.eval.get('callables'), resolve=True
-                ),
+                callables=callables,
                 video=results_path,
+                **subgoal_kwargs,
             )
         print('Warmup done.')
 
@@ -224,10 +244,9 @@ def run(cfg: DictConfig):
             goal_offset=cfg.eval.goal_offset_steps,
             eval_budget=cfg.eval.eval_budget,
             episodes_idx=eval_episodes.tolist(),
-            callables=OmegaConf.to_container(
-                cfg.eval.get('callables'), resolve=True
-            ),
+            callables=callables,
             video=results_path,
+            **subgoal_kwargs,
         )
     end_time = time.time()
 

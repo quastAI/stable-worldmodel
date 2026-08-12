@@ -982,14 +982,15 @@ class CubeEnv(ManipSpaceEnv):
         grid_texture.rgb2 = self.variation_space['floor']['color'].value[1]
 
         # Modify arm color
-        agent_color_changed = np.allclose(
-            mjcf_model.find('material', 'ur5e/robotiq/black').rgba[:3],
-            self.variation_space['agent']['color'].value,
-        )
-        agent_color_changed = agent_color_changed or np.allclose(
-            mjcf_model.find('material', 'ur5e/robotiq/pad_gray').rgba[:3],
-            self.variation_space['agent']['color'].value,
-        )
+        agent_color = self.variation_space['agent']['color'].value
+        agent_color_changed = False
+        for material_name in ('ur5e/robotiq/black', 'ur5e/robotiq/pad_gray'):
+            rgba = mjcf_model.find('material', material_name).rgba
+            # Dirty only when the value actually differs. This mirrors the
+            # other checks in this method; getting the sense backwards forced
+            # a full recompile on every single reset.
+            if rgba is None or not np.allclose(rgba[:3], agent_color):
+                agent_color_changed = True
         mjcf_model.find('material', 'ur5e/robotiq/black').rgba[:3] = (
             self.variation_space['agent']['color'].value
         )

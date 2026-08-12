@@ -64,6 +64,7 @@ class ExpertPolicy(BasePolicy):
         single_env = self.env.envs[0].unwrapped
         assert single_env.spec.id in [
             'swm/OGBCube-v0',
+            'swm/OGBCubeDR-v0',
             'swm/OGBScene-v0',
         ], (
             'OGBCollectionPolicy can only be used with OGBench Manipulation environments.'
