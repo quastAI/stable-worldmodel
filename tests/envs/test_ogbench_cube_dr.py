@@ -17,6 +17,8 @@ pytest.importorskip('mujoco')
 
 from stable_worldmodel.envs.ogbench.cube_env import CubeEnv  # noqa: E402
 from stable_worldmodel.envs.ogbench.dr_cube_env import (  # noqa: E402
+    DIRECTIONAL_LIGHT_ROWS,
+    LIGHT_NAMES,
     DRCubeEnv,
     render_digit_png,
 )
@@ -33,9 +35,13 @@ RECOMPILE_FREE_VARIATIONS = [
     'light.headlight_diffuse',
     'background.floor_material',
     'background.wall_material',
+    'background.floor_rgb',
+    'background.wall_rgb',
     'digit.value',
     'digit.position',
     'digit.yaw',
+    'digit.count',
+    'digit.size',
     'cube.start_position',
     'cube.start_yaw',
     'cube.goal_position',
@@ -105,6 +111,128 @@ class TestVariationSpace:
         e = make_env(num_digits=0)
         assert 'digit.value' not in set(e.variation_space.names())
 
+    def test_cube_size_stops_at_the_effector_clip_plane(self, env):
+        """Below this the oracle would grasp above the cube's center."""
+        assert env.variation_space['cube']['size'].low.min() >= 0.015
+
+
+class TestSeparation:
+    """Cube starts and digit decals must not be sampled on top of each other."""
+
+    @staticmethod
+    def _min_gap(positions):
+        positions = np.asarray(positions).reshape(-1, 2)
+        deltas = positions[:, None, :] - positions[None, :, :]
+        distances = np.linalg.norm(deltas, axis=-1)
+        iu = np.triu_indices(len(positions), k=1)
+        return distances[iu].min()
+
+    def test_cubes_never_start_interpenetrating(self):
+        e = make_env()
+        for seed in range(12):
+            e.reset(
+                seed=seed,
+                options={'variation': ['cube.size', 'cube.start_position']},
+            )
+            sizes = np.asarray(e.variation_space['cube']['size'].value)
+            positions = e.variation_space['cube']['start_position'].value
+            # Circumradius, so the test holds at any yaw.
+            assert self._min_gap(positions) >= 2 * sizes.min() * np.sqrt(2) - 1e-6
+
+    def test_digits_never_cover_each_other(self):
+        e = make_env()
+        for seed in range(12):
+            e.reset(
+                seed=seed,
+                options={'variation': ['digit.size', 'digit.position']},
+            )
+            sizes = np.asarray(e.variation_space['digit']['size'].value)
+            positions = e.variation_space['digit']['position'].value
+            assert self._min_gap(positions) >= 2 * sizes.min() * np.sqrt(2) - 1e-6
+
+    def test_defaults_satisfy_the_predicates(self):
+        """The inherited default puts every cube at the same xy."""
+        e = make_env()
+        assert e.variation_space.check(debug=True)
+        positions = e.variation_space['cube']['start_position'].value
+        assert self._min_gap(positions) > 0.05
+
+    def test_predicates_are_optional(self):
+        e = make_env(enforce_separation=False)
+        e.reset(seed=0, options={'variation': ['all']})
+        assert e.variation_space.check(debug=True)
+
+
+class TestBackgroundColor:
+    def test_floor_and_wall_take_independent_colors(self):
+        e = make_env()
+        e.reset(seed=5, options={'variation': ['all']})
+        floor_mat = e._model.geom_matid[e._floor_geom_id]
+        wall_mat = e._model.geom_matid[e._backdrop_geom_ids[0]]
+        np.testing.assert_allclose(
+            e._model.mat_rgba[floor_mat][:3],
+            e.variation_space['background']['floor_rgb'].value,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            e._model.mat_rgba[wall_mat][:3],
+            e.variation_space['background']['wall_rgb'].value,
+            atol=1e-6,
+        )
+
+    def test_pools_never_share_a_material(self, env):
+        """Index 1 used to be one `plain` material in both pools.
+
+        Sharing it silently forced the floor and the backdrop to the same
+        color whenever both sampled that index.
+        """
+        assert not set(env._bg_floor_matids) & set(env._bg_wall_matids)
+
+    def test_colors_reach_the_render(self):
+        e = make_env(width=64, height=64)
+        seen = set()
+        for seed in range(4):
+            e.reset(
+                seed=seed,
+                options={
+                    'variation': [
+                        'background.floor_rgb',
+                        'background.wall_rgb',
+                    ]
+                },
+            )
+            seen.add(e.render().mean().round(2))
+        assert len(seen) > 1
+
+
+class TestDigitCountAndSize:
+    def test_surplus_decals_are_parked_out_of_frame(self):
+        e = make_env()
+        e.reset(seed=4, options={'variation': ['digit.count']})
+        count = int(e.variation_space['digit']['count'].value)
+        for i in range(e._num_digits):
+            z = e._data.mocap_pos[e._digit_mocap_ids[i]][2]
+            assert (z > 0) == (i < count)
+
+    def test_visibility_is_exported(self):
+        e = make_env()
+        _, info = e.reset(seed=4, options={'variation': ['digit.count']})
+        count = int(info['privileged/digit_count'][0])
+        visible = [
+            int(info[f'privileged/digit_{i}_visible'][0])
+            for i in range(e._num_digits)
+        ]
+        assert sum(visible) == count
+
+    def test_sizes_reach_the_model(self):
+        e = make_env()
+        e.reset(seed=6, options={'variation': ['digit.size']})
+        sizes = e.variation_space['digit']['size'].value
+        for i in range(e._num_digits):
+            geom_size = e._model.geom_size[e._digit_geom_ids[i]]
+            assert geom_size[0] == pytest.approx(sizes[i])
+            assert geom_size[1] == pytest.approx(sizes[i])
+
 
 class TestNoRecompile:
     def test_dr_axes_never_recompile(self):
@@ -144,7 +272,14 @@ class TestVisualVariationApplied:
             )
             seen_floor.add(int(e._model.geom_matid[e._floor_geom_id]))
             seen_digit_mat.add(int(e._model.geom_matid[e._digit_geom_ids[0]]))
-            seen_light.add(tuple(np.round(e._model.light_pos[0], 5)))
+            # Light 0 is directional and its position is pinned, so watch a
+            # light whose position MuJoCo actually uses.
+            positioned = next(
+                row
+                for row in range(len(LIGHT_NAMES))
+                if row not in DIRECTIONAL_LIGHT_ROWS
+            )
+            seen_light.add(tuple(np.round(e._model.light_pos[positioned], 5)))
 
         assert len(seen_floor) > 1
         assert len(seen_digit_mat) > 1
@@ -180,7 +315,28 @@ class TestPrivilegedInfo:
         _, info = env.reset(seed=2)
         assert info['privileged/floor_material'].shape == (1,)
         assert info['privileged/wall_material'].shape == (1,)
-        assert info['privileged/light_pos'].shape == (2 * 3,)
+        assert info['privileged/floor_rgb'].shape == (3,)
+        assert info['privileged/wall_rgb'].shape == (3,)
+        assert info['privileged/light_dir'].shape == (2 * 3,)
+
+    def test_directional_light_position_is_not_exported(self, env):
+        """A directional light's position never reaches a pixel.
+
+        Exporting it would hand a latent probe a target it can only fit noise
+        to, so only the positioned lights appear.
+        """
+        _, info = env.reset(seed=2)
+        positioned = len(LIGHT_NAMES) - len(DIRECTIONAL_LIGHT_ROWS)
+        assert info['privileged/light_pos'].shape == (positioned * 3,)
+
+    def test_directional_light_position_is_pinned(self, env):
+        position = env.variation_space['light']['position']
+        for row in DIRECTIONAL_LIGHT_ROWS:
+            np.testing.assert_allclose(position.low[row], position.high[row])
+
+    def test_declared_directional_rows_match_the_model(self, env):
+        env.reset(seed=2)
+        env._verify_directional_lights()  # raises if the constant went stale
 
     def test_cube_keys_still_there(self, env):
         _, info = env.reset(seed=2)
@@ -215,12 +371,62 @@ class TestSizeAwareGeometry:
         # task5_stack is a 4-high tower; rebuild the expected ladder.
         stock = CubeEnv.set_tasks
         assert stock is not None  # the ladder lives in the parent
-        rescaled = e._rescaled_task_info(e.task_infos[4])
+        identity = np.arange(e._num_cubes)
+        rescaled = e._rescaled_task_info(e.task_infos[4], identity)
         halves = e.variation_space['cube']['size'].value
+
+        # Each cube rests on the one below it in its column, so its height is
+        # the running sum of the *supporting* cubes' full extents, not a
+        # multiple of its own.
+        bottom = 0.0
         for i, half in enumerate(halves):
-            assert rescaled['goal_xyzs'][i][2] == pytest.approx(
-                half + 2 * half * i
-            )
+            assert rescaled['goal_xyzs'][i][2] == pytest.approx(bottom + half)
+            bottom += 2 * half
+
+    def test_stacked_waypoints_use_the_supporting_cube(self):
+        """A layer-1 cube sits on layer 0's height, not on its own."""
+        e = make_env(mode='task', permute_blocks=False)
+        e.reset(seed=1, options={'variation': []})
+        e.variation_space['cube']['size'].set_value(
+            np.array([0.03, 0.015, 0.02, 0.02][: e._num_cubes])
+        )
+        identity = np.arange(e._num_cubes)
+        rescaled = e._rescaled_task_info(e.task_infos[4], identity)
+        # Cube 0 (half 0.03) is the base; cube 1 (half 0.015) rests on top of
+        # it, so it sits at 2 * 0.03 + 0.015, not at 3 * 0.015.
+        assert rescaled['goal_xyzs'][0][2] == pytest.approx(0.03)
+        assert rescaled['goal_xyzs'][1][2] == pytest.approx(0.075)
+
+    def test_rows_are_permuted_before_the_heights_are_built(self):
+        """Row i must belong to cube i, or the half-extents get swapped."""
+        e = make_env(mode='task', permute_blocks=False)
+        e.reset(seed=1, options={'variation': []})
+        e.variation_space['cube']['size'].set_value(
+            np.array([0.03, 0.015, 0.02, 0.02][: e._num_cubes])
+        )
+        permutation = np.array([1, 0] + list(range(2, e._num_cubes)))
+        rescaled = e._rescaled_task_info(e.task_infos[4], permutation)
+        # The tower is the same shape with the two cubes exchanged: cube 1
+        # (half 0.015) is now the base and cube 0 (half 0.03) sits on it.
+        assert rescaled['goal_xyzs'][1][2] == pytest.approx(0.015)
+        assert rescaled['goal_xyzs'][0][2] == pytest.approx(0.06)
+
+    def test_effector_clip_plane_follows_the_smallest_cube(self):
+        e = make_env()
+        e.reset(seed=3, options={'variation': ['cube.size']})
+        smallest = float(np.min(e.variation_space['cube']['size'].value))
+        assert e._workspace_bounds[0][2] == pytest.approx(
+            min(0.02, smallest)
+        )
+
+    def test_clip_plane_does_not_ratchet_down(self):
+        e = make_env()
+        e.reset(seed=3, options={'variation': ['cube.size']})
+        e.variation_space['cube']['size'].set_value(
+            np.full(e._num_cubes, 0.03)
+        )
+        e._apply_size_aware_workspace()
+        assert e._workspace_bounds[0][2] == pytest.approx(0.02)
 
 
 class TestDatasetReset:

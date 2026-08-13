@@ -15,13 +15,25 @@ What it adds on top of ``CubeEnv``:
   each episode picks an index and swaps ``geom_matid``. Optional opaque
   backdrop panels give the camera a randomizable background instead of the
   static skybox.
-* **Floor digit distractors** -- ``num_digits`` non-colliding mocap decals, each
-  showing one of ten pre-baked digit textures at a randomized floor position and
-  yaw. Their ground-truth value and position are exported under
+* **Continuous floor and backdrop color** -- ``background.floor_rgb`` and
+  ``background.wall_rgb`` write ``mat_rgba`` on whichever pool entry the
+  episode selected. Every pool material is authored white, so the axis is the
+  material's color outright on the untextured entries and a tint on the
+  textured ones. Both are independent: the floor and the backdrop never share
+  a material.
+* **Floor digit distractors** -- up to ``num_digits`` non-colliding mocap
+  decals, each showing one of ten pre-baked digit textures at a randomized
+  floor position, size and yaw, with the per-episode count randomized too.
+  Their ground-truth value, position, size and visibility are exported under
   ``privileged/digit_{i}_*`` so a linear probe can ask whether the learned
   representation retained them.
 * **Size-consistent geometry** -- resting heights, stacking offsets and task
-  waypoints scale with the per-cube half-extent instead of assuming ``0.02``.
+  waypoints scale with the per-cube half-extent instead of assuming ``0.02``,
+  and the effector clip plane follows the smallest cube in play.
+* **Non-overlapping samples** -- cube start positions and digit decal
+  positions are drawn with a pairwise-separation predicate, so an episode
+  never begins with interpenetrating cubes or with one decal covering
+  another that the privileged info still reports as fully visible.
 
 Recompilation cost
 ------------------
@@ -71,6 +83,16 @@ from stable_worldmodel.envs.ogbench.cube_env import CubeEnv
 # these two are exactly the lights present after compilation.
 LIGHT_NAMES = ('global', 'spotlight')
 
+# Rows of `light.position` that MuJoCo ignores when shading. `floor_wall.xml`
+# declares `global` as `directional="true"`, and a directional light is shaded
+# from `light_dir` alone -- its position never reaches a pixel. Those rows are
+# pinned in the variation space and withheld from the privileged info, so a
+# probe is never handed a target it cannot possibly fit. Declared rather than
+# detected because the model is not compiled until the first reset, long after
+# the variation space is built; `post_compilation_objects` checks it against
+# the compiled model so this constant cannot silently go stale.
+DIRECTIONAL_LIGHT_ROWS = (0,)
+
 # `light.intensity` is inherited from CubeEnv but disabled here: the parent
 # applies it by editing the MJCF and recompiling, which this class replaces
 # with the recompile-free `light.diffuse` axis. Pinning it to the stock value
@@ -88,6 +110,23 @@ DEFAULT_VARIATIONS = (
 # Digit decals sit this far above the floor plane to avoid z-fighting.
 DIGIT_Z = 0.0015
 DIGIT_HALF_EXTENT = 0.03
+DIGIT_SIZE_RANGE = (0.02, 0.045)
+
+# Where surplus decals are parked when `digit.count` hides them. Mirrors how
+# `CubeEnv.set_new_target` hides the non-target cube markers.
+HIDDEN_Z = -0.5
+
+# Minimum cube half-extent. `ManipSpaceEnv` clips the effector target to
+# `_workspace_bounds`, whose z floor is 0.02, so a cube smaller than that gets
+# grasped above its center instead of at it. `initialize_episode` lowers that
+# clip to follow the smallest cube in play, and this bound keeps it from
+# dropping far enough for the gripper pads to scrape the floor.
+MIN_CUBE_SIZE = 0.015
+
+# Slack, in meters, on the pairwise-separation predicates. Dataset replay
+# round-trips positions through float32, so a sample that sat exactly on the
+# threshold during collection must still validate on the way back in.
+SEPARATION_SLACK = 1e-4
 
 
 @functools.lru_cache(maxsize=16)
@@ -210,6 +249,9 @@ class DRCubeEnv(CubeEnv):
         digit_bounds=((0.22, -0.36), (0.62, 0.36)),
         add_backdrop: bool = True,
         size_aware_geometry: bool = True,
+        min_cube_size: float = MIN_CUBE_SIZE,
+        digit_size_range=DIGIT_SIZE_RANGE,
+        enforce_separation: bool = True,
         *args,
         **kwargs,
     ):
@@ -229,9 +271,17 @@ class DRCubeEnv(CubeEnv):
             add_backdrop: Whether to add opaque, collision-free backdrop panels
                 behind and beside the workspace. Disable to keep the stock
                 skybox background.
-            size_aware_geometry: Whether resting heights, stack offsets and
-                task waypoints scale with the per-cube half-extent. Disable to
-                reproduce ``CubeEnv`` behavior exactly.
+            size_aware_geometry: Whether resting heights, stack offsets, task
+                waypoints and the effector clip plane scale with the per-cube
+                half-extent. Disable to reproduce ``CubeEnv`` behavior exactly.
+            min_cube_size: Lower bound of the ``cube.size`` half-extent axis.
+                Also the floor under the size-aware effector clip plane. See
+                :data:`MIN_CUBE_SIZE`.
+            digit_size_range: ``(lo, hi)`` half-extent range of the digit
+                decals.
+            enforce_separation: Whether cube start positions and digit
+                positions are drawn with a pairwise-separation predicate.
+                Disable to reproduce the unconstrained i.i.d. sampling.
             *args: Forwarded to :class:`CubeEnv`.
             **kwargs: Forwarded to :class:`CubeEnv`.
         """
@@ -241,8 +291,17 @@ class DRCubeEnv(CubeEnv):
         self._digit_bounds = np.asarray(digit_bounds, dtype=np.float64)
         self._add_backdrop = bool(add_backdrop)
         self._size_aware_geometry = bool(size_aware_geometry)
+        self._min_cube_size = float(min_cube_size)
+        self._digit_size_range = tuple(float(v) for v in digit_size_range)
+        self._enforce_separation = bool(enforce_separation)
+        self._directional_light_rows = DIRECTIONAL_LIGHT_ROWS
 
         super().__init__(*args, **kwargs)
+
+        # Captured before any episode narrows it, so the size-aware clip plane
+        # is always recomputed from the stock value rather than from whatever
+        # the previous episode left behind.
+        self._stock_workspace_z = float(self._workspace_bounds[0][2])
 
         self.env_name = 'CubeDR'
         self._extend_variation_space()
@@ -252,8 +311,19 @@ class DRCubeEnv(CubeEnv):
     # ------------------------------------------------------------------
 
     def _extend_variation_space(self):
-        """Replace ``light`` and add ``background`` / ``digit`` sub-spaces."""
+        """Replace ``cube`` / ``light`` and add ``background`` / ``digit``."""
         n_lights = len(LIGHT_NAMES)
+
+        # A directional light has no position -- MuJoCo shades from `light_dir`
+        # alone -- so those rows are pinned to their defaults. Sampling them
+        # would add a phantom axis and, worse, put a target with no image
+        # correlate into the privileged info that latent probes train on.
+        pos_low = np.array([[-0.6, -0.6, 1.2], [0.05, -0.35, 0.30]])
+        pos_high = np.array([[0.6, 0.6, 2.6], [0.65, 0.35, 0.85]])
+        pos_init = np.array([[0.0, 0.0, 2.0], [0.25, 0.0, 0.5]])
+        for row in self._directional_light_rows:
+            pos_low[row] = pos_init[row]
+            pos_high[row] = pos_init[row]
 
         light_space = swm_spaces.Dict(
             {
@@ -266,11 +336,11 @@ class DRCubeEnv(CubeEnv):
                     init_value=np.array([PINNED_LIGHT_INTENSITY]),
                 ),
                 'position': swm_spaces.Box(
-                    low=np.array([[-0.6, -0.6, 1.2], [0.05, -0.35, 0.30]]),
-                    high=np.array([[0.6, 0.6, 2.6], [0.65, 0.35, 0.85]]),
+                    low=pos_low,
+                    high=pos_high,
                     shape=(n_lights, 3),
                     dtype=np.float64,
-                    init_value=np.array([[0.0, 0.0, 2.0], [0.25, 0.0, 0.5]]),
+                    init_value=pos_init,
                 ),
                 'direction': swm_spaces.Box(
                     low=np.tile([-0.6, -0.6, -1.0], (n_lights, 1)),
@@ -310,6 +380,10 @@ class DRCubeEnv(CubeEnv):
             }
         )
 
+        # Every pool material is authored white, so these are the material's
+        # color outright on the untextured entries and a multiplicative tint on
+        # the textured ones. `wall_rgb` defaults to the stock backdrop color so
+        # an unrandomized episode still renders exactly as it did before.
         background_space = swm_spaces.Dict(
             {
                 'floor_material': swm_spaces.Discrete(
@@ -318,15 +392,31 @@ class DRCubeEnv(CubeEnv):
                 'wall_material': swm_spaces.Discrete(
                     self._num_bg_materials, init_value=1
                 ),
+                'floor_rgb': swm_spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(3,),
+                    dtype=np.float64,
+                    init_value=np.ones(3),
+                ),
+                'wall_rgb': swm_spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(3,),
+                    dtype=np.float64,
+                    init_value=np.array([0.15, 0.18, 0.25]),
+                ),
             }
         )
 
         spaces_dict = dict(self.variation_space.spaces)
+        spaces_dict['cube'] = self._rebuilt_cube_space()
         spaces_dict['light'] = light_space
         spaces_dict['background'] = background_space
 
         if self._num_digits > 0:
             lo, hi = self._digit_bounds
+            size_lo, size_hi = self._digit_size_range
             spaces_dict['digit'] = swm_spaces.Dict(
                 {
                     'value': swm_spaces.MultiDiscrete(
@@ -334,12 +424,25 @@ class DRCubeEnv(CubeEnv):
                         init_value=np.arange(self._num_digits, dtype=np.int64)
                         % 10,
                     ),
+                    'count': swm_spaces.Discrete(
+                        self._num_digits + 1, init_value=self._num_digits
+                    ),
+                    'size': swm_spaces.Box(
+                        low=size_lo,
+                        high=size_hi,
+                        shape=(self._num_digits,),
+                        dtype=np.float64,
+                        init_value=np.full(
+                            self._num_digits, DIGIT_HALF_EXTENT
+                        ),
+                    ),
                     'position': swm_spaces.Box(
                         low=np.tile(lo, (self._num_digits, 1)),
                         high=np.tile(hi, (self._num_digits, 1)),
                         shape=(self._num_digits, 2),
                         dtype=np.float64,
                         init_value=self._default_digit_positions(),
+                        constrain_fn=self._digits_are_separated,
                     ),
                     'yaw': swm_spaces.Box(
                         low=0.0,
@@ -348,10 +451,168 @@ class DRCubeEnv(CubeEnv):
                         dtype=np.float64,
                         init_value=np.zeros(self._num_digits),
                     ),
-                }
+                },
+                # `position`'s predicate reads the sampled sizes, so `size` has
+                # to be drawn first.
+                sampling_order=[
+                    'value',
+                    'count',
+                    'size',
+                    'position',
+                    'yaw',
+                ],
             )
 
         self.variation_space = swm_spaces.Dict(spaces_dict)
+
+    def _rebuilt_cube_space(self) -> swm_spaces.Dict:
+        """Rebuild the inherited ``cube`` sub-space with two changes.
+
+        ``size`` gets a floor of ``min_cube_size`` so the axis stops running
+        past the effector clip plane, and ``start_position`` gets a
+        pairwise-separation predicate plus a spread-out default -- the
+        inherited default puts every cube at the same xy, which the predicate
+        would otherwise reject at reset.
+        """
+        cube = dict(self.variation_space['cube'].spaces)
+        n = self._num_cubes
+
+        cube['size'] = swm_spaces.Box(
+            low=self._min_cube_size,
+            high=0.03,
+            shape=(n,),
+            dtype=np.float64,
+            init_value=0.02 * np.ones((n,), dtype=np.float64),
+        )
+        cube['start_position'] = swm_spaces.Box(
+            low=np.tile(self._object_sampling_bounds[0], (n, 1)),
+            high=np.tile(self._object_sampling_bounds[1], (n, 1)),
+            shape=(n, 2),
+            dtype=np.float64,
+            init_value=self._default_cube_positions(),
+            constrain_fn=self._cubes_are_separated,
+        )
+
+        return swm_spaces.Dict(
+            cube,
+            # `start_position`'s predicate reads the sampled sizes.
+            sampling_order=[
+                'color',
+                'size',
+                'start_position',
+                'start_yaw',
+                'goal_position',
+                'goal_yaw',
+            ],
+        )
+
+    def _verify_directional_lights(self):
+        """Check :data:`DIRECTIONAL_LIGHT_ROWS` against the compiled model.
+
+        Raises:
+            RuntimeError: If the scene's directional lights are not the ones
+                the variation space pinned. Getting this wrong either wastes a
+                variation axis or, worse, ships an unlearnable probe target.
+        """
+        types = np.asarray(self._model.light_type)[
+            np.asarray(self._light_ids, dtype=int)
+        ]
+        directional = int(mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+        actual = tuple(int(r) for r in np.flatnonzero(types == directional))
+        if actual != tuple(self._directional_light_rows):
+            raise RuntimeError(
+                'DIRECTIONAL_LIGHT_ROWS is stale: `light.position` pins rows '
+                f'{tuple(self._directional_light_rows)} but the compiled model '
+                f'has directional lights at rows {actual}.'
+            )
+
+    # ------------------------------------------------------------------
+    # separation predicates
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pairwise_clear(positions, radii) -> bool:
+        """Whether every pair of xy positions clears the sum of its radii.
+
+        Args:
+            positions: ``(n, 2)`` xy positions.
+            radii: ``(n,)`` per-item clearance radius.
+
+        Returns:
+            True if no pair is closer than ``radii[i] + radii[j]``.
+        """
+        positions = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+        radii = np.asarray(radii, dtype=np.float64).reshape(-1)
+        if len(positions) < 2:
+            return True
+
+        deltas = positions[:, None, :] - positions[None, :, :]
+        distances = np.linalg.norm(deltas, axis=-1)
+        needed = radii[:, None] + radii[None, :] - SEPARATION_SLACK
+        iu = np.triu_indices(len(positions), k=1)
+        return bool(np.all(distances[iu] >= needed[iu]))
+
+    def _cubes_are_separated(self, positions) -> bool:
+        """Reject cube starts that would begin the episode interpenetrating.
+
+        The inherited sampler draws each cube's xy i.i.d., which at the top of
+        the ``cube.size`` range overlaps a pair in roughly two episodes in
+        five. Uses the circumradius (``half * sqrt(2)``) so the test holds at
+        any ``start_yaw``.
+        """
+        if not self._enforce_separation:
+            return True
+        return self._pairwise_clear(
+            positions, self._current_cube_sizes() * np.sqrt(2.0)
+        )
+
+    def _digits_are_separated(self, positions) -> bool:
+        """Reject decal layouts where one digit covers another.
+
+        Overlapping decals are coplanar, so the depth-test tie goes to draw
+        order and one digit is silently occluded -- while its
+        ``privileged/digit_{i}_value`` still reports it in full. That is label
+        noise aimed straight at the probe the decals exist to support.
+        """
+        if not self._enforce_separation:
+            return True
+        return self._pairwise_clear(
+            positions, self._current_digit_sizes() * np.sqrt(2.0)
+        )
+
+    def _current_cube_sizes(self) -> np.ndarray:
+        """Per-cube half-extents, falling back to the stock size."""
+        try:
+            value = self.variation_space['cube']['size'].value
+        except (AttributeError, KeyError, TypeError):
+            value = None
+        if value is None:
+            return np.full(self._num_cubes, 0.02)
+        return np.asarray(value, dtype=np.float64).reshape(-1)
+
+    def _current_digit_sizes(self) -> np.ndarray:
+        """Per-decal half-extents, falling back to the stock size."""
+        try:
+            value = self.variation_space['digit']['size'].value
+        except (AttributeError, KeyError, TypeError):
+            value = None
+        if value is None:
+            return np.full(self._num_digits, DIGIT_HALF_EXTENT)
+        return np.asarray(value, dtype=np.float64).reshape(-1)
+
+    def _default_cube_positions(self) -> np.ndarray:
+        """Spread-out default cube starts that satisfy the predicate.
+
+        ``CubeEnv`` defaults every cube to the same xy, which the separation
+        predicate rejects -- and which would drop four coincident cubes into
+        the scene on any reset that does not resample ``start_position``.
+        """
+        lo, hi = self._object_sampling_bounds
+        n = self._num_cubes
+        frac = (np.arange(n) + 0.5) / n
+        y = lo[1] + frac * (hi[1] - lo[1])
+        x = lo[0] + ((np.arange(n) % 2) * 0.6 + 0.2) * (hi[0] - lo[0])
+        return np.stack([x, y], axis=1)
 
     def _default_digit_positions(self) -> np.ndarray:
         """Deterministic, evenly spread default positions inside the bounds."""
@@ -434,11 +695,16 @@ class DRCubeEnv(CubeEnv):
         and looking it up in the matching pool keeps a single variation axis
         while rendering correctly on both.
 
-        Index 0 reuses the stock ``grid`` checkerboard so the inherited
-        ``floor.color`` axis keeps working; index 1 is a plain dark material
-        matching the skybox. Remaining entries are procedural, generated from a
-        fixed seed so the pool is byte-identical in every process -- a dataset
-        that stores only the index can therefore be replayed exactly.
+        Index 0 reuses the stock ``grid`` checkerboard; index 1 is a plain
+        material. Remaining entries are procedural, generated from a fixed seed
+        so the pool is byte-identical in every process -- a dataset that stores
+        only the index can therefore be replayed exactly.
+
+        Every entry is authored white and gets its color from
+        ``background.floor_rgb`` / ``background.wall_rgb`` at episode start, so
+        the two pools must not share an element: index 1 used to be one
+        ``plain`` material in both, which silently forced the floor and the
+        backdrop to the same color whenever both sampled it.
         """
         # Cube-mapped twin of the stock `grid` checker, for the box panels.
         arena_mjcf.asset.add(
@@ -459,20 +725,25 @@ class DRCubeEnv(CubeEnv):
             texture='bg_tex_grid_cube',
             texuniform=True,
         )
-        # An untextured material renders the same on any geom type.
-        plain = arena_mjcf.asset.add(
-            'material',
-            name='bg_mat_plain',
-            rgba=(0.15, 0.18, 0.25, 1.0),
-            specular=0.0,
-            shininess=0.0,
+        # An untextured material renders the same on any geom type, but the
+        # floor and the backdrop each need their own so their colors stay
+        # independent.
+        plain_floor, plain_wall = (
+            arena_mjcf.asset.add(
+                'material',
+                name=name,
+                rgba=(1.0, 1.0, 1.0, 1.0),
+                specular=0.0,
+                shininess=0.0,
+            )
+            for name in ('bg_mat_plain_floor', 'bg_mat_plain_wall')
         )
 
         self._bg_floor_material_elems = [
             arena_mjcf.find('material', 'grid'),
-            plain,
+            plain_floor,
         ]
-        self._bg_wall_material_elems = [grid_cube, plain]
+        self._bg_wall_material_elems = [grid_cube, plain_wall]
 
         images = []
         if self._bg_image_dir is not None:
@@ -581,7 +852,7 @@ class DRCubeEnv(CubeEnv):
                     type='box',
                     pos=pos,
                     size=size,
-                    material='bg_mat_plain',
+                    material='bg_mat_plain_wall',
                     contype=0,
                     conaffinity=0,
                     group=1,
@@ -630,6 +901,7 @@ class DRCubeEnv(CubeEnv):
             self._model.light(elem.full_identifier).id
             for elem in self._light_elems
         ]
+        self._verify_directional_lights()
 
     # ------------------------------------------------------------------
     # per-episode visual randomization (post-compilation, no recompile)
@@ -660,26 +932,36 @@ class DRCubeEnv(CubeEnv):
         background = self.variation_space['background']
         floor_idx = int(background['floor_material'].value)
         wall_idx = int(background['wall_material'].value)
-        self._model.geom_matid[self._floor_geom_id] = self._bg_floor_matids[
-            floor_idx
-        ]
+        floor_matid = self._bg_floor_matids[floor_idx]
+        wall_matid = self._bg_wall_matids[wall_idx]
+        self._model.geom_matid[self._floor_geom_id] = floor_matid
         for gid in self._backdrop_geom_ids:
-            self._model.geom_matid[gid] = self._bg_wall_matids[wall_idx]
+            self._model.geom_matid[gid] = wall_matid
+
+        # Only the selected entry is visible, so tinting it alone is enough --
+        # and every entry is re-tinted before it is ever shown again.
+        self._model.mat_rgba[floor_matid, :3] = background['floor_rgb'].value
+        self._model.mat_rgba[wall_matid, :3] = background['wall_rgb'].value
 
         if self._num_digits:
             digit = self.variation_space['digit']
             values = np.asarray(digit['value'].value, dtype=np.int64)
             positions = np.asarray(digit['position'].value, dtype=np.float64)
             yaws = np.asarray(digit['yaw'].value, dtype=np.float64)
+            sizes = np.asarray(digit['size'].value, dtype=np.float64)
+            count = int(digit['count'].value)
             for i in range(self._num_digits):
-                self._model.geom_matid[self._digit_geom_ids[i]] = (
-                    self._digit_matids[values[i]]
-                )
+                gid = self._digit_geom_ids[i]
+                self._model.geom_matid[gid] = self._digit_matids[values[i]]
+                self._model.geom_size[gid] = (sizes[i], sizes[i], 0.001)
                 mocap_id = self._digit_mocap_ids[i]
+                # Surplus decals are parked under the floor rather than made
+                # transparent: alpha lives on the shared digit material, which
+                # every decal showing the same value would inherit.
                 self._data.mocap_pos[mocap_id] = (
-                    positions[i][0],
-                    positions[i][1],
-                    DIGIT_Z,
+                    (positions[i][0], positions[i][1], DIGIT_Z)
+                    if i < count
+                    else (0.0, 0.0, HIDDEN_Z)
                 )
                 self._data.mocap_quat[mocap_id] = lie.SO3.from_z_radians(
                     yaws[i]
@@ -699,29 +981,84 @@ class DRCubeEnv(CubeEnv):
             return 0.02
         return float(self.variation_space['cube']['size'].value[cube_idx])
 
-    def _rescaled_task_info(self, task_info: dict) -> dict:
-        """Rescale a task's z waypoints to the current cube sizes.
+    def _rescaled_task_info(self, task_info: dict, permutation) -> dict:
+        """Permute a task's rows, then rescale its z waypoints to cube sizes.
 
-        ``CubeEnv.set_tasks`` hard-codes the stacking ladder as
-        ``0.02 + 0.04 * layer``. With randomized sizes that ladder is wrong, so
-        recover the layer index and rebuild it as ``half + 2 * half * layer``.
+        The permutation is applied *here* rather than left to the parent.
+        ``CubeEnv.initialize_episode`` shuffles the task rows after this method
+        has run, so row ``i``'s height would otherwise have been built from the
+        half-extent of a different cube than the one that ends up there.
+        Permuting first makes row ``i`` cube ``i`` by construction, and
+        :meth:`initialize_episode` pins the parent's own shuffle off.
 
-        ``set_tasks`` itself cannot do this: it runs inside ``__init__``,
+        ``set_tasks`` cannot do any of this: it runs inside ``__init__``,
         before the variation space exists.
+
+        Args:
+            task_info: Task dict holding ``init_xyzs`` and ``goal_xyzs``.
+            permutation: Row order to apply before rescaling.
+
+        Returns:
+            A new task dict; ``task_info`` is left untouched.
         """
-        if not self._size_aware_geometry or task_info is None:
+        if task_info is None:
             return task_info
 
         out = dict(task_info)
         for key in ('init_xyzs', 'goal_xyzs'):
-            xyzs = np.asarray(task_info[key], dtype=np.float64).copy()
-            layers = np.rint((xyzs[:, 2] - 0.02) / 0.04).astype(int)
-            halves = np.array(
-                [self._half(i) for i in range(len(xyzs))], dtype=np.float64
-            )
-            xyzs[:, 2] = halves + 2.0 * halves * layers
+            xyzs = np.asarray(task_info[key], dtype=np.float64)[
+                permutation
+            ].copy()
+            if self._size_aware_geometry:
+                xyzs[:, 2] = self._stack_heights(xyzs)
             out[key] = xyzs
         return out
+
+    def _stack_heights(self, xyzs: np.ndarray) -> np.ndarray:
+        """Rebuild the resting-height ladder for the current cube sizes.
+
+        ``CubeEnv.set_tasks`` hard-codes it as ``0.02 + 0.04 * layer``, which
+        assumes two things that stop holding once sizes differ: that every cube
+        is the stock size, and that a cube's own half-extent sets how high it
+        sits. The second is wrong even in principle -- a cube at layer 1 rests
+        on whatever is at layer 0 of its column, so the offset comes from *that*
+        cube's half-extent. Stacked waypoints share an exact xy, so grouping by
+        xy and accumulating up each column recovers the true ladder.
+
+        Args:
+            xyzs: ``(n, 3)`` waypoints in cube order.
+
+        Returns:
+            ``(n,)`` corrected z heights.
+        """
+        heights = np.empty(len(xyzs), dtype=np.float64)
+        columns: dict[tuple[float, float], list[int]] = {}
+        for i, xyz in enumerate(xyzs):
+            key = (round(float(xyz[0]), 4), round(float(xyz[1]), 4))
+            columns.setdefault(key, []).append(i)
+
+        for members in columns.values():
+            members.sort(key=lambda i: xyzs[i][2])
+            bottom = 0.0
+            for i in members:
+                half = self._half(i)
+                heights[i] = bottom + half
+                bottom += 2.0 * half
+        return heights
+
+    def _apply_size_aware_workspace(self):
+        """Lower the effector clip plane to reach the smallest cube in play.
+
+        ``ManipSpaceEnv`` clips the effector target to ``_workspace_bounds``,
+        whose z floor is the stock half-extent. A cube below that size would be
+        grasped above its center -- silently, since the clip happens inside the
+        step function. Recomputed from the stock value every episode so repeated
+        resets cannot ratchet it downwards.
+        """
+        if not self._size_aware_geometry:
+            return
+        smallest = float(np.min(self._current_cube_sizes()))
+        self._workspace_bounds[0][2] = min(self._stock_workspace_z, smallest)
 
     # ------------------------------------------------------------------
     # episode lifecycle
@@ -735,17 +1072,29 @@ class DRCubeEnv(CubeEnv):
         through its own setup, so the scene must already look final by then.
         """
         self._apply_visual_variations()
+        self._apply_size_aware_workspace()
 
         if self._mode == 'data_collection':
             self._initialize_episode_data_collection()
             return
 
-        saved = self.cur_task_info
-        self.cur_task_info = self._rescaled_task_info(saved)
+        # Draw the cube order here and hand the parent pre-permuted rows, so
+        # `_rescaled_task_info` knows which cube lands on which waypoint.
+        permutation = (
+            self.np_random.permutation(self._num_cubes)
+            if self._permute_blocks
+            else np.arange(self._num_cubes)
+        )
+
+        saved_task = self.cur_task_info
+        saved_permute = self._permute_blocks
+        self.cur_task_info = self._rescaled_task_info(saved_task, permutation)
+        self._permute_blocks = False
         try:
             super().initialize_episode()
         finally:
-            self.cur_task_info = saved
+            self.cur_task_info = saved_task
+            self._permute_blocks = saved_permute
 
     def _initialize_episode_data_collection(self):
         """Size-aware version of the parent's data-collection branch.
@@ -894,9 +1243,18 @@ class DRCubeEnv(CubeEnv):
         Adds to ``ob_info`` (on top of everything :class:`CubeEnv` adds):
             - ``privileged/digit_{i}_value``: digit shown by decal ``i``.
             - ``privileged/digit_{i}_pos``: its ``(x, y)`` floor position.
+            - ``privileged/digit_{i}_size``: its half-extent.
+            - ``privileged/digit_{i}_visible``: whether it is on the floor at
+              all this episode, or parked out of frame by ``digit.count``.
+            - ``privileged/digit_count``: how many decals are visible.
             - ``privileged/floor_material`` / ``privileged/wall_material``:
               background pool indices.
-            - ``privileged/light_pos``: flattened per-light positions.
+            - ``privileged/floor_rgb`` / ``privileged/wall_rgb``: their colors.
+            - ``privileged/light_pos``: positions of the lights that *have* a
+              position. Directional lights are excluded -- MuJoCo shades them
+              from direction alone, so their position never reaches a pixel and
+              a probe could only ever fit noise to it.
+            - ``privileged/light_dir``: flattened per-light directions.
         """
         super().add_object_info(ob_info)
 
@@ -904,11 +1262,22 @@ class DRCubeEnv(CubeEnv):
             digit = self.variation_space['digit']
             values = np.asarray(digit['value'].value, dtype=np.int64)
             positions = np.asarray(digit['position'].value, dtype=np.float64)
+            sizes = np.asarray(digit['size'].value, dtype=np.float64)
+            count = int(digit['count'].value)
             for i in range(self._num_digits):
                 ob_info[f'privileged/digit_{i}_value'] = np.array(
                     [values[i]], dtype=np.int64
                 )
                 ob_info[f'privileged/digit_{i}_pos'] = positions[i].copy()
+                ob_info[f'privileged/digit_{i}_size'] = np.array(
+                    [sizes[i]], dtype=np.float64
+                )
+                ob_info[f'privileged/digit_{i}_visible'] = np.array(
+                    [int(i < count)], dtype=np.int64
+                )
+            ob_info['privileged/digit_count'] = np.array(
+                [count], dtype=np.int64
+            )
 
         background = self.variation_space['background']
         ob_info['privileged/floor_material'] = np.array(
@@ -917,8 +1286,24 @@ class DRCubeEnv(CubeEnv):
         ob_info['privileged/wall_material'] = np.array(
             [int(background['wall_material'].value)], dtype=np.int64
         )
+        ob_info['privileged/floor_rgb'] = np.asarray(
+            background['floor_rgb'].value, dtype=np.float64
+        ).copy()
+        ob_info['privileged/wall_rgb'] = np.asarray(
+            background['wall_rgb'].value, dtype=np.float64
+        ).copy()
+
+        light = self.variation_space['light']
+        positioned = [
+            row
+            for row in range(len(LIGHT_NAMES))
+            if row not in self._directional_light_rows
+        ]
         ob_info['privileged/light_pos'] = np.asarray(
-            self.variation_space['light']['position'].value, dtype=np.float64
+            light['position'].value, dtype=np.float64
+        )[positioned].reshape(-1)
+        ob_info['privileged/light_dir'] = np.asarray(
+            light['direction'].value, dtype=np.float64
         ).reshape(-1)
 
     # ------------------------------------------------------------------
