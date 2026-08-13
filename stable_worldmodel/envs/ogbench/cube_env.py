@@ -812,14 +812,24 @@ class CubeEnv(ManipSpaceEnv):
         """
         options = options or {}
 
+        # Forward the caller's seed, the way `PushTEnv.reset` does. Hardcoding
+        # `seed=None` here re-seeded the variation space from OS entropy on
+        # every reset, so `reset(seed=n)` twice produced two different scenes
+        # and a recorded dataset could not be regenerated from its seeds.
         swm_spaces.reset_variation_space(
             self.variation_space,
-            seed=None,
+            seed=seed,
             options=options,
             default_variations=DEFAULT_VARIATIONS,
         )
 
-        ob, info = super().reset(options=options, *args, **kwargs)
+        # `seed` also has to reach `gym.Env.reset`, which is what re-seeds
+        # `self.np_random` -- the stream `initialize_arm` and `set_new_target`
+        # draw from. `ManipSpaceEnv.reset` takes `options` by name and passes
+        # the rest through, so this arrives as a keyword and is not doubled.
+        ob, info = super().reset(
+            options=options, seed=seed, *args, **kwargs
+        )
 
         if 'state' in options and options['state'] is not None:
             state = options['state']

@@ -109,8 +109,8 @@ DEFAULT_VARIATIONS = (
 
 # Digit decals sit this far above the floor plane to avoid z-fighting.
 DIGIT_Z = 0.0015
-DIGIT_HALF_EXTENT = 0.03
-DIGIT_SIZE_RANGE = (0.02, 0.045)
+DIGIT_HALF_EXTENT = 0.045
+DIGIT_SIZE_RANGE = (0.035, 0.06)
 
 # Where surplus decals are parked when `digit.count` hides them. Mirrors how
 # `CubeEnv.set_new_target` hides the non-target cube markers.
@@ -246,7 +246,7 @@ class DRCubeEnv(CubeEnv):
         num_digits: int = 1,
         num_bg_materials: int = 8,
         bg_image_dir=None,
-        digit_bounds=((0.22, -0.36), (0.62, 0.36)),
+        digit_bounds=((0.32, -0.21), (0.53, 0.21)),
         add_backdrop: bool = True,
         size_aware_geometry: bool = True,
         min_cube_size: float = MIN_CUBE_SIZE,
@@ -267,7 +267,21 @@ class DRCubeEnv(CubeEnv):
                 pool as image textures, replacing procedural entries from
                 index 2 onward.
             digit_bounds: ``((x_lo, y_lo), (x_hi, y_hi))`` sampling box for
-                digit positions on the floor.
+                digit positions on the floor. The binding constraint is not
+                the containment walls (``x`` in ``[0.223, 0.627]``, ``y`` in
+                ``[-0.377, 0.377]``) but the ``front_pixels`` camera's
+                *recorded* frame: that camera is oblique and itself subject to
+                ``camera.angle_delta`` (+-10 deg), so its visible floor region
+                is a trapezoid that narrows in ``y`` as ``x`` grows, not a
+                rectangle. This default was calibrated empirically (render at
+                every combination of the box's corners, the largest sampled
+                digit size, 45 deg yaw -- worst case for a square tile's
+                reach -- and every extreme of ``camera.angle_delta``) to keep
+                every decal fully inside that frame with a several-pixel
+                margin. Widening it -- especially ``y_hi``/``-y_lo`` at the
+                ``x_hi`` end -- risks a decal that is physically on the floor
+                but invisible in the recorded ``pixels`` observation while its
+                privileged info still reports it.
             add_backdrop: Whether to add opaque, collision-free backdrop panels
                 behind and beside the workspace. Disable to keep the stock
                 skybox background.
@@ -424,8 +438,18 @@ class DRCubeEnv(CubeEnv):
                         init_value=np.arange(self._num_digits, dtype=np.int64)
                         % 10,
                     ),
-                    'count': swm_spaces.Discrete(
-                        self._num_digits + 1, init_value=self._num_digits
+                    # At num_digits == 1, "how many are visible" is a coin
+                    # flip between 0 and 1 -- disruptive, not a clutter-level
+                    # dial. Pin it to the single value 1 so hiding the only
+                    # decal requires an explicit variation_values override,
+                    # not a 50/50 draw from options={'variation': ['all']}.
+                    'count': (
+                        swm_spaces.Discrete(1, start=1, init_value=1)
+                        if self._num_digits == 1
+                        else swm_spaces.Discrete(
+                            self._num_digits + 1,
+                            init_value=self._num_digits,
+                        )
                     ),
                     'size': swm_spaces.Box(
                         low=size_lo,
@@ -1463,7 +1487,17 @@ class DRCubeEnv(CubeEnv):
         arr = np.asarray(value)
 
         if isinstance(space, swm_spaces.Discrete):
-            return int(np.clip(np.rint(arr.reshape(-1)[0]), 0, space.n - 1))
+            # `space.start` defaults to 0 but isn't always -- `digit.count`
+            # is pinned to `Discrete(1, start=1)` at num_digits == 1, and
+            # clipping to `[0, n-1]` would silently coerce every replayed
+            # value to the invalid 0.
+            return int(
+                np.clip(
+                    np.rint(arr.reshape(-1)[0]),
+                    space.start,
+                    space.start + space.n - 1,
+                )
+            )
         if isinstance(space, swm_spaces.MultiDiscrete):
             clipped = np.clip(
                 np.rint(arr).reshape(space.shape), 0, space.nvec - 1

@@ -13,15 +13,10 @@ dataset_name: ogbench/cube_quadruple_dr_expert.lance
 
 world:
   num_envs: 10
-  # 500 steps and a raised p_stack (below) bias collection toward stacking
-  # events for the stack task, at the cost of matching upstream's 1001-step
-  # play recipe (~11 chained pick-and-places at the stock 10-50% stack rate).
-  max_episode_steps: 500
+  max_episode_steps: 400
   image_shape: [224, 224]
 
-# Forwarded to gym.make -> DRCubeEnv. Keep these identical in the eval config:
-# the dataset stores background/digit *indices*, so a differently sized pool
-# would resolve them to different materials.
+
 env:
   env_type: quadruple
   ob_type: states
@@ -30,28 +25,18 @@ env:
   height: 224
   visualize_info: False
   terminate_at_goal: False
-  num_digits: 5
+  num_digits: 1
   num_bg_materials: 8
   add_backdrop: True
-
-# 'plan_oracle' == CubePlanOracle, used for OGBench's `-play` datasets. It
-# grasps at the cube's live pose, so it needs no changes under size
-# randomization. 'markov_oracle' hard-codes 0.02/0.04 alignment thresholds and
-# 0.16-0.18 m lift heights and would need loosening first.
 policy_type: plan_oracle
-
-# Per-episode P(stack on another cube | >=2 cubes exposed), sampled uniformly
-# from [lo, hi] -- see ExpertPolicy.p_stack. Set to null to fall back to the
-# built-in per-env_type schedule (quadruple: U(0.1, 0.5)). NOTE: raising this
-# does not make a completed tower persist -- set_new_target still
-# unconditionally disperses the top cube once none are left to stack onto, so
-# episodes still show towers being built and torn down repeatedly rather than
-# held.
-p_stack: [0.7, 0.8]
-
-num_workers: 4
 seed: 3072
 num_traj: 5000
+
+# Sharded collection. `shard` takes an even slice of `num_traj` and a disjoint
+# block of episode seeds, and writes `<dataset_name>_shard{i}`. Driven by
+# collect_cube_quadruple_dr_sharded.py; leave at 0/1 for a single process.
+shard: 0
+num_shards: 1
 
 options:
   variation:

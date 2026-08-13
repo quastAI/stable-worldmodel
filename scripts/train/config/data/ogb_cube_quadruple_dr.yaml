@@ -2,10 +2,21 @@ dataset:
   name: ogbench/cube_quadruple_dr_expert.lance
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5
+  # `keys_to_merge` resolves its source as a regex over the *loaded* keys
+  # (`LanceDataset._keys = keys_to_load or available`), so the `proprio/*`
+  # columns have to be listed here or the merge concatenates an empty list and
+  # raises `need at least one array to concatenate` before training starts.
   keys_to_load:
     - pixels
     - action
     - observation
+    - proprio/joint_pos
+    - proprio/joint_vel
+    - proprio/effector_pos
+    - proprio/effector_yaw
+    - proprio/gripper_opening
+    - proprio/gripper_vel
+    - proprio/gripper_contact
   keys_to_cache:
     - action
     - observation
