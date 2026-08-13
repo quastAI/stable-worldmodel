@@ -29,6 +29,14 @@ env:
   num_bg_materials: 8
   add_backdrop: True
 policy_type: plan_oracle
+
+# Fixed P(stack on another cube | >=2 cubes exposed), overriding the built-in
+# per-env_type schedule (quadruple: U(0.1, 0.5)). A `[lo, hi]` pair samples
+# uniformly per episode instead; `null` restores the schedule. NOTE: this
+# biases target selection toward stacking, it does not make a finished tower
+# persist -- see the warning in README §5.1.
+p_stack: 0.8
+
 seed: 3072
 num_traj: 5000
 

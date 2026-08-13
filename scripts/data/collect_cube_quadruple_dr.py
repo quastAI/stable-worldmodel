@@ -7,13 +7,13 @@ below) -- and resamples the domain randomization, so the recorded
 ``variation.*`` columns are what ``DRCubeEnv.reset_options_from_dataset``
 later replays at evaluation time.
 
-The shipped default (``p_stack: null``, 1000-step episodes) matches
-upstream's ``cube-quadruple-play-v0`` recipe: ~11 chained pick-and-places per
-episode at the stock 10-50% per-episode stacking rate, for general-purpose
-representation learning. Raising ``p_stack`` biases collection toward
-stacking events, at the cost of matching that recipe -- see ``p_stack``'s
-docstring in :class:`~stable_worldmodel.envs.ogbench.ExpertPolicy` for why
-that alone still won't produce episodes that end on a *held* 4-tower.
+The shipped default is ``p_stack: 0.8`` over 400-step episodes: a deliberate
+bias toward stacking events, not upstream's ``cube-quadruple-play-v0`` recipe.
+Set ``p_stack=null`` to restore that recipe -- the stock per-env_type schedule
+(quadruple: ``U(0.1, 0.5)``) over 1000-step episodes, ~11 chained
+pick-and-places for general-purpose representation learning. See ``p_stack``'s
+docstring in :class:`~stable_worldmodel.envs.ogbench.ExpertPolicy` for why a
+high value still won't produce episodes that end on a *held* 4-tower.
 
 Collection is single-threaded -- ``EnvPool`` steps its envs in a Python loop,
 so ``world.num_envs`` batches but does not parallelize. To use more than one
@@ -30,11 +30,20 @@ Usage::
 """
 
 import os
+import sys
 from pathlib import Path
 
-# glfw needs a display, so headless Linux nodes must export MUJOCO_GL=egl (or
-# osmesa) before launching. Only default it, never override an explicit choice.
-os.environ.setdefault('MUJOCO_GL', 'glfw')
+# Pick a renderer that will actually start, and never override an explicit
+# export. `glfw` needs a display, so it fails on a headless node; `egl` needs a
+# GPU and is rejected outright on macOS. `osmesa` is software rasterization --
+# it always works and is roughly half the cost of a collection step, so export
+# `MUJOCO_GL=egl` yourself on a Linux node that has a GPU.
+if 'MUJOCO_GL' not in os.environ:
+    if sys.platform == 'darwin' or os.environ.get('DISPLAY'):
+        os.environ['MUJOCO_GL'] = 'glfw'
+    else:
+        os.environ['MUJOCO_GL'] = 'osmesa'
+        os.environ.setdefault('PYOPENGL_PLATFORM', 'osmesa')
 import hydra
 import numpy as np
 from loguru import logger as logging

@@ -143,8 +143,12 @@ def main() -> int:
     # `swm merge` renumbers episodes into one contiguous range and rejects a
     # column mismatch before writing anything.
     merge_target = stem  # `swm merge` appends the format suffix itself.
+    # Console scripts live next to the interpreter in a venv. Resolving it that
+    # way keeps the merge working when the venv is not on PATH -- e.g. invoked
+    # as `/opt/venv/bin/python scripts/data/...` in a container entrypoint.
+    swm_bin = Path(sys.executable).with_name('swm')
     merge = [
-        'swm',
+        str(swm_bin) if swm_bin.exists() else 'swm',
         'merge',
         *shard_names,
         '--output',
