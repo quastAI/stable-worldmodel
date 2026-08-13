@@ -18,7 +18,7 @@ world:
   terminate_at_goal: True
   # DR knobs (see DRCubeEnv). Must match the collection env, otherwise the
   # background/digit pool indices stored in the dataset mean something else.
-  num_digits: 5
+  num_digits: 1
   num_bg_materials: 8
   add_backdrop: True
 

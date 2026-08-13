@@ -21,6 +21,7 @@ class ExpertPolicy(BasePolicy):
         p_random_action=0.0,
         noise_smoothing=0.5,
         min_norm=0.4,
+        p_stack: float | tuple[float, float] | list[float] | None = None,
         seed: int | None = None,
         **kwargs,
     ):
@@ -33,6 +34,19 @@ class ExpertPolicy(BasePolicy):
             p_random_action (float, optional): Probability of selecting a random action. Applies to both policy types.
             noise_smoothing (float, optional): Action noise smoothing level for "plan_oracle" policy type.
             min_norm (float, optional): Minimum action norm for "markov_oracle" policy type.
+            p_stack (float | tuple[float, float] | list[float] | None, optional):
+              Overrides the per-``env_type`` cube-stacking-probability schedule
+              (see :meth:`_get_cube_stack_prob`). A float pins every episode to
+              that exact probability; a ``(lo, hi)`` pair (tuple or 2-element
+              list, so it round-trips through YAML/OmegaConf) samples uniformly
+              from that range per episode, same as the built-in schedule does.
+              ``None`` (the default) keeps the built-in schedule.
+
+              Note: does not, by itself, make the oracle *hold* a completed
+              stack -- ``set_new_target`` still unconditionally disperses the
+              top cube once every cube is stacked (there are no other exposed
+              cubes left to stack onto), regardless of ``p_stack``.
+            seed (int | None, optional): Random seed for action sampling.
             **kwargs: Arbitrary keyword arguments passed to parent BasePolicy.
 
             Note: see original OGBench params per environment and policy type in
@@ -48,6 +62,7 @@ class ExpertPolicy(BasePolicy):
         self.p_random_action = p_random_action
         self.noise_smoothing = noise_smoothing
         self.min_norm = min_norm
+        self.p_stack = p_stack
         self.set_seed(seed)
 
     def set_seed(self, seed: int | None) -> None:
@@ -195,6 +210,11 @@ class ExpertPolicy(BasePolicy):
                 }
 
     def _get_cube_stack_prob(self):
+        if self.p_stack is not None:
+            if isinstance(self.p_stack, (list, tuple)):
+                return self.rng.uniform(*self.p_stack)
+            return self.p_stack
+
         envs = [e.unwrapped for e in self.env.envs]
         env_type = envs[0]._env_type  # assuming all envs have the same type
 

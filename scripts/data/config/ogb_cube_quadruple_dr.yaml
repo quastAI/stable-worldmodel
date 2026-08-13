@@ -13,9 +13,10 @@ dataset_name: ogbench/cube_quadruple_dr_expert.lance
 
 world:
   num_envs: 10
-  # Upstream generates cube-quadruple play data with 1001-step episodes,
-  # giving ~11 chained pick-and-places per episode.
-  max_episode_steps: 1000
+  # 500 steps and a raised p_stack (below) bias collection toward stacking
+  # events for the stack task, at the cost of matching upstream's 1001-step
+  # play recipe (~11 chained pick-and-places at the stock 10-50% stack rate).
+  max_episode_steps: 500
   image_shape: [224, 224]
 
 # Forwarded to gym.make -> DRCubeEnv. Keep these identical in the eval config:
@@ -38,6 +39,15 @@ env:
 # randomization. 'markov_oracle' hard-codes 0.02/0.04 alignment thresholds and
 # 0.16-0.18 m lift heights and would need loosening first.
 policy_type: plan_oracle
+
+# Per-episode P(stack on another cube | >=2 cubes exposed), sampled uniformly
+# from [lo, hi] -- see ExpertPolicy.p_stack. Set to null to fall back to the
+# built-in per-env_type schedule (quadruple: U(0.1, 0.5)). NOTE: raising this
+# does not make a completed tower persist -- set_new_target still
+# unconditionally disperses the top cube once none are left to stack onto, so
+# episodes still show towers being built and torn down repeatedly rather than
+# held.
+p_stack: [0.7, 0.8]
 
 num_workers: 4
 seed: 3072

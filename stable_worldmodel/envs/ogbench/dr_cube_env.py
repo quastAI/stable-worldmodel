@@ -243,7 +243,7 @@ class DRCubeEnv(CubeEnv):
 
     def __init__(
         self,
-        num_digits: int = 5,
+        num_digits: int = 1,
         num_bg_materials: int = 8,
         bg_image_dir=None,
         digit_bounds=((0.22, -0.36), (0.62, 0.36)),
