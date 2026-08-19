@@ -1,4 +1,5 @@
 from .loss import *  # noqa: F403
+from .probes import *  # noqa: F403
 from .utils import *  # noqa: F403
 
 # Baselines
