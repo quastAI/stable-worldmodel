@@ -106,7 +106,9 @@ class FitConfig:
     seed: int = 0
 
     def __post_init__(self):
-        bad = [p for p in self.probes if p not in ('baseline', 'linear', 'mlp')]
+        bad = [
+            p for p in self.probes if p not in ('baseline', 'linear', 'mlp')
+        ]
         if bad:
             raise ValueError(f'unknown probe kinds {bad}')
 
@@ -207,7 +209,9 @@ def classification_metrics(
         if mask.any():
             recalls.append(float((pred[mask] == c).mean()))
     log_probs = logits - logits.max(axis=1, keepdims=True)
-    log_probs = log_probs - np.log(np.exp(log_probs).sum(axis=1, keepdims=True))
+    log_probs = log_probs - np.log(
+        np.exp(log_probs).sum(axis=1, keepdims=True)
+    )
     return {
         'acc': acc,
         'balanced_acc': float(np.mean(recalls)) if recalls else float('nan'),

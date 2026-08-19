@@ -106,9 +106,13 @@ def _cols(**kwargs):
 
 def test_build_labels_concat_reads_the_requested_step():
     target = tg.TARGETS_BY_NAME['effector_pos']
-    cols = _cols(**{
-        'proprio/effector_pos': [[[0, 0, 0], [1, 2, 3], [9, 9, 9], [4, 4, 4]]]
-    })
+    cols = _cols(
+        **{
+            'proprio/effector_pos': [
+                [[0, 0, 0], [1, 2, 3], [9, 9, 9], [4, 4, 4]]
+            ]
+        }
+    )
     out = tg.build_labels(target, cols, step=1)
     assert out.shape == (1, 3)
     assert np.allclose(out, [[1, 2, 3]])
@@ -165,7 +169,9 @@ def test_blocks_centroid_is_the_mean():
 
 
 def test_blocks_max_z_is_the_tallest_cube():
-    cols = _block_cols([[[0, 0, 0.02], [0, 0, 0.06], [0, 0, 0.1], [0, 0, 0.04]]])
+    cols = _block_cols(
+        [[[0, 0, 0.02], [0, 0, 0.06], [0, 0, 0.1], [0, 0, 0.04]]]
+    )
     out = tg.build_labels(tg.TARGETS_BY_NAME['cube_max_z'], cols, 0)
     assert out.shape == (1, 1)
     assert np.allclose(out, [[0.1]])
@@ -499,10 +505,14 @@ def test_ridge_probe_predicts_in_physical_units():
 
 def test_ridge_finds_no_signal_in_noise():
     rng = np.random.default_rng(1)
-    x = {s: rng.normal(size=(n, 8)).astype(np.float32)
-         for s, n in (('train', 300), ('val', 80), ('test', 150))}
-    y = {s: rng.normal(size=(len(v), 2)).astype(np.float32)
-         for s, v in x.items()}
+    x = {
+        s: rng.normal(size=(n, 8)).astype(np.float32)
+        for s, n in (('train', 300), ('val', 80), ('test', 150))
+    }
+    y = {
+        s: rng.normal(size=(len(v), 2)).astype(np.float32)
+        for s, v in x.items()
+    }
     _, _, metrics, _ = fitting.fit_ridge(x, y, fitting.FitConfig(), 'cpu')
     assert metrics['r2'] < 0.1
 
@@ -572,10 +582,14 @@ def test_fit_one_routes_linear_regression_to_the_closed_form():
 
 def test_fit_one_routes_linear_classification_to_gradients():
     rng = np.random.default_rng(0)
-    x = {s: rng.normal(size=(n, 4)).astype(np.float32)
-         for s, n in (('train', 200), ('val', 50), ('test', 100))}
-    y = {s: rng.integers(0, 4, size=len(v)).astype(np.int64)
-         for s, v in x.items()}
+    x = {
+        s: rng.normal(size=(n, 4)).astype(np.float32)
+        for s, n in (('train', 200), ('val', 50), ('test', 100))
+    }
+    y = {
+        s: rng.integers(0, 4, size=len(v)).astype(np.int64)
+        for s, v in x.items()
+    }
     cfg = fitting.FitConfig(epochs=5, patience=2, weight_decays=(1e-2,))
     _, _, _, _, hyper = fitting.fit_one(
         'linear', x, y, tg.TARGETS_BY_NAME['target_block'], cfg, 'cpu'
@@ -629,8 +643,10 @@ def _fake_payload(n_train=200, n_eval=60, dim=16, num_steps=4, seed=0):
         'feature_dims': {'emb': dim},
         'label_columns': columns,
         'variant_label_step': {'emb': 2},
-        'column_dims': {'proprio/effector_pos': 3,
-                        'privileged/digit_0_value': 1},
+        'column_dims': {
+            'proprio/effector_pos': 3,
+            'privileged/digit_0_value': 1,
+        },
         'episodes': {s: [] for s in ft.SPLITS},
         'num_windows': {'train': n_train, 'val': n_eval, 'test': n_eval},
     }
@@ -645,8 +661,12 @@ def _fake_payload(n_train=200, n_eval=60, dim=16, num_steps=4, seed=0):
 def test_fit_all_produces_one_row_per_combination():
     payload = _fake_payload()
     probe_targets = tg.select_targets(names=['effector_pos', 'digit_value'])
-    cfg = fitting.FitConfig(probes=('baseline', 'linear'), epochs=10,
-                            patience=3, weight_decays=(1e-2,))
+    cfg = fitting.FitConfig(
+        probes=('baseline', 'linear'),
+        epochs=10,
+        patience=3,
+        weight_decays=(1e-2,),
+    )
     rows, _ = fitting.fit_all(payload, probe_targets, cfg, progress=False)
     assert len(rows) == 2 * 2
     assert {r['probe'] for r in rows} == {'baseline', 'linear'}
@@ -655,8 +675,12 @@ def test_fit_all_produces_one_row_per_combination():
 def test_fit_all_recovers_the_planted_signal_and_not_the_noise():
     payload = _fake_payload()
     probe_targets = tg.select_targets(names=['effector_pos', 'digit_value'])
-    cfg = fitting.FitConfig(probes=('baseline', 'linear'), epochs=20,
-                            patience=5, weight_decays=(1e-2,))
+    cfg = fitting.FitConfig(
+        probes=('baseline', 'linear'),
+        epochs=20,
+        patience=5,
+        weight_decays=(1e-2,),
+    )
     rows, _ = fitting.fit_all(payload, probe_targets, cfg, progress=False)
     scores = {(r['target'], r['probe']): r['score'] for r in rows}
     assert scores[('effector_pos', 'linear')] > 0.9
@@ -767,9 +791,5 @@ def test_feature_cache_roundtrips(tmp_path):
 def test_feature_cache_survives_slashes_in_column_names(tmp_path):
     payload = _fake_payload(n_train=10, n_eval=4, dim=3)
     assert any('/' in c for c in payload['meta']['label_columns'])
-    loaded = ft.load_features(
-        ft.save_features(tmp_path / 'f.npz', payload)
-    )
-    assert set(loaded['labels']['train']) == set(
-        payload['labels']['train']
-    )
+    loaded = ft.load_features(ft.save_features(tmp_path / 'f.npz', payload))
+    assert set(loaded['labels']['train']) == set(payload['labels']['train'])

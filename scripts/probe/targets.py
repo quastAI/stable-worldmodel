@@ -113,9 +113,7 @@ def _stack_blocks(cols: dict[str, np.ndarray]) -> np.ndarray:
 
 def reduce_concat(cols: dict[str, np.ndarray], order) -> np.ndarray:
     """Concatenate the requested columns along the feature axis."""
-    return np.concatenate([cols[c] for c in order], axis=-1).astype(
-        np.float32
-    )
+    return np.concatenate([cols[c] for c in order], axis=-1).astype(np.float32)
 
 
 def reduce_sincos(cols: dict[str, np.ndarray], order) -> np.ndarray:
@@ -141,8 +139,10 @@ def reduce_blocks_centroid(cols, order) -> np.ndarray:
 
 def reduce_blocks_max_z(cols, order) -> np.ndarray:
     """Height of the tallest cube — how high the tower currently is."""
-    return _stack_blocks(cols)[..., 2].max(axis=1, keepdims=True).astype(
-        np.float32
+    return (
+        _stack_blocks(cols)[..., 2]
+        .max(axis=1, keepdims=True)
+        .astype(np.float32)
     )
 
 
@@ -161,9 +161,7 @@ def reduce_blocks_pos_sorted(cols, order) -> np.ndarray:
     """
     blocks = _stack_blocks(cols)
     order_idx = np.argsort(blocks[..., 0], axis=1)
-    sorted_blocks = np.take_along_axis(
-        blocks, order_idx[..., None], axis=1
-    )
+    sorted_blocks = np.take_along_axis(blocks, order_idx[..., None], axis=1)
     return sorted_blocks.reshape(len(blocks), -1).astype(np.float32)
 
 

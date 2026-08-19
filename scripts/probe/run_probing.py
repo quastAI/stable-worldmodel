@@ -95,9 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     grp = p.add_argument_group('sampling')
-    grp.add_argument('--train-episodes', type=int, default=300)
-    grp.add_argument('--val-episodes', type=int, default=60)
-    grp.add_argument('--test-episodes', type=int, default=120)
+    # Episodes, not windows, are the unit that matters: every episode
+    # re-draws lighting, camera angle, cube colours and materials, so
+    # episode-level appearance dominates the features. Below ~1000 training
+    # episodes a linear probe fits episode identity and every within-episode
+    # target reads R2 ~ 0 on held-out episodes. Raise --train-episodes before
+    # raising --windows-per-episode, which adds correlated samples.
+    grp.add_argument('--train-episodes', type=int, default=1000)
+    grp.add_argument('--val-episodes', type=int, default=150)
+    grp.add_argument('--test-episodes', type=int, default=250)
     grp.add_argument('--windows-per-episode', type=int, default=20)
     grp.add_argument('--seed', type=int, default=0)
 
@@ -121,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument('--mlp-dropout', type=float, default=0.0)
     grp.add_argument('--probe-epochs', type=int, default=200)
     grp.add_argument('--probe-patience', type=int, default=25)
-    grp.add_argument('--probe-lr', type=float, default=1e-3)
+    grp.add_argument('--probe-lr', type=float, default=3e-3)
 
     grp = p.add_argument_group('output')
     grp.add_argument('--out', required=True, help='Run directory.')
@@ -199,7 +205,9 @@ def get_features(cfg, label_columns, cache_path: Path, reuse: bool):
     if reuse and cache_path.exists():
         payload = ft.load_features(cache_path)
         missing = [
-            c for c in label_columns if c not in payload['meta']['label_columns']
+            c
+            for c in label_columns
+            if c not in payload['meta']['label_columns']
         ]
         if missing:
             raise ValueError(
@@ -295,7 +303,9 @@ def main(argv=None) -> int:
             probe_dir = out_dir / 'probes' / tag
             probe_dir.mkdir(parents=True, exist_ok=True)
             for (variant, target, rung), probe in probes.items():
-                torch.save(probe, probe_dir / f'{variant}__{target}__{rung}.pt')
+                torch.save(
+                    probe, probe_dir / f'{variant}__{target}__{rung}.pt'
+                )
 
     payload = {
         'args': vars(args),
@@ -330,9 +340,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         for row in rows:
             writer.writerow(
                 {
-                    k: (
-                        json.dumps(v) if isinstance(v, (list, dict)) else v
-                    )
+                    k: (json.dumps(v) if isinstance(v, (list, dict)) else v)
                     for k, v in row.items()
                 }
             )

@@ -89,9 +89,9 @@ class StandardizedProbe(nn.Module):
                 a constant feature dim would otherwise blow up.
             eps: Floor for ``std``.
         """
-        mean = torch.as_tensor(
-            np.asarray(mean, dtype=np.float32)
-        ).reshape(1, -1)
+        mean = torch.as_tensor(np.asarray(mean, dtype=np.float32)).reshape(
+            1, -1
+        )
         std = torch.as_tensor(np.asarray(std, dtype=np.float32)).reshape(1, -1)
         if mean.shape[1] != self.input_dim or std.shape[1] != self.input_dim:
             raise ValueError(
@@ -99,9 +99,7 @@ class StandardizedProbe(nn.Module):
                 f'mean={tuple(mean.shape)} std={tuple(std.shape)}'
             )
         self.feature_mean.copy_(mean.to(self.feature_mean.device))
-        self.feature_std.copy_(
-            std.clamp(min=eps).to(self.feature_std.device)
-        )
+        self.feature_std.copy_(std.clamp(min=eps).to(self.feature_std.device))
 
     @torch.no_grad()
     def set_target_stats(self, mean, std, eps: float = 1e-8) -> None:
@@ -112,9 +110,9 @@ class StandardizedProbe(nn.Module):
         the loss. Keeping the stats on the module means :meth:`unscale` can
         map a prediction back to physical units later.
         """
-        mean = torch.as_tensor(
-            np.asarray(mean, dtype=np.float32)
-        ).reshape(1, -1)
+        mean = torch.as_tensor(np.asarray(mean, dtype=np.float32)).reshape(
+            1, -1
+        )
         std = torch.as_tensor(np.asarray(std, dtype=np.float32)).reshape(1, -1)
         if mean.shape[1] != self.output_dim or std.shape[1] != self.output_dim:
             raise ValueError(
