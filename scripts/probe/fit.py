@@ -1,7 +1,7 @@
 """Fitting the read-outs: the cheap half, run on cached frozen features.
 
-Three rungs per (feature variant, target), so a number is only ever read as
-a difference against the rung below it:
+Three rungs per target, so a number is only ever read as a difference
+against the rung below it:
 
 ``baseline``
     Predict the training mean (regression) or the training majority class.
@@ -117,14 +117,12 @@ class FitConfig:
 class ProbeResult:
     """One row of the results table."""
 
-    variant: str
     target: str
     group: str
     kind: str
     probe: str
     feature_dim: int
     output_dim: int
-    label_step: int
     n_train: int
     n_val: int
     n_test: int
@@ -140,14 +138,12 @@ class ProbeResult:
         row = {
             k: getattr(self, k)
             for k in (
-                'variant',
                 'target',
                 'group',
                 'kind',
                 'probe',
                 'feature_dim',
                 'output_dim',
-                'label_step',
                 'n_train',
                 'n_val',
                 'n_test',
@@ -545,129 +541,84 @@ def fit_all(
     payload: dict,
     probe_targets,
     cfg: FitConfig,
-    variants=None,
     keep_probes: bool = False,
     progress: bool = True,
 ) -> tuple[list[dict], dict]:
-    """Fit every (variant, target, rung) combination on a feature cache.
+    """Fit every (target, rung) combination on a feature cache.
 
     Args:
         payload: A cache from :func:`features.extract` / ``load_features``.
         probe_targets: Targets from :func:`targets.select_targets`.
         cfg: Fit config.
-        variants: Feature variants to probe; ``None`` uses every variant in
-            the cache.
         keep_probes: Also return the fitted modules, keyed by
-            ``(variant, target, probe)``.
-        progress: Print a line per (variant, target).
+            ``(target, probe)``.
+        progress: Print a line per target.
 
     Returns:
         ``(rows, probes)`` — result rows ready for a table, and the fitted
         probes (empty unless ``keep_probes``).
     """
     device = cfg.device or default_device()
-    meta = payload['meta']
-    variants = list(variants or meta['feature_dims'])
+    x = payload['features']
 
-    unknown = [v for v in variants if v not in payload['features']['train']]
-    if unknown:
-        raise KeyError(
-            f'variants {unknown} are not in this cache; it holds '
-            f'{sorted(payload["features"]["train"])}'
-        )
-
-    rows: list[dict] = []
-    probes: dict = {}
-
-    # An episode-constant label repeats identically across every window of
+    # An episode-constant label repeats identically across every frame of
     # its episode, so its effective training size is the episode count.
     n_train_episodes = len(
         np.unique(payload['windows']['train']['episode_idx'])
     )
 
-    for variant in variants:
-        x = {s: payload['features'][s][variant] for s in payload['features']}
-        step = meta['variant_label_step'][variant]
+    rows: list[dict] = []
+    probes: dict = {}
 
-        for target in probe_targets:
-            y = _split_labels(target, payload, step)
-            shared = dict(
-                variant=variant,
-                target=target.name,
-                group=target.group,
-                kind=target.kind,
-                feature_dim=x['train'].shape[1],
-                output_dim=(
-                    target.num_classes
-                    if target.kind == 'classification'
-                    else y['train'].shape[1]
-                ),
-                label_step=step,
-                n_train=len(x['train']),
-                n_val=len(x['val']),
-                n_test=len(x['test']),
-                n_train_effective=(
-                    n_train_episodes
-                    if target.episode_constant
-                    else len(x['train'])
-                ),
-                episode_constant=target.episode_constant,
+    for target in probe_targets:
+        y = _split_labels(target, payload, step=0)
+        shared = dict(
+            target=target.name,
+            group=target.group,
+            kind=target.kind,
+            feature_dim=x['train'].shape[1],
+            output_dim=(
+                target.num_classes
+                if target.kind == 'classification'
+                else y['train'].shape[1]
+            ),
+            n_train=len(x['train']),
+            n_val=len(x['val']),
+            n_test=len(x['test']),
+            n_train_effective=(
+                n_train_episodes
+                if target.episode_constant
+                else len(x['train'])
+            ),
+            episode_constant=target.episode_constant,
+        )
+
+        for rung in cfg.probes:
+            started = time.time()
+            probe, score, val_score, metrics, hyper = fit_one(
+                rung, x, y, target, cfg, device
             )
 
-            for rung in cfg.probes:
-                started = time.time()
-                probe, score, val_score, metrics, hyper = fit_one(
-                    rung, x, y, target, cfg, device
-                )
+            result = ProbeResult(
+                probe=rung,
+                score=float(score),
+                val_score=float(val_score),
+                metrics=metrics,
+                hyper=hyper,
+                fit_seconds=time.time() - started,
+                **shared,
+            )
+            rows.append(result.as_row())
+            if keep_probes and probe is not None:
+                probes[(target.name, rung)] = probe
 
-                result = ProbeResult(
-                    probe=rung,
-                    score=float(score),
-                    val_score=float(val_score),
-                    metrics=metrics,
-                    hyper=hyper,
-                    fit_seconds=time.time() - started,
-                    **shared,
-                )
-                rows.append(result.as_row())
-                if keep_probes and probe is not None:
-                    probes[(variant, target.name, rung)] = probe
-
-            if progress:
-                summary = ' '.join(
-                    f'{r["probe"]}={r["score"]:.3f}'
-                    for r in rows[-len(cfg.probes) :]
-                )
-                print(f'{variant:>14s} / {target.name:<18s} {summary}')
+        if progress:
+            summary = ' '.join(
+                f'{r["probe"]}={r["score"]:.3f}' for r in rows[-len(cfg.probes) :]
+            )
+            print(f'{target.name:<18s} {summary}')
 
     return rows, probes
-
-
-def prediction_fidelity(payload: dict) -> dict:
-    """How close ``pred_emb`` sits to ``emb_next_true``, per split.
-
-    Not a probing result — a sanity check on the world model itself. A
-    ``pred_emb`` that probes far worse than ``emb_next_true`` while sitting
-    right on top of it here would mean the two variants got mismatched.
-    """
-    out = {}
-    for split, feats in payload['features'].items():
-        if 'pred_emb' not in feats or 'emb_next_true' not in feats:
-            continue
-        pred = feats['pred_emb'].astype(np.float64)
-        true = feats['emb_next_true'].astype(np.float64)
-        cos = (pred * true).sum(1) / (
-            np.linalg.norm(pred, axis=1) * np.linalg.norm(true, axis=1) + 1e-12
-        )
-        out[split] = {
-            'cosine_mean': float(cos.mean()),
-            'cosine_std': float(cos.std()),
-            'mse': float(((pred - true) ** 2).mean()),
-            'relative_mse': float(
-                ((pred - true) ** 2).mean() / (true**2).mean()
-            ),
-        }
-    return out
 
 
 __all__ = [
@@ -679,7 +630,6 @@ __all__ = [
     'fit_gradient_probe',
     'fit_one',
     'fit_ridge',
-    'prediction_fidelity',
     'r2_per_dim',
     'regression_metrics',
 ]

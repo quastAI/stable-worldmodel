@@ -42,8 +42,8 @@ def test_select_targets_defaults_to_everything():
 
 
 def test_select_targets_by_group():
-    picked = tg.select_targets(groups=['control'])
-    assert picked and all(t.group == 'control' for t in picked)
+    picked = tg.select_targets(groups=['nuisance'])
+    assert picked and all(t.group == 'nuisance' for t in picked)
 
 
 def test_select_targets_by_name_keeps_registry_order():
@@ -162,21 +162,6 @@ def _block_cols(positions):
     }
 
 
-def test_blocks_centroid_is_the_mean():
-    cols = _block_cols([[[0, 0, 0], [2, 0, 0], [0, 2, 0], [2, 2, 4]]])
-    out = tg.build_labels(tg.TARGETS_BY_NAME['cube_centroid'], cols, 0)
-    assert np.allclose(out, [[1.0, 1.0, 1.0]])
-
-
-def test_blocks_max_z_is_the_tallest_cube():
-    cols = _block_cols(
-        [[[0, 0, 0.02], [0, 0, 0.06], [0, 0, 0.1], [0, 0, 0.04]]]
-    )
-    out = tg.build_labels(tg.TARGETS_BY_NAME['cube_max_z'], cols, 0)
-    assert out.shape == (1, 1)
-    assert np.allclose(out, [[0.1]])
-
-
 def test_blocks_z_sorted_is_ascending():
     cols = _block_cols([[[0, 0, 0.3], [0, 0, 0.1], [0, 0, 0.4], [0, 0, 0.2]]])
     out = tg.build_labels(tg.TARGETS_BY_NAME['cube_z_sorted'], cols, 0)
@@ -192,16 +177,6 @@ def test_blocks_pos_sorted_is_permutation_invariant():
     b = tg.build_labels(target, _block_cols([shuffled]), 0)
     assert a.shape == (1, 12)
     assert np.allclose(a, b)
-
-
-def test_block_0_pos_is_not_permutation_invariant():
-    """The identity control must react to relabelling — that is its job."""
-    layout = [[1.0, 0, 0], [3.0, 1, 0], [2.0, 2, 0], [4.0, 3, 0]]
-    shuffled = [layout[i] for i in (2, 0, 3, 1)]
-    target = tg.TARGETS_BY_NAME['block_0_pos']
-    a = tg.build_labels(target, _block_cols([layout]), 0)
-    b = tg.build_labels(target, _block_cols([shuffled]), 0)
-    assert not np.allclose(a, b)
 
 
 def test_build_labels_reports_a_missing_column():
@@ -221,20 +196,13 @@ def test_label_dim_matches_build_labels_for_every_target():
     dims = {
         'proprio/effector_pos': 3,
         'proprio/effector_yaw': 1,
-        'proprio/joint_pos': 6,
-        'proprio/joint_vel': 6,
         'proprio/gripper_opening': 1,
         'proprio/gripper_contact': 1,
         'privileged/digit_0_value': 1,
-        'privileged/digit_0_pos': 2,
-        'privileged/digit_0_size': 1,
         'privileged/floor_material': 1,
         'privileged/wall_material': 1,
         'privileged/floor_rgb': 3,
         'privileged/light_pos': 3,
-        'privileged/block_0_pos': 3,
-        'privileged/target_block': 1,
-        'privileged/target_block_pos': 3,
         **{c: 3 for c in tg.BLOCK_POS_COLUMNS},
     }
     rng = np.random.default_rng(0)
@@ -246,7 +214,6 @@ def test_label_dim_matches_build_labels_for_every_target():
     columns['privileged/digit_0_value'] = np.zeros((2, 4, 1), np.float32)
     columns['privileged/floor_material'] = np.zeros((2, 4, 1), np.float32)
     columns['privileged/wall_material'] = np.zeros((2, 4, 1), np.float32)
-    columns['privileged/target_block'] = np.zeros((2, 4, 1), np.float32)
 
     for target in tg.TARGETS:
         built = tg.build_labels(target, columns, step=0)
@@ -291,83 +258,54 @@ def test_episode_split_requires_all_splits():
         ft.ExtractConfig(episodes={'train': 1}, checkpoint='r/w.pt')
 
 
-###############
-## windowing ##
-###############
+######################
+## frame sampling   ##
+######################
 
 
 class _StubDataset(Dataset):
     """Just enough of a Dataset to expose real ``clip_indices``."""
 
-    def __init__(self, lengths, frameskip, num_steps):
+    def __init__(self, lengths):
         super().__init__(
             np.asarray(lengths, dtype=np.int64),
             np.zeros(len(lengths), dtype=np.int64),
-            frameskip=frameskip,
-            num_steps=num_steps,
+            frameskip=1,
+            num_steps=1,
         )
 
 
-def test_sample_windows_indices_match_real_clip_indices():
+def test_sample_frames_indices_match_real_clip_indices():
     """The arithmetic shortcut must agree with Dataset.clip_indices."""
     lengths = [40, 25, 60, 12, 33]
-    frameskip, num_steps = 5, 4
-    dataset = _StubDataset(lengths, frameskip, num_steps)
-    span = num_steps * frameskip
+    dataset = _StubDataset(lengths)
 
-    clips, eps, starts = ft.sample_windows(
-        dataset.lengths, np.arange(len(lengths)), span, 3, seed=1
+    clips, eps, frame_idx = ft.sample_frames(
+        dataset.lengths, np.arange(len(lengths)), 3, seed=1
     )
-    for clip, ep, start in zip(clips, eps, starts):
-        assert dataset.clip_indices[int(clip)] == (int(ep), int(start))
+    for clip, ep, frame in zip(clips, eps, frame_idx):
+        assert dataset.clip_indices[int(clip)] == (int(ep), int(frame))
 
 
-def test_sample_windows_never_reads_the_last_row():
-    """The rotated NaN action lives on the final row of every episode."""
-    lengths = [30, 30]
-    span = 20
-    _, eps, starts = ft.sample_windows(
-        np.asarray(lengths), np.arange(2), span, 100, seed=0
-    )
-    for ep, start in zip(eps, starts):
-        assert start + span <= lengths[int(ep)] - 1
-
-
-def test_sample_windows_is_capped_by_episode_length():
-    lengths = [25, 100]
-    span = 20
-    _, eps, _ = ft.sample_windows(
-        np.asarray(lengths), np.arange(2), span, 50, seed=0
-    )
-    # episode 0 offers length - span = 5 valid starts, episode 1 offers 50.
+def test_sample_frames_is_capped_by_episode_length():
+    lengths = [5, 100]
+    _, eps, _ = ft.sample_frames(np.asarray(lengths), np.arange(2), 50, seed=0)
     assert (eps == 0).sum() == 5
     assert (eps == 1).sum() == 50
 
 
-def test_sample_windows_draws_without_replacement():
-    clips, _, _ = ft.sample_windows(
-        np.asarray([100]), np.array([0]), 20, 40, seed=3
-    )
+def test_sample_frames_draws_without_replacement():
+    clips, _, _ = ft.sample_frames(np.asarray([100]), np.array([0]), 40, seed=3)
     assert len(np.unique(clips)) == len(clips)
 
 
-def test_sample_windows_skips_episodes_that_are_too_short():
-    lengths = [10, 100]
-    _, eps, _ = ft.sample_windows(
-        np.asarray(lengths), np.arange(2), 20, 5, seed=0
-    )
-    assert set(eps.tolist()) == {1}
+def test_sample_frames_raises_when_nothing_fits():
+    with pytest.raises(ValueError, match='no valid frames'):
+        ft.sample_frames(np.asarray([0, 0]), np.arange(2), 5, seed=0)
 
 
-def test_sample_windows_raises_when_nothing_fits():
-    with pytest.raises(ValueError, match='no valid windows'):
-        ft.sample_windows(np.asarray([5, 5]), np.arange(2), 20, 5, seed=0)
-
-
-def test_sample_windows_is_sorted():
-    clips, _, _ = ft.sample_windows(
-        np.asarray([100, 100, 100]), np.arange(3), 20, 10, seed=0
-    )
+def test_sample_frames_is_sorted():
+    clips, _, _ = ft.sample_frames(np.asarray([100, 100, 100]), np.arange(3), 10, seed=0)
     assert np.all(np.diff(clips) > 0)
 
 
@@ -376,26 +314,9 @@ def test_sample_windows_is_sorted():
 ######################
 
 
-def test_extract_config_step_indices():
-    cfg = ft.ExtractConfig(history_size=3, num_preds=1, checkpoint='r/w.pt')
-    assert cfg.num_steps == 4
-    assert cfg.current_step == 2
-    assert cfg.next_step == 3
-
-
-def test_extract_config_rejects_unknown_variant():
-    with pytest.raises(ValueError, match='unknown feature variants'):
-        ft.ExtractConfig(variants=('not_a_variant',), checkpoint='r/w.pt')
-
-
-def test_extract_config_random_init_needs_a_checkpoint():
-    with pytest.raises(ValueError, match='random_init still needs'):
-        ft.ExtractConfig(random_init=True, checkpoint=None)
-
-
-def test_every_default_variant_has_a_label_step():
-    for variant in ft.DEFAULT_VARIANTS:
-        assert variant in ft.VARIANT_LABEL_STEP
+def test_extract_config_requires_a_checkpoint():
+    with pytest.raises(ValueError, match='checkpoint is required'):
+        ft.ExtractConfig(checkpoint=None)
 
 
 #############
@@ -464,7 +385,7 @@ def test_classification_baseline_is_the_majority_rate():
         'val': np.array([0] * 9 + [1]),
         'test': np.array([0] * 80 + [1] * 20),
     }
-    score, _ = fitting.fit_baseline(tg.TARGETS_BY_NAME['target_block'], y)
+    score, _ = fitting.fit_baseline(tg.TARGETS_BY_NAME['floor_material'], y)
     assert score == pytest.approx(0.8)
 
 
@@ -562,7 +483,7 @@ def test_logistic_probe_separates_two_classes():
     x = {s: v[0] for s, v in data.items()}
     y = {s: v[1] for s, v in data.items()}
 
-    target = tg.TARGETS_BY_NAME['target_block']
+    target = tg.TARGETS_BY_NAME['floor_material']
     cfg = fitting.FitConfig(epochs=80, patience=20, seed=0)
     _, _, metrics, hyper = fitting.fit_gradient_probe(
         'linear', x, y, target, cfg, 'cpu'
@@ -587,12 +508,12 @@ def test_fit_one_routes_linear_classification_to_gradients():
         for s, n in (('train', 200), ('val', 50), ('test', 100))
     }
     y = {
-        s: rng.integers(0, 4, size=len(v)).astype(np.int64)
+        s: rng.integers(0, 8, size=len(v)).astype(np.int64)
         for s, v in x.items()
     }
     cfg = fitting.FitConfig(epochs=5, patience=2, weight_decays=(1e-2,))
     _, _, _, _, hyper = fitting.fit_one(
-        'linear', x, y, tg.TARGETS_BY_NAME['target_block'], cfg, 'cpu'
+        'linear', x, y, tg.TARGETS_BY_NAME['floor_material'], cfg, 'cpu'
     )
     assert 'weight_decay' in hyper
 
@@ -607,7 +528,7 @@ def test_fit_config_rejects_an_unknown_rung():
 ##################
 
 
-def _fake_payload(n_train=200, n_eval=60, dim=16, num_steps=4, seed=0):
+def _fake_payload(n_train=200, n_eval=60, dim=16, num_steps=1, seed=0):
     """A cache-shaped payload with a decodable and an undecodable target."""
     rng = np.random.default_rng(seed)
     columns = tg.required_columns(
@@ -626,29 +547,27 @@ def _fake_payload(n_train=200, n_eval=60, dim=16, num_steps=4, seed=0):
     ):
         x = rng.normal(size=(n, dim)).astype(np.float32)
         effector = np.zeros((n, num_steps, 3), dtype=np.float32)
-        # Only the probed step carries the signal.
-        effector[:, 2] = x @ weight
+        effector[:, 0] = x @ weight
         digit = rng.integers(0, 10, size=(n, num_steps, 1)).astype(np.float32)
-        features[split] = {'emb': x}
+        features[split] = x
         labels[split] = {
             'proprio/effector_pos': effector,
             'privileged/digit_0_value': digit,
         }
         windows[split] = {
             'episode_idx': np.repeat(np.arange(n // 10 or 1), 10)[:n],
-            'start_step': np.arange(n),
+            'frame_idx': np.arange(n),
             'clip_index': np.arange(n),
         }
     meta = {
-        'feature_dims': {'emb': dim},
+        'feature_dim': dim,
         'label_columns': columns,
-        'variant_label_step': {'emb': 2},
         'column_dims': {
             'proprio/effector_pos': 3,
             'privileged/digit_0_value': 1,
         },
         'episodes': {s: [] for s in ft.SPLITS},
-        'num_windows': {'train': n_train, 'val': n_eval, 'test': n_eval},
+        'num_frames': {'train': n_train, 'val': n_eval, 'test': n_eval},
     }
     return {
         'features': features,
@@ -687,17 +606,6 @@ def test_fit_all_recovers_the_planted_signal_and_not_the_noise():
     assert scores[('digit_value', 'linear')] < 0.35
 
 
-def test_fit_all_reads_the_variant_label_step():
-    """Signal is planted only at step 2; reading step 0 must find nothing."""
-    payload = _fake_payload()
-    payload['meta']['variant_label_step']['emb'] = 0
-    cfg = fitting.FitConfig(probes=('linear',), weight_decays=(1e-2,))
-    rows, _ = fitting.fit_all(
-        payload, tg.select_targets(names=['effector_pos']), cfg, progress=False
-    )
-    assert rows[0]['score'] < 0.2
-
-
 def test_fit_all_reports_effective_n_for_episode_constant_targets():
     payload = _fake_payload()
     cfg = fitting.FitConfig(probes=('baseline',))
@@ -725,41 +633,7 @@ def test_fit_all_can_return_the_fitted_probes():
         keep_probes=True,
         progress=False,
     )
-    assert ('emb', 'effector_pos', 'linear') in probes
-
-
-def test_fit_all_rejects_an_absent_variant():
-    payload = _fake_payload()
-    with pytest.raises(KeyError, match='not in this cache'):
-        fitting.fit_all(
-            payload,
-            tg.select_targets(names=['effector_pos']),
-            fitting.FitConfig(probes=('baseline',)),
-            variants=['pred_emb'],
-            progress=False,
-        )
-
-
-#####################
-## fidelity check  ##
-#####################
-
-
-def test_prediction_fidelity_is_perfect_for_identical_features():
-    payload = _fake_payload()
-    rng = np.random.default_rng(0)
-    for split, feats in payload['features'].items():
-        emb = rng.normal(size=(len(feats['emb']), 8)).astype(np.float32)
-        feats['pred_emb'] = emb
-        feats['emb_next_true'] = emb.copy()
-    out = fitting.prediction_fidelity(payload)
-    for split in ft.SPLITS:
-        assert out[split]['cosine_mean'] == pytest.approx(1.0, abs=1e-5)
-        assert out[split]['mse'] == pytest.approx(0.0, abs=1e-8)
-
-
-def test_prediction_fidelity_is_empty_without_both_variants():
-    assert fitting.prediction_fidelity(_fake_payload()) == {}
+    assert ('effector_pos', 'linear') in probes
 
 
 ###########
@@ -775,8 +649,7 @@ def test_feature_cache_roundtrips(tmp_path):
     assert loaded['meta'] == payload['meta']
     for split in ft.SPLITS:
         assert np.allclose(
-            loaded['features'][split]['emb'],
-            payload['features'][split]['emb'],
+            loaded['features'][split], payload['features'][split]
         )
         for col in payload['meta']['label_columns']:
             assert np.allclose(

@@ -1,9 +1,8 @@
 """Run the probing experiment end to end: extract features, fit read-outs.
 
-    # one checkpoint, plus the untrained-encoder control
+    # one checkpoint
     python scripts/probe/run_probing.py \
         --checkpoint lewm_q4_dr/weights_epoch_11.pt \
-        --with-random-init \
         --out $STABLEWM_HOME/probing/lewm_q4_dr
 
     # reuse the cached features (skips the encoder entirely)
@@ -19,7 +18,7 @@
 
 Writes ``results.json`` (rows + metadata + the feature-cache manifest) and
 ``results.csv`` per run directory, and one ``features_<tag>.npz`` per
-configuration. The notebook ``scripts/notebooks/probe_lewm_ogbcubedr.ipynb``
+checkpoint. The notebook ``scripts/notebooks/probe_lewm_ogbcubedr.ipynb``
 drives the same functions interactively.
 """
 
@@ -58,12 +57,6 @@ def build_parser() -> argparse.ArgumentParser:
         'e.g. lewm_q4_dr/weights_epoch_11.pt',
     )
     grp.add_argument(
-        '--with-random-init',
-        action='store_true',
-        help='Also probe an untrained encoder of the same architecture — '
-        'the control that says how much of the score is the ViT prior.',
-    )
-    grp.add_argument(
         '--checkpoint-root',
         default=None,
         help='Overrides STABLEWM_HOME for the checkpoint lookup.',
@@ -79,13 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='Overrides STABLEWM_HOME for the dataset lookup.',
     )
 
-    grp = p.add_argument_group('targets and features')
+    grp = p.add_argument_group('targets')
     grp.add_argument('--targets', nargs='+', default=None)
     grp.add_argument(
         '--groups', nargs='+', default=None, choices=list(tg.GROUPS)
-    )
-    grp.add_argument(
-        '--variants', nargs='+', default=list(ft.DEFAULT_VARIANTS)
     )
     grp.add_argument(
         '--probes',
@@ -95,22 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     grp = p.add_argument_group('sampling')
-    # Episodes, not windows, are the unit that matters: every episode
+    # Episodes, not frames, are the unit that matters: every episode
     # re-draws lighting, camera angle, cube colours and materials, so
     # episode-level appearance dominates the features. Below ~1000 training
     # episodes a linear probe fits episode identity and every within-episode
     # target reads R2 ~ 0 on held-out episodes. Raise --train-episodes before
-    # raising --windows-per-episode, which adds correlated samples.
+    # raising --frames-per-episode, which adds correlated samples.
     grp.add_argument('--train-episodes', type=int, default=1000)
     grp.add_argument('--val-episodes', type=int, default=150)
     grp.add_argument('--test-episodes', type=int, default=250)
-    grp.add_argument('--windows-per-episode', type=int, default=20)
+    grp.add_argument('--frames-per-episode', type=int, default=20)
     grp.add_argument('--seed', type=int, default=0)
-
-    grp = p.add_argument_group('window layout (must match training)')
-    grp.add_argument('--history-size', type=int, default=3)
-    grp.add_argument('--num-preds', type=int, default=1)
-    grp.add_argument('--frameskip', type=int, default=5)
     grp.add_argument('--img-size', type=int, default=224)
 
     grp = p.add_argument_group('compute')
@@ -144,40 +129,26 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def run_tag(checkpoint: str, random_init: bool) -> str:
-    """Filesystem-safe label for one (checkpoint, control) configuration."""
-    stem = re.sub(r'[^A-Za-z0-9]+', '_', checkpoint.replace('.pt', '')).strip(
+def run_tag(checkpoint: str) -> str:
+    """Filesystem-safe label for one checkpoint."""
+    return re.sub(r'[^A-Za-z0-9]+', '_', checkpoint.replace('.pt', '')).strip(
         '_'
     )
-    return f'{stem}__randinit' if random_init else stem
 
 
-def configs_from_args(args):
-    """Every (checkpoint, random_init) configuration the run covers."""
-    for checkpoint in args.checkpoint:
-        yield checkpoint, False
-        if args.with_random_init:
-            yield checkpoint, True
-
-
-def extract_config(args, checkpoint: str, random_init: bool):
+def extract_config(args, checkpoint: str):
     return ft.ExtractConfig(
         dataset_name=args.dataset,
         checkpoint=checkpoint,
         checkpoint_root=args.checkpoint_root,
         dataset_cache_dir=args.dataset_root,
-        random_init=random_init,
-        history_size=args.history_size,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
         img_size=args.img_size,
         episodes={
             'train': args.train_episodes,
             'val': args.val_episodes,
             'test': args.test_episodes,
         },
-        windows_per_episode=args.windows_per_episode,
-        variants=tuple(args.variants),
+        frames_per_episode=args.frames_per_episode,
         seed=args.seed,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -223,32 +194,23 @@ def get_features(cfg, label_columns, cache_path: Path, reuse: bool):
 
 
 def summarize(rows, probe_targets) -> str:
-    """A compact table: score per (target, variant) for each rung."""
+    """A compact table: score per (target, rung) for each run."""
     from tabulate import tabulate
 
-    variants, rungs = [], []
-    for row in rows:
-        if row['variant'] not in variants:
-            variants.append(row['variant'])
-        if row['probe'] not in rungs:
-            rungs.append(row['probe'])
-
+    rungs = list(dict.fromkeys(r['probe'] for r in rows))
     lookup = {
-        (r['run'], r['variant'], r['target'], r['probe']): r['score']
-        for r in rows
+        (r['run'], r['target'], r['probe']): r['score'] for r in rows
     }
     runs = list(dict.fromkeys(r['run'] for r in rows))
 
-    table, headers = [], ['run', 'target', 'group', 'metric']
-    headers += [f'{v}/{p}' for v in variants for p in rungs]
+    table, headers = [], ['run', 'target', 'group', 'metric', *rungs]
     for run in runs:
         for target in probe_targets:
             metric = 'acc' if target.kind == 'classification' else 'R2'
             line = [run, target.name, target.group, metric]
-            for variant in variants:
-                for rung in rungs:
-                    score = lookup.get((run, variant, target.name, rung))
-                    line.append('-' if score is None else f'{score:.3f}')
+            for rung in rungs:
+                score = lookup.get((run, target.name, rung))
+                line.append('-' if score is None else f'{score:.3f}')
             table.append(line)
     return tabulate(table, headers=headers, tablefmt='github')
 
@@ -261,20 +223,16 @@ def main(argv=None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f'{len(probe_targets)} targets, {len(args.variants)} feature '
-        f'variants, {len(args.probes)} probe rungs'
-    )
+    print(f'{len(probe_targets)} targets, {len(args.probes)} probe rungs')
 
     all_rows: list[dict] = []
     manifests: dict[str, dict] = {}
-    fidelity: dict[str, dict] = {}
 
-    for checkpoint, random_init in configs_from_args(args):
-        tag = run_tag(checkpoint, random_init)
+    for checkpoint in args.checkpoint:
+        tag = run_tag(checkpoint)
         print(f'\n=== {tag} ===')
 
-        cfg = extract_config(args, checkpoint, random_init)
+        cfg = extract_config(args, checkpoint)
         payload = get_features(
             cfg,
             label_columns,
@@ -282,19 +240,16 @@ def main(argv=None) -> int:
             args.reuse_cache,
         )
         manifests[tag] = payload['meta']
-        fidelity[tag] = fitting.prediction_fidelity(payload)
 
         rows, probes = fitting.fit_all(
             payload,
             probe_targets,
             fit_config(args),
-            variants=args.variants,
             keep_probes=args.save_probes,
         )
         for row in rows:
             row['run'] = tag
             row['checkpoint'] = checkpoint
-            row['random_init'] = random_init
         all_rows.extend(rows)
 
         if args.save_probes:
@@ -302,16 +257,13 @@ def main(argv=None) -> int:
 
             probe_dir = out_dir / 'probes' / tag
             probe_dir.mkdir(parents=True, exist_ok=True)
-            for (variant, target, rung), probe in probes.items():
-                torch.save(
-                    probe, probe_dir / f'{variant}__{target}__{rung}.pt'
-                )
+            for (target, rung), probe in probes.items():
+                torch.save(probe, probe_dir / f'{target}__{rung}.pt')
 
     payload = {
         'args': vars(args),
         'targets': [asdict(t) for t in probe_targets],
         'manifests': manifests,
-        'prediction_fidelity': fidelity,
         'rows': all_rows,
     }
     with open(out_dir / 'results.json', 'w') as f:
