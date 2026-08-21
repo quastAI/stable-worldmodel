@@ -18,7 +18,7 @@ minute on the box itself.
 
 | Directory | Role |
 |---|---|
-| `stable-worldmodel/` | **Primary.** The framework: envs, datasets, world models (LeWM/DINO-WM/PLDM/TD-MPC2), planners, training and eval scripts. All project code lives here. |
+| `stable-worldmodel/` | **Primary.** The framework: envs, datasets, world models (LeWM/SMWM/DINO-WM/PLDM/TD-MPC2), planners, training and eval scripts. All project code lives here. |
 | `ogbench/` | Upstream OGBench checkout (v1.2.1). Read-only reference — SWM installs `ogbench` from PyPI at the same version. Only install this editable if you intend to modify OGBench itself. |
 | `le-wm/` | Original LeWM paper repo. **Parity reference only** — do not develop here. Its eval script targets an older SWM API (see §8). |
 
@@ -507,6 +507,77 @@ is no EMA target network).
 
 `swm checkpoints` lists what you have.
 
+### Sensorimotor world model (SMWM)
+
+`scripts/train/smwm.py` trains the sensorimotor variant: the same architecture as
+LeWM plus an MLP **inverse dynamics model** (`stable_worldmodel.wm.smwm.module.InverseModel`,
+`(z_t, z_{t+1}) -> a_t`) held *inside* the world model, and the objective
+
+```
+L = pred_loss + loss.inverse.weight * inv_loss + loss.sigreg.weight * sigreg_loss
+```
+
+`scripts/train/config/smwm.yaml` keeps the LeWM architecture verbatim (`encoder_scale=small`,
+`embed_dim=384`, `wm.history_size=3`) and differs from `lewm.yaml` in exactly three places:
+
+| Key | `lewm.yaml` | `smwm.yaml` | Why |
+|---|---|---|---|
+| `loss.inverse.weight` | — | `1.0` | the new IDM term |
+| `loss.sigreg.weight` | `0.09` | `0.0` | **the IDM replaces SIGReg** as the anti-collapse term |
+| `loader.batch_size` | `128` | `256` | matches the sensorimotor recipe |
+| `optimizer.lr` | `5e-5` | `1e-4` | linearly scaled for the 2× batch |
+
+```bash
+python scripts/train/smwm.py data=ogb_cube_quadruple_dr \
+    output_model_name=smwm_q4_dr \
+    trainer.max_epochs=100 \
+    loss.inverse.weight=1.0 \
+    inverse.hidden_dim=256
+```
+
+New knobs: `loss.inverse.weight` (λ_inv) and `inverse.hidden_dim`. The IDM is supervised on
+every consecutive latent pair in the window (3 pairs at
+`num_steps = num_preds + history_size = 4`) and regresses the **normalized** flattened
+action block, so its output width is `frameskip × action_dim = 25` — wired automatically in
+`run()` from `dataset.get_dim('action')`.
+
+**Watch `inv_loss` for collapse.** With `loss.sigreg.weight=0` the IDM is the *only* thing
+keeping the latent from collapsing — `pred_loss` alone is minimised at zero by a constant
+encoder, and there is no EMA target network. A run where `pred_loss` dives while `inv_loss`
+plateaus high is collapsing. Two escape hatches: raise `loss.inverse.weight`, or put SIGReg
+back with `loss.sigreg.weight=0.09` (that value was tuned at batch 128, and the SIGReg
+statistic scales with batch size, so re-tune it if you also keep `batch_size=256`).
+
+To reproduce a strict LeWM A/B instead, revert all four keys at once:
+
+```bash
+python scripts/train/smwm.py data=ogb_cube_quadruple_dr \
+    loss.inverse.weight=0.0 loss.sigreg.weight=0.09 \
+    loader.batch_size=128 optimizer.lr=5e-5
+```
+
+That is verified to reproduce `lewm.py`'s loss bit-for-bit.
+
+> **`loader.batch_size=256` is not free.** With `history_size=3` and `num_preds=1` each batch
+> pushes `256 × 4 = 1024` images at 224² through the ViT, double the LeWM baseline. If that
+> OOMs, use `loader.batch_size=128 optimizer.lr=5e-5`, or keep the effective batch with
+> `loader.batch_size=128 +trainer.accumulate_grad_batches=2` (leaving the LR at `1e-4`).
+> The LR *schedule* needs no manual fix either way — `total_steps` and the 1% warmup both
+> derive from `len(train)`, so they track the batch size automatically.
+
+Evaluation needs no SMWM-specific flags: `load_pretrained` rebuilds the model — inverse
+model included — from the checkpoint's `config.json`, so §7 applies verbatim with
+`policy=smwm_q4_dr/weights_epoch_N.pt`.
+
+**RunPod notebooks.** `scripts/notebooks/{train,plan,probe}_smwm_ogbcubedr.ipynb` are the
+SMWM counterparts of the three `*_lewm_ogbcubedr.ipynb` notebooks, same flow and same
+`/workspace` volume layout. Two of them take an optional pointer at the LeWM baseline so the
+comparison lands in one table: `BASELINE_RESULTS_DIR` in the planning notebook, and
+`BASELINE_MODEL_NAME` / `BASELINE_EPOCH` in the probing notebook (§11 there refits the same
+probes on the LeWM checkpoint over identical features and episode splits). The probing code
+in `scripts/probe/` is model-agnostic — it instantiates whatever `config.json` describes and
+calls `model.encode` — so it needed no changes for SMWM.
+
 > **The last action of every episode is `NaN`.** `World.collect` rotates the
 > action column (`ep['action'].append(ep['action'].pop(0))`), which moves the
 > reset frame's placeholder action to the end. The window sampler does not
@@ -538,6 +609,10 @@ python scripts/plan/eval_wm.py --config-name=cube_quadruple_dr policy=random
 # Trained model
 python scripts/plan/eval_wm.py --config-name=cube_quadruple_dr \
     policy=lewm_q4_dr/weights_epoch_100.pt
+
+# Sensorimotor variant - identical command, only the checkpoint differs
+python scripts/plan/eval_wm.py --config-name=cube_quadruple_dr \
+    policy=smwm_q4_dr/weights_epoch_100.pt
 ```
 
 Key settings (`scripts/plan/config/cube_quadruple_dr.yaml`):
