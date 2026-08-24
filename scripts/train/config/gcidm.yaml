@@ -1,0 +1,136 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+
+output_model_name: gcidm
+subdir: ${hydra:job.id}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: small
+embed_dim: 384
+encoder_resnet9: False
+train_value_function: False
+projector_loss_weight: 1e-3
+dump_object: True
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 256
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+optimizer:
+  type: AdamW
+  # linearly scaled from the LeWM baseline (5e-5 at batch 128) for batch 256
+  lr: 1e-4
+  weight_decay: 1e-3
+
+wm:
+  history_size: 3
+  num_preds: 1
+  # Planning horizon in action blocks. The goal frame is this many blocks
+  # after the current frame, so at frameskip 5 the goal is 25 env steps
+  # ahead -- which must match `eval.goal_offset_steps` and
+  # `plan_config.horizon * plan_config.action_block` in the plan config.
+  goal_horizon: 5
+
+model:
+  _target_: stable_worldmodel.wm.gcidm.GCIDM
+  encoder:
+    _target_: stable_pretraining.backbone.utils.vit_hf
+    size: ${encoder_scale}
+    patch_size: ${patch_size}
+    image_size: ${img_size}
+    pretrained: false
+    use_mask_token: false
+  predictor:
+    _target_: stable_worldmodel.wm.gcidm.module.Predictor
+    num_frames: ${wm.history_size}
+    input_dim: ${embed_dim}
+    hidden_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+  action_encoder:
+    _target_: stable_worldmodel.wm.gcidm.module.Embedder
+    input_dim: ???
+    emb_dim: ${embed_dim}
+  projector:
+    _target_: stable_worldmodel.wm.gcidm.module.MLP
+    input_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+  pred_proj:
+    _target_: stable_worldmodel.wm.gcidm.module.MLP
+    input_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+  # Goal-conditioned plan head: (z_{t-2}, z_{t-1}, z_t, z_goal) -> the whole
+  # `goal_horizon`-block action plan, as (mu, sigma). Held inside the world
+  # model so it round-trips through save_pretrained/load_pretrained and is
+  # available to PolicyCEMSolver at planning time.
+  policy_head:
+    _target_: stable_worldmodel.wm.gcidm.module.GoalPolicyHead
+    embed_dim: ${embed_dim}
+    action_dim: ??? # set in run(): frameskip * dataset.get_dim('action')
+    horizon: ${wm.goal_horizon}
+    # Same context the predictor gets, not just the current frame.
+    context_frames: ${wm.history_size}
+    hidden_dim: ${policy.hidden_dim}
+    num_layers: ${policy.num_layers}
+    predict_std: true
+    log_std_min: -5.0
+    log_std_max: 2.0
+
+policy:
+  # ~1.96M params at embed_dim 384 / action_dim 25 / horizon 5, comfortably
+  # under the ~24M predictor as required. tests/wm/test_gcidm.py asserts the
+  # ordering so a config edit cannot silently invert it.
+  hidden_dim: 768
+  num_layers: 3
+
+loss:
+  # Off by default: the policy head is the anti-collapse term for this model (a
+  # collapsed latent cannot say which plan connects a state to a goal). Kept
+  # configurable so `loss.sigreg.weight=0.09` reproduces the LeWM baseline
+  # objective. NOTE the SIGReg statistic scales with batch size, so 0.09 was
+  # tuned at batch 128.
+  sigreg:
+    weight: 0.0
+    kwargs:
+      knots: 17
+      num_proj: 1024
+  policy:
+    # L = L_fwd + policy.weight * L_policy + policy.std_weight * L_policy_std.
+    # At weight 0.0 this reduces to LeWM exactly and nothing regularizes the
+    # latent, so the encoder is free to collapse.
+    weight: 1.0
+    # The sigma head is trained by Gaussian NLL against a *detached* mean, so
+    # calibrating the spread can never reweight the encoder-shaping gradient.
+    # See scripts/train/gcidm.py::gcidm_forward for why that split matters.
+    std_weight: 1.0

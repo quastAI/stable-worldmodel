@@ -1,0 +1,71 @@
+# GCIDM planning: identical to `cube_quadruple_dr.yaml` except that CEM's
+# initial proposal distribution comes from the model's goal-conditioned policy
+# head instead of N(0, var_scale). Run this against the SAME checkpoint as
+# `cube_quadruple_dr.yaml` to separate the two effects the model claims:
+#
+#   this config vs. cube_quadruple_dr.yaml   -> what the warm start buys
+#   cube_quadruple_dr.yaml, gcidm vs. smwm   -> what the objective buys
+#
+defaults:
+  - launcher: local
+  - solver: policy_cem
+  - objective: goal_mse
+  - _self_
+
+world:
+  env_name: swm/OGBCubeDR-v0
+  num_envs: ${eval.num_eval}
+  # >= eval_budget; the script overrides this with 2 * eval_budget.
+  max_episode_steps: 640
+  env_type: quadruple
+  ob_type: states
+  multiview: False
+  width: 224
+  height: 224
+  visualize_info: False
+  terminate_at_goal: True
+  # DR knobs (see DRCubeEnv). Must match the collection env, otherwise the
+  # background/digit pool indices stored in the dataset mean something else.
+  num_digits: 1
+  num_bg_materials: 8
+  add_backdrop: True
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+
+seed: 42
+policy: random # ckpt name or random
+
+plan_config:
+  # Must equal the training-time `wm.goal_horizon`: the head emits exactly
+  # this many action blocks and PolicyCEMSolver refuses a mismatch.
+  horizon: 5
+  receding_horizon: 1 # true MPC; == horizon would be open-loop per plan
+  action_block: 5 # frameskip
+  history_len: 3 # must match wm.history_size used at training time
+  # The policy head owns the initialization, so there is no reason to carry
+  # the previous plan's tail. Set true (and solver.warm_start_mode=tail) to
+  # keep the previous prefix and have the head fill only the remainder.
+  warm_start: false
+
+# Evaluation from dataset: replay an expert episode, restore the env to the
+# recorded state (including the sampled domain randomization), then hand the
+# planner a chain of oracle subgoals `goal_offset_steps` apart. No `callables`
+# block is needed - DRCubeEnv implements `reset_options_from_dataset`.
+eval:
+  num_eval: 50
+  # Must equal plan_config.horizon * plan_config.action_block: the head was
+  # trained on a goal frame exactly that many env steps ahead.
+  goal_offset_steps: 25
+  num_subgoals: 8
+  subgoal_budget: 40
+  subgoal_advance: both # advance on reach or on budget, whichever is first
+  subgoal_tol: 0.04
+  eval_budget: 320 # num_subgoals * subgoal_budget
+  img_size: 224
+  dataset_name: ogbench/cube_quadruple_dr_expert.lance
+
+output:
+  filename: ogb_cube_quadruple_dr_gcidm_results.txt

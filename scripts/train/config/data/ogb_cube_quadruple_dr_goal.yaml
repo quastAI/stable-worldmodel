@@ -1,0 +1,33 @@
+dataset:
+  name: ogbench/cube_quadruple_dr_expert.lance
+  # GCIDM's clip must additionally reach the goal frame, which sits
+  # `wm.goal_horizon` action-blocks after the current frame (index
+  # `history_size - 1`) -- so the last index needed is
+  # `history_size - 1 + goal_horizon` and the clip needs one more than that.
+  # At the shipped 3 + 5 that is 8 frames spanning 40 env steps, of which the
+  # ViT only ever encodes 5 (see scripts/train/gcidm.py::gcidm_forward).
+  # Kept as a separate data config rather than an override because gcidm.yaml
+  # lists `_self_` first in `defaults`, so the data group wins over the
+  # parent config body.
+  num_steps: ${eval:'${wm.history_size} + ${wm.goal_horizon}'}
+  frameskip: 5
+  # `keys_to_merge` resolves its source as a regex over the *loaded* keys
+  # (`LanceDataset._keys = keys_to_load or available`), so the `proprio/*`
+  # columns have to be listed here or the merge concatenates an empty list and
+  # raises `need at least one array to concatenate` before training starts.
+  keys_to_load:
+    - pixels
+    - action
+    - observation
+    - proprio/joint_pos
+    - proprio/joint_vel
+    - proprio/effector_pos
+    - proprio/effector_yaw
+    - proprio/gripper_opening
+    - proprio/gripper_vel
+    - proprio/gripper_contact
+  keys_to_cache:
+    - action
+    - observation
+  keys_to_merge:
+    proprio: proprio

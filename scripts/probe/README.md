@@ -108,3 +108,64 @@ Per run directory:
 - `probes/<tag>/` — the fitted read-outs, with `--save-probes`. They carry
   their own feature- and target-standardization buffers, so
   `probe.predict(raw_features)` returns physical units.
+
+## `shortcut_ceiling.py` — the GCIDM pre-test
+
+A second, **model-free** entry point in this directory. It answers a
+different question from the probes above: not "what did this encoder keep?"
+but "is the objective we are about to train even capable of forcing the
+encoder to keep it?"
+
+GCIDM regresses the action-block plan joining an observation to a goal
+observation. Because the OGBench oracle's action is literally an effector
+delta (`plan[i] - proprio/effector_pos`, see
+`ogbench/manipspace/oracles/plan/plan_oracle.py`), the *sum* of that plan is
+computable from gripper features alone — no cube state needed. Only the path
+curvature (approach above the cube, descend, grasp, lift, clearance
+waypoint) and the grasp timing genuinely require knowing where a cube is.
+
+The script brackets that with two ceilings, fit from **ground-truth state**
+instead of a learned encoder — so it needs no checkpoint and runs on CPU:
+
+| Feature set | Columns | Meaning |
+|---|---|---|
+| `proprio` | every `proprio/*` (19 dims: joint pos/vel, effector pose, gripper opening/vel/contact) | **shortcut ceiling** — best R² using the robot only |
+| `full_state` | `observation` (55 dims; = proprio + the four block poses) | **information ceiling** — best R² with perfect state |
+
+The direction is inverted relative to the probes above: here the *features*
+are state and the *target* is the action plan. Everything else is shared —
+`fit.py`'s baseline / linear-ridge / mlp rungs, the episode-level split,
+train-statistic whitening, one touch of the test split.
+
+```bash
+python scripts/probe/shortcut_ceiling.py --out runs/shortcut_ceiling_h5
+```
+
+**Reading it.** The gap `R²(full_state) − R²(proprio)` is the entire headroom
+cube state can buy at this horizon.
+
+- **gap < ~0.05** → NO-GO. No encoder can be pushed to represent cube state
+  by this objective at this horizon, so training would be uninformative.
+- **gap large** → GO. Record both numbers: labels are z-scored, so once
+  GCIDM trains, `train/policy_loss` lands on the same axis via
+  `R² ≈ 1 − policy_loss`, and its position between the two ceilings says how
+  much of the available cube information the encoder actually used.
+- **gap negative** → INCONCLUSIVE, reported as such. `observation` is a
+  strict superset of the `proprio` columns, so a negative gap is impossible
+  in the data and means the wider feature set is underfit. Raise
+  `--train-episodes` / `--windows-per-episode`.
+
+`--goal-horizon` also drives the fallback design. Sweeping it shows where the
+gap is widest, which is the offset a long-horizon shaping head should use:
+
+```bash
+for H in 5 10 20; do
+  python scripts/probe/shortcut_ceiling.py --goal-horizon $H \
+         --out runs/shortcut_ceiling_h$H
+done
+```
+
+`--frameskip`, `--context-frames` and `--goal-horizon` must match
+`data.dataset.frameskip`, `wm.history_size` and `wm.goal_horizon` in
+`scripts/train/config/gcidm.yaml` for the numbers to be comparable to a
+training run.

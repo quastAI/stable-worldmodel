@@ -1,0 +1,20 @@
+_target_: stable_worldmodel.planning.solver.PolicyCEMSolver
+cost: ???
+batch_size: 1
+num_samples: 300
+# NOTE despite the name this scales a standard deviation, not a variance:
+# CEM samples `randn * var + mean` and refits `var` as the elite std.
+var_scale: 1.0
+n_steps: 30
+topk: 30
+device: "cuda"
+seed: ${seed}
+# `replace`: the policy head proposes the whole horizon and any leftover plan
+# is discarded -- the mode that isolates the head's contribution. `tail`: the
+# previous plan keeps its prefix and the head fills the rest (needs
+# plan_config.warm_start: true to have a prefix to keep).
+warm_start_mode: replace
+# Lower clamp on the proposal std. A confidently-wrong head would otherwise
+# collapse the search to a point; this floor is what keeps CEM able to move
+# away from the proposal.
+var_floor: 0.1

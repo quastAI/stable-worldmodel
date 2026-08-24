@@ -26,6 +26,7 @@ from stable_worldmodel.planning.solver import (
     LagrangianSolver,
     MPPISolver,
     PGDSolver,
+    PolicyCEMSolver,
     PredictiveSamplingSolver,
     Solver,
 )
@@ -53,6 +54,7 @@ __all__ = [
     'MPPISolver',
     'Objective',
     'PGDSolver',
+    'PolicyCEMSolver',
     'PredictiveSamplingSolver',
     'ShootingCostEvaluator',
     'Solver',

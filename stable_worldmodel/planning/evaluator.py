@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import torch
 
-from stable_worldmodel.protocols import Dynamics, Objective
+from stable_worldmodel.protocols import Actionable, Dynamics, Objective
 
 
 def default_goal_encode(model: Dynamics, info_dict: dict) -> torch.Tensor:
@@ -49,9 +49,12 @@ class ShootingCostEvaluator(torch.nn.Module):
     candidate dtype from it instead of falling back to float32.
 
     The actor warm-start tail-fill — a solver calling ``model.get_action`` for
-    ``Actionable`` models such as tdmpc2 — is not forwarded through the wrapper;
-    it is moot for the ``LeWM``-style models this targets. Add ``get_action``
-    delegation if an ``Actionable`` model is ever wrapped.
+    ``Actionable`` models such as tdmpc2 — is forwarded to the wrapped model
+    when that model is itself ``Actionable`` (e.g.
+    :class:`~stable_worldmodel.wm.gcidm.GCIDM`, which carries a
+    goal-conditioned policy head). For plain ``LeWM``-style models the
+    attribute is absent, so a solver probing for it sees no actor and
+    zero-pads as before.
 
     Args:
         model: World model providing ``encode``/``rollout`` (the ``Dynamics``
@@ -83,6 +86,11 @@ class ShootingCostEvaluator(torch.nn.Module):
         self.encode_goal = encode_goal
         if constraints:
             self.get_constraints = self._get_constraints
+        # Bound only when the model is Actionable, so that a solver probing
+        # `isinstance(cost, Actionable)` still sees no actor for models
+        # without one (LeWM/SMWM/PLDM) and falls back to zero-padding.
+        if isinstance(model, Actionable):
+            self.get_action = model.get_action
 
     def _rollout(
         self, info_dict: dict, action_candidates: torch.Tensor
