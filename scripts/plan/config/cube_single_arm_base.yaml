@@ -1,0 +1,86 @@
+# Shared base for all six stage-D arms.
+#
+# The plan holds the planner, the cost and the eval protocol IDENTICAL across
+# arms -- that is the whole point of the comparison. Making that a shared base
+# rather than six copies is deliberate: six copies drift, and a drifted
+# `plan_config` would show up as an arm difference indistinguishable from a
+# representation difference.
+#
+# An arm config overrides exactly two things: `model` and `arm`. Anything else
+# an arm needs to override is a deviation and must be recorded in the scatter's
+# `deviations` column.
+
+defaults:
+  - launcher: local
+  - solver: cem
+  - objective: goal_mse      # O(n)-invariant, which Thm 4 requires
+  - _self_
+
+world:
+  env_name: swm/LeJEPACube-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 640
+  env_type: single
+  ob_type: states
+  multiview: False
+  width: 224
+  height: 224
+  visualize_info: False
+  terminate_at_goal: True
+  # Must match the collection env, or the background/digit pool indices stored
+  # in the dataset mean something else on replay.
+  num_digits: 1
+  num_bg_materials: 8
+  add_backdrop: True
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    # Arms P and O read their latent straight out of these. Without them
+    # `StateWM.encode` sees nothing -- it raises rather than planning on a
+    # constant embedding, which would otherwise look exactly like a
+    # catastrophic identifiability failure.
+    - privileged/block_0_pos
+    - privileged/block_0_quat
+    - privileged/block_0_yaw
+    - privileged/ee_yaw
+    - proprio/effector_pos
+    - proprio/effector_yaw
+    - proprio/gripper_opening
+    - qpos
+    - qvel
+
+seed: 42
+policy: random
+
+# HELD FIXED ACROSS ALL ARMS.
+plan_config:
+  horizon: 5
+  receding_horizon: 1
+  action_block: 5
+  history_len: 3
+
+# HELD FIXED ACROSS ALL ARMS.
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  num_subgoals: 8
+  subgoal_budget: 40
+  subgoal_advance: both
+  subgoal_tol: 0.04
+  eval_budget: 320
+  img_size: 224
+  dataset_name: ogbench/cube_single_predictor.lance
+
+# The ground-truth latent for arms P and O, in fixed order. Shared so the two
+# are scored in the same coordinates.
+state_keys:
+  - privileged/block_0_pos
+  - privileged/block_0_yaw
+  - proprio/effector_pos
+  - privileged/ee_yaw
+  - proprio/gripper_opening
+
+output:
+  filename: cube_single_arm_${arm}_results.txt

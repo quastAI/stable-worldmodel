@@ -1,0 +1,13 @@
+# Arm C2: encoder trained on stride-matched trajectory pairs.
+# The stride was fitted so the achieved rho matches the declared one, which is
+# what lets the A->C1 gap be decomposed into a rho mismatch plus a
+# marginal-shape problem.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: c2
+checkpoint: lejepa_predictor_c2/weights_final.pt
+model:
+  _target_: stable_worldmodel.wm.utils.load_pretrained
+  name: ${checkpoint}

@@ -1,0 +1,32 @@
+# Scoring a checkpoint with the frozen metric suite.
+
+defaults:
+  - _self_
+
+checkpoint: ???
+arm: A
+
+# BOTH are required for a complete row. The encoder trains on OU-set states and
+# the planner only ever sees rollouts; the gap between them is a measurement,
+# not a nuisance to be asserted away.
+ou_dataset: ogbench/cube_single_ou.lance
+rollout_dataset: ogbench/cube_single_predictor.lance
+
+cache_dir: null
+max_samples: 20000
+seed: 3072
+device: cuda
+
+# Success rates from `scripts/plan/eval_wm.py`, supplying both y-axes.
+success_rate: null
+success_rate_oracle: null
+success_rate_state: null
+
+# Append-only, written from the first run onward: several of its columns
+# cannot be reconstructed after the fact.
+scatter_path: outputs/lejepa_scatter.jsonl
+
+program_constants:
+  rho: 0.9
+  lambda: 3.0e-3
+  seed_budget: 5

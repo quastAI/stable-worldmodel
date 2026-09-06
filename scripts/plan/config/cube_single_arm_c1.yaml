@@ -1,0 +1,10 @@
+# Arm C1: encoder trained on naive consecutive-frame pairs.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: c1
+checkpoint: lejepa_predictor_c1/weights_final.pt
+model:
+  _target_: stable_worldmodel.wm.utils.load_pretrained
+  name: ${checkpoint}

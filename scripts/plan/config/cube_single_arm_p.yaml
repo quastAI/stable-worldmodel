@@ -1,0 +1,12 @@
+# Arm P: ground-truth state + learned predictor.
+# The 'perfect representation' ceiling, and the denominator of the SR/SR(P)
+# y-axis. Same predictor family, capacity and budget as arm A.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: p
+checkpoint: state_predictor/weights_final.pt
+model:
+  _target_: stable_worldmodel.wm.utils.load_pretrained
+  name: ${checkpoint}

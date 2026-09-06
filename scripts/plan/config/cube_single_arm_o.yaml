@@ -1,0 +1,15 @@
+# Arm O: ground-truth state + MuJoCo re-simulation.
+# The absolute ceiling and the denominator of SR/SR(O). Measured at ~0.25 s per
+# planning call, so the planner is held fixed here too -- no reduced sample
+# count is needed.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: o
+model:
+  _target_: stable_worldmodel.wm.state.OracleWM
+  state_keys: ${state_keys}
+  action_block: ${plan_config.action_block}
+  num_samples_override: null   # null keeps the planner identical to every other arm
+  use_batched_rollout: false   # mujoco.rollout cannot drive a Python Cartesian controller

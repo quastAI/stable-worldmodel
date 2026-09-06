@@ -1,0 +1,74 @@
+# Arm P: predictor on ground-truth state.
+#
+# Predictor family, capacity, optimiser, schedule and epoch budget are
+# deliberately identical to `lejepa_predictor.yaml`. Arm P is the
+# perfect-representation ceiling; if any of those differ, it stops being a
+# clean control and SR/SR(P) stops meaning what the plan says it means.
+
+defaults:
+  - _self_
+  - launcher: local
+  - data: ogb_cube_single_pred
+
+output_model_name: state_predictor
+subdir: ${hydra:job.id}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+
+predictor_hidden_dim: 512
+
+# The ground-truth latent, in fixed order. Must match `state_keys` in
+# scripts/plan/config/cube_single_arm_base.yaml, or arms P and O are scored in
+# different coordinates and GoalMSE compares unlike with unlike.
+state_keys:
+  - privileged/block_0_pos
+  - privileged/block_0_yaw
+  - proprio/effector_pos
+  - privileged/ee_yaw
+  - proprio/gripper_opening
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+model:
+  _target_: stable_worldmodel.wm.state.StateWM
+  predictor:
+    _target_: stable_worldmodel.wm.lejepa.module.Predictor
+    num_frames: ${wm.history_size}
+    input_dim: ???
+    hidden_dim: ${predictor_hidden_dim}
+    output_dim: ???
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+  action_encoder:
+    _target_: stable_worldmodel.wm.lejepa.module.Embedder
+    input_dim: ???
+    emb_dim: ???

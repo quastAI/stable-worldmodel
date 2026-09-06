@@ -1,0 +1,92 @@
+# Encoder dataset for the LeJEPA identifiability study (Env 1, stage A).
+#
+# Every decision the research plan leaves open is a knob here, not a constant
+# in the code. The three blocks that matter are `program_constants` (frozen
+# before Env 1 and copied verbatim into every result row), `latents` (which
+# decides what z is, and therefore n), and `violation`.
+
+defaults:
+  - _self_
+
+dataset_name: ogbench/cube_single_ou.lance
+cache_dir: null
+write_mode: overwrite
+
+# Sized against the phase-0 throughput benchmark: at ~165 frames/s a 200k-pair
+# dataset is 400k frames, ~0.67 core-hours in one process. Shard for more.
+num_pairs: 200000
+seed: 3072
+
+shard: 0
+num_shards: 1
+
+# Frozen before Env 1. Any run that deviates from these is flagged as a
+# first-class event in the scatter, so they live here rather than being passed
+# around per-script.
+program_constants:
+  rho: 0.9          # mid-range of Fig. 6's best region, clear of the rho=0.99 collapse
+  lambda: 3.0e-3    # in [1e-3, 1e-2] per Fig. 6
+  seed_budget: 5
+
+env:
+  env_type: single
+  image_size: 224
+  num_digits: 1
+  camera: front_pixels
+  marker:
+    # Breaks the cube's exact 4-fold yaw symmetry. Without it, yaws pi/2 apart
+    # render to zero differing pixels and cube.yaw is unidentifiable in
+    # principle -- no encoder can recover what the renderer discarded.
+    enabled: true
+    # 'top' is visible at every yaw but foreshortened by the oblique camera
+    # (~48 differing pixels between yaws pi/2 apart); 'front' is ~5x stronger
+    # when visible and invisible for roughly half of all yaws. Measured, not
+    # assumed -- see MARKER_YAW_SIGNAL_RMS_* in lejepa_cube_env.py.
+    face: top
+    scale: 0.85
+
+latents:
+  # 'task_content' (n=9, physical only) is the stage-A exit-criterion profile
+  # and the one that actually exercises the alignment loss's discard
+  # behaviour. 'all_content' (n=58) leaves no continuous style at all, so the
+  # style-invariance metric is vacuous under it -- run as a scaling datapoint.
+  profile: task_content
+
+  # cube.yaw is circular and has no Gaussian marginal, so it is sampled on a
+  # sub-arc. This is a *declared* V5-type support truncation, recorded in the
+  # registry rather than discovered later as an anomaly. pi/2 spans two
+  # quadrants, which keeps the 4-fold ambiguity live and the marker
+  # load-bearing; below pi/4 the silhouette alone identifies yaw and the
+  # marker becomes redundant.
+  yaw_half_arc: 1.5707963267948966
+
+  # Off under the yaw-only decision. The sampler's tangent-space branch is
+  # written and tested but unused.
+  include_roll_pitch: false
+
+  # Discrete latents are renderable and hence content-capable, but have no
+  # Gaussian marginal -- a structural V1. Off by default; when on, the
+  # monotone-recovery metric is reported instead of the linear one.
+  include_discrete: false
+
+  # Above the table on purpose. Lifted, table-clipped and interpenetrating
+  # cubes are all allowed, which is what makes the induced V5 baseline zero by
+  # construction in stage A.
+  pos_z_max: 0.15
+
+# Sampler knobs not driven by `violation`. A violation's own kwargs override
+# whatever is set here, so the two cannot silently disagree.
+ou:
+  dist: gaussian
+  alpha: null
+  noise_coupling: 0.0
+  cross_corr: 0.0
+
+violation:
+  name: none
+  severity: 0.0
+
+style:
+  # Style latents are resampled *within* a pair -- the two views get
+  # independent draws. This is what the alignment term is asked to discard.
+  resample_within_pair: true

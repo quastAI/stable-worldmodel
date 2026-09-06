@@ -1,0 +1,10 @@
+# Arm A: frozen LeJEPA encoder + learned predictor. The arm under test.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: a
+checkpoint: lejepa_predictor/weights_final.pt
+model:
+  _target_: stable_worldmodel.wm.utils.load_pretrained
+  name: ${checkpoint}

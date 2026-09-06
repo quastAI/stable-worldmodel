@@ -1,0 +1,12 @@
+# Arm R: random frozen encoder + learned predictor.
+# Identical to arm A in every respect except which checkpoint is loaded -- that
+# is what makes it a control rather than a different experiment.
+defaults:
+  - cube_single_arm_base
+  - _self_
+
+arm: r
+checkpoint: lejepa_predictor_random/weights_final.pt
+model:
+  _target_: stable_worldmodel.wm.utils.load_pretrained
+  name: ${checkpoint}

@@ -1,0 +1,14 @@
+# The encoder dataset: one OU positive pair per two-step episode.
+#
+# `num_steps: 2, frameskip: 1` is what turns a recorded episode back into the
+# pair it was written as -- `pixels` arrives as (2, C, H, W) and `latent/z` as
+# (2, n). No custom loader is involved anywhere in this pipeline.
+dataset:
+  name: ogbench/cube_single_ou.lance
+  num_steps: 2
+  frameskip: 1
+  keys_to_load:
+    - pixels
+    - latent/z
+  keys_to_cache:
+    - latent/z

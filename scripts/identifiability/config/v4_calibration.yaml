@@ -1,0 +1,20 @@
+# Phase 6: reproduce the published Table-2 anisotropy boundary.
+#
+# Run BEFORE the production sweep. It is the only cheap chance to discover that
+# the metric suite cannot resolve the effect it was built to measure --
+# finding that out after the full severity x seed budget has been spent would
+# invalidate the budget, not just the V4 rows.
+
+defaults:
+  - _self_
+
+# `n` for the stage-A exit-criterion profile (task_content).
+n: 9
+
+# The frozen program constant. The boundary's location depends on it, so a
+# calibration run at a different rho does not license the production sweep.
+rho: 0.9
+
+num_samples: 20000
+seed: 3072
+output: outputs/v4_calibration.json
