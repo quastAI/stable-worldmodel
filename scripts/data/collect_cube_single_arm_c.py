@@ -170,6 +170,7 @@ def run(cfg: DictConfig):
         width=cfg.env.image_size,
         height=cfg.env.image_size,
         num_digits=cfg.env.num_digits,
+        pixel_transparent_arm=cfg.env.pixel_transparent_arm,
         marker_enabled=cfg.env.marker.enabled,
         marker_face=cfg.env.marker.face,
         marker_scale=cfg.env.marker.scale,

@@ -31,34 +31,40 @@ program_constants:
 env:
   env_type: single
   image_size: 224
-  num_digits: 1
+  # No floor digit distractors. They exist to give a linear probe a nuisance
+  # target in the DR benchmark; nothing here reads them, and against a scene
+  # whose content latents are already small in the frame they are pure
+  # occlusion risk.
+  num_digits: 0
   camera: front_pixels
+  # The arm is NOT faded. Upstream OGBench renders it at alpha 0.1 so it does
+  # not occlude the object in a manipulation benchmark -- but effector.pos,
+  # effector.yaw and gripper.opening are content latents the encoder must
+  # recover here, so hiding them would be self-defeating.
+  pixel_transparent_arm: false
   marker:
-    # Breaks the cube's exact 4-fold yaw symmetry. Without it, yaws pi/2 apart
-    # render to zero differing pixels and cube.yaw is unidentifiable in
-    # principle -- no encoder can recover what the renderer discarded.
-    enabled: true
-    # 'top' is visible at every yaw but foreshortened by the oblique camera
-    # (~48 differing pixels between yaws pi/2 apart); 'front' is ~5x stronger
-    # when visible and invisible for roughly half of all yaws. Measured, not
-    # assumed -- see MARKER_YAW_SIGNAL_RMS_* in lejepa_cube_env.py.
+    # Off. A decal breaks the cube's 4-fold yaw symmetry, but that symmetry is
+    # a symmetry of the *grasping task* too: yaw and yaw+pi/2 are one state
+    # under two names. Sampling yaw on one fundamental domain (below) makes it
+    # identifiable without scoring the encoder on a quadrant index no grasp
+    # depends on. Enable only to study the full circle deliberately.
+    enabled: false
     face: top
     scale: 0.85
 
 latents:
   # 'task_content' (n=9, physical only) is the stage-A exit-criterion profile
   # and the one that actually exercises the alignment loss's discard
-  # behaviour. 'all_content' (n=58) leaves no continuous style at all, so the
+  # behaviour. 'all_content' (n=54) leaves no continuous style at all, so the
   # style-invariance metric is vacuous under it -- run as a scaling datapoint.
   profile: task_content
 
-  # cube.yaw is circular and has no Gaussian marginal, so it is sampled on a
-  # sub-arc. This is a *declared* V5-type support truncation, recorded in the
-  # registry rather than discovered later as an anomaly. pi/2 spans two
-  # quadrants, which keeps the 4-fold ambiguity live and the marker
-  # load-bearing; below pi/4 the silhouette alone identifies yaw and the
-  # marker becomes redundant.
-  yaw_half_arc: 1.5707963267948966
+  # One fundamental domain of the cube's C4 yaw symmetry (pi/4, less a 5%
+  # margin so the arc's two endpoints -- which are the SAME configuration --
+  # cannot both collect clipped mass). Yaw is then identifiable from the
+  # silhouette alone, and the coordinate is a coordinate on the quotient
+  # rather than on the raw circle. Widening past pi/4 requires marker.enabled.
+  yaw_half_arc: 0.7461282552275249
 
   # Off under the yaw-only decision. The sampler's tangent-space branch is
   # written and tested but unused.

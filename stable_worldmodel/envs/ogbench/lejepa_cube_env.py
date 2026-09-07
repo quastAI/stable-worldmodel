@@ -4,9 +4,9 @@
 with what the encoder dataset (see the Env-1 implementation plan, SS5.B) needs
 and the stock domain-randomized environment does not have:
 
-* **A yaw marker** -- one asymmetric decal baked onto a cube face, so
-  ``cube.yaw`` has an image correlate at all. Without it the cube is 4-fold
-  symmetric about z and yaw is unrecoverable by construction.
+* **A grasp-relevant yaw convention** -- ``cube.yaw`` is sampled on one
+  fundamental domain of the cube's own symmetry group, so it is identifiable
+  from the silhouette with no marker at all. See below.
 * **``agent.ee_start_yaw``** -- a variation axis for the effector's yaw, which
   the parent draws from ``self.np_random`` inside ``initialize_arm`` and
   therefore does not expose as a controllable latent.
@@ -69,6 +69,71 @@ already a content latent in its own right (plan SS3.2).
 :meth:`render_content` is an addition, not a replacement: the inherited
 ``reset`` is untouched and remains the path used by evaluation, replay and
 every stepped-physics consumer.
+
+The orientation quantity that matters
+-------------------------------------
+A cube grasped by a parallel-jaw gripper has a symmetry group, and the
+identifiability target should be a coordinate on the *quotient*, not on the
+raw circle.
+
+Rotating the cube by ``pi/2`` about z maps it exactly onto itself -- the
+renderer produces zero differing pixels (measured; see the table below) and
+the grasp is the same grasp. So ``cube.yaw`` and ``cube.yaw + pi/2`` are not
+two states that an encoder is failing to distinguish; they are **one state
+with two names**. The gripper carries the matching symmetry: its jaws are
+symmetric under a ``pi`` rotation about the approach axis, so ``effector.yaw``
+is likewise only meaningful modulo ``pi``.
+
+Two ways to make yaw identifiable follow from that, and they are not equally
+good:
+
+*Break the symmetry* (a decal on a face). This makes all of ``[0, 2pi)``
+distinguishable -- but it does so by inventing a distinction the *task* does
+not have, and paying for it with a ~48-pixel signal on a 50k-pixel frame. The
+encoder is then scored on recovering a quadrant index that no grasp depends
+on, and the resulting failure mode dominates the yaw metric while being
+irrelevant to control.
+
+*Quotient the symmetry out* (what this class does). Sample ``cube.yaw`` on a
+single fundamental domain of the 4-fold group -- an arc of width ``pi/2``,
+centred at zero. Every physically distinct orientation has exactly one
+representative there, the silhouette determines it strongly (rms 6.1 between
+the arc's own extremes), and no marker is needed. ``effector.yaw`` is already
+declared on ``[-pi/2, pi/2]``, one fundamental domain of the gripper's 2-fold
+symmetry, for the same reason.
+
+The marker machinery is kept and tested but defaults **off**; enabling it is
+how one would study the full circle deliberately, not the default posture.
+
+One consequence worth stating before anyone reads a yaw-recovery curve:
+**pixel separability is not monotone in angular error.** Measured at 224x224
+on an unmarked cube::
+
+    separation    rms
+      21 deg     3.79
+      43 deg     4.36
+      86 deg     1.17
+
+Separability peaks near 45 deg and falls back toward zero at 90 deg, because
+90 deg *is* the identification. So a larger raw angular error can look far
+*less* wrong than a smaller one, and any metric that assumes monotonicity in
+raw angle will misread the result. Scoring on the quotient coordinate -- which
+is what the registry hands the metric suite -- is what avoids this.
+
+What is deliberately absent
+---------------------------
+``num_digits`` defaults to ``0`` here, against :class:`DRCubeEnv`'s ``1``. The
+floor digit decals exist to give a linear probe a nuisance target in the DR
+benchmark. Nothing in the identifiability study reads them, and against a
+scene whose content latents already occupy few pixels they are pure occlusion
+risk -- a V6 contribution nobody asked for.
+
+``pixel_transparent_arm`` defaults to ``False``, against OGBench's ``True``.
+Upstream fades the arm to alpha 0.1 so it does not occlude the object in a
+manipulation benchmark. Here ``effector.pos``, ``effector.yaw`` and
+``gripper.opening`` are *content latents the encoder must recover*, so fading
+them to near-invisibility would be asking for the recovery of something the
+renderer was told to hide.
 """
 
 import mujoco
@@ -100,9 +165,7 @@ MARKER_FACES = {
 }
 
 # How strong the yaw signal actually is, measured at 224x224 on the stock
-# `front_pixels` camera with a 0.026 m half-extent cube. Reported here because
-# it is a prediction the identifiability metrics will be checked against, not a
-# free parameter -- see `test_marker_makes_yaw_observable`.
+# `front_pixels` camera with a 0.026 m half-extent cube:
 #
 #   config                       rms(0, pi/2)   rms(0, pi/4)   px differing
 #   no marker                          0.0089         6.1182              0
@@ -110,21 +173,11 @@ MARKER_FACES = {
 #   marker top,   scale 0.95           2.0936         7.4526             48
 #   marker front, scale 0.95           5.9023         6.8466            224
 #
-# Two things follow, both of which shape what the recovery metrics can show:
-#
-# 1. Without a marker the cube is *exactly* 4-fold symmetric about z -- yaws
-#    pi/2 apart render to zero differing pixels. But yaws pi/4 apart differ
-#    strongly (rms 6.1) from the silhouette alone. So yaw is already
-#    observable **modulo pi/2** with no marker at all; the marker's job is
-#    only to break the remaining 4-fold quadrant ambiguity.
-# 2. A top-face marker breaks it with a comparatively weak signal -- ~48
-#    pixels of a 50k-pixel frame. A front-face marker is ~5x stronger when
-#    visible, and invisible for roughly half of all yaws.
-#
-# The prediction, recorded before measurement: yaw recovery will be good
-# modulo pi/2 and markedly worse on the quadrant, and that gap is a property
-# of the *rendering*, not of the encoder. A yaw metric that does not separate
-# the two will misattribute it.
+# The first row is the whole argument. An unmarked cube is *exactly* 4-fold
+# symmetric about z -- yaws pi/2 apart render to zero differing pixels -- but
+# yaws pi/4 apart differ strongly (rms 6.1) from the silhouette alone. So yaw
+# is already strongly observable **within a quadrant**; only the quadrant
+# itself is ambiguous, and a marker buys ~48 pixels out of 50k to resolve it.
 MARKER_YAW_SIGNAL_RMS_TOP = 2.09
 MARKER_YAW_SIGNAL_RMS_NONE = 0.009
 
@@ -281,29 +334,46 @@ class LeJEPACubeEnv(DRCubeEnv):
 
     def __init__(
         self,
-        marker_enabled: bool = True,
+        marker_enabled: bool = False,
         marker_face: str = 'top',
         marker_scale: float = DEFAULT_MARKER_SCALE,
         pin_floor_color: bool = True,
+        num_digits: int = 0,
+        pixel_transparent_arm: bool = False,
         *args,
         **kwargs,
     ):
         """Initialize the LeJEPA cube environment.
 
         Args:
-            marker_enabled: Whether to bake an asymmetric decal onto each
-                cube, breaking the 4-fold yaw symmetry. With this off,
-                ``cube.yaw`` has no image correlate and must be excluded from
-                the content vector.
-            marker_face: Which cube face carries the decal. One of
-                :data:`MARKER_FACES`. ``'top'`` is visible from the
-                ``front_pixels`` camera at every yaw; a side face is not, and
-                choosing one deliberately introduces a V6 occlusion floor.
+            marker_enabled: Whether to bake an asymmetric decal onto each cube.
+                **Off by default.** A decal breaks the cube's 4-fold yaw
+                symmetry, but that symmetry is a symmetry of the *grasping
+                task* too -- see the module docstring's "The orientation
+                quantity that matters" section. Restricting ``cube.yaw`` to one
+                fundamental domain achieves identifiability without inventing a
+                distinction the task does not have.
+            marker_face: Which cube face carries the decal, when enabled. One
+                of :data:`MARKER_FACES`.
             marker_scale: Marker tile size as a fraction of the cube face.
             pin_floor_color: Whether to pin the inherited ``floor.color`` axis
                 to its default. Leaving it live is the one axis that forces an
                 MJCF recompile per frame; ``background.floor_rgb`` supersedes
                 it. See the module docstring.
+            num_digits: Floor digit distractors. **Zero by default**, against
+                :class:`DRCubeEnv`'s 1. Those decals exist to give a linear
+                probe a nuisance target in the DR benchmark; here they are pure
+                occlusion risk over a scene whose content latents are already
+                small in the frame, and nothing in the identifiability study
+                reads them.
+            pixel_transparent_arm: Whether to render the arm at alpha 0.1.
+                **False by default**, against OGBench's ``True``. Upstream
+                fades the arm so it does not occlude the object in a
+                *manipulation benchmark*. Here ``effector.pos``,
+                ``effector.yaw`` and ``gripper.opening`` are content latents the
+                encoder is required to recover, so rendering them at alpha 0.1
+                asks for the recovery of something deliberately made almost
+                invisible.
             *args: Forwarded to :class:`DRCubeEnv`.
             **kwargs: Forwarded to :class:`DRCubeEnv`.
         """
@@ -316,6 +386,8 @@ class LeJEPACubeEnv(DRCubeEnv):
         self._marker_face = marker_face
         self._marker_scale = float(marker_scale)
         self._pin_floor_color = bool(pin_floor_color)
+        kwargs.setdefault('num_digits', num_digits)
+        kwargs.setdefault('pixel_transparent_arm', pixel_transparent_arm)
 
         # Populated by `add_objects` / `post_compilation_objects`.
         self._marker_geom_elems = []

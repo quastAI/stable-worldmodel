@@ -41,8 +41,9 @@ env:
   ob_type: pixels
   multiview: false
   visualize_info: false
+  pixel_transparent_arm: false
   terminate_at_goal: false
-  num_digits: 1
+  num_digits: 0
   num_bg_materials: 8
   add_backdrop: true
 

@@ -34,6 +34,10 @@ from stable_worldmodel.envs.ogbench.lejepa_cube_env import (  # noqa: E402
 
 # Appearance axes that must be identical between the `reset` reference and the
 # `render_content` candidate for the equivalence test to mean anything.
+#
+# Note what is *absent*: no `digit.*` and no `marker.value`. The environment
+# defaults to `num_digits=0` and `marker_enabled=False`, so those sub-spaces do
+# not exist and naming them would raise. Tests that want them opt in explicitly.
 APPEARANCE = {
     'cube.color': np.array([[0.85, 0.25, 0.15]]),
     'cube.size': np.array([0.026]),
@@ -47,11 +51,16 @@ APPEARANCE = {
     'background.wall_material': 5,
     'background.floor_rgb': np.array([0.42, 0.61, 0.38]),
     'background.wall_rgb': np.array([0.19, 0.23, 0.44]),
+}
+
+# Extra axes that exist only when the yaw marker and floor digits are enabled.
+MARKER_APPEARANCE = {**APPEARANCE, 'marker.value': np.array([4])}
+DIGIT_APPEARANCE = {
+    **APPEARANCE,
     'digit.value': np.array([7]),
     'digit.size': np.array([0.048]),
     'digit.position': np.array([[0.44, -0.11]]),
     'digit.yaw': np.array([1.1]),
-    'marker.value': np.array([4]),
 }
 
 
@@ -64,7 +73,6 @@ def make_env(**kwargs):
         visualize_info=False,
         width=128,
         height=128,
-        num_digits=1,
     )
     defaults.update(kwargs)
     env = LeJEPACubeEnv(**defaults)
@@ -309,7 +317,7 @@ def test_gripper_bounds_are_narrower_than_unit(env):
     assert float(space.high[0]) == pytest.approx(hi)
 
 
-# ----------------------------------------------------------------- yaw marker
+# ------------------------------------------- yaw: the quotient, not the circle
 
 
 def _yaw_rms(e, appearance, a, b):
@@ -323,159 +331,273 @@ def _yaw_rms(e, appearance, a, b):
     return float(np.sqrt(((frames[0] - frames[1]) ** 2).mean())), frames
 
 
-def test_cube_is_exactly_four_fold_symmetric_without_a_marker():
-    """The premise the marker exists to fix, asserted exactly.
+def test_cube_is_exactly_four_fold_symmetric():
+    """The fact the whole yaw convention rests on.
 
-    A bare cube is invariant under yaw -> yaw + pi/2, so those two states carry
-    no distinguishable information. Yaw is then unidentifiable in principle,
-    not approximately -- no encoder can recover what the renderer discarded.
+    A rotation of pi/2 about z maps the cube onto itself, so those two states
+    are not "hard to tell apart" -- they are one state under two names, for the
+    renderer and for the grasp alike. That is why the fix is to sample a
+    fundamental domain rather than to bolt on a marker that manufactures a
+    distinction the task does not have.
 
-    The assertion is at the rasterizer's own precision rather than at exactly
-    zero: a handful of subpixels land one LSB apart because the two
-    quaternions are different float32 values that rasterize to the same
-    geometry. That is quantization, not signal. What matters is the contrast
-    with a marked cube, which differs by ~48 whole pixels at magnitudes well
-    above this floor.
+    Asserted at the rasterizer's precision: a handful of subpixels land one LSB
+    apart because the two quaternions are different float32 values that
+    rasterize to the same geometry. That is quantization, not signal.
     """
-    e = make_env(marker_enabled=False, width=224, height=224)
-    appearance = {k: v for k, v in APPEARANCE.items() if k != 'marker.value'}
+    e = make_env(width=224, height=224)
     try:
-        _, frames = _yaw_rms(e, appearance, 0.0, np.pi / 2)
+        _, frames = _yaw_rms(e, APPEARANCE, 0.0, np.pi / 2)
         delta = np.abs(frames[0] - frames[1])
         assert delta.max() <= 1, (
-            f'unmarked cube differs by up to {delta.max():.0f} between yaws '
-            'pi/2 apart; it is not 4-fold symmetric and the marker rationale '
-            'needs revisiting'
+            f'cube differs by up to {delta.max():.0f} between yaws pi/2 apart; '
+            'it is not 4-fold symmetric and the quotient argument is wrong'
         )
         assert int((delta > 1).sum()) == 0
     finally:
         e.close()
 
 
-def test_marker_makes_yaw_observable():
-    """The marker must break the 4-fold symmetry by a decisive margin.
+def test_yaw_is_identifiable_on_the_fundamental_domain():
+    """Within one fundamental domain, yaw is strongly observable unaided.
 
-    Stated as a ratio against the unmarked baseline rather than as an absolute
-    rms, because the absolute number scales with render resolution and cube
-    size while the claim -- "the marker is what makes yaw identifiable" --
-    does not. Run at 224x224, the resolution the dataset is actually collected
-    at; at 128x128 the marker covers ~12 pixels and this signal is genuinely
-    marginal.
+    This is what makes the marker unnecessary. Compared at half the domain's
+    width apart (~43 deg) rather than at its extremes -- see
+    :func:`test_yaw_separability_is_non_monotone_in_angle` for why the extremes
+    are the *worst* possible probe of identifiability, not the best.
     """
-    marked = make_env(width=224, height=224)
-    unmarked = make_env(marker_enabled=False, width=224, height=224)
-    bare = {k: v for k, v in APPEARANCE.items() if k != 'marker.value'}
-    try:
-        with_marker, _ = _yaw_rms(marked, APPEARANCE, 0.0, np.pi / 2)
-        without, _ = _yaw_rms(unmarked, bare, 0.0, np.pi / 2)
+    from stable_worldmodel.identifiability.latents import DEFAULT_YAW_HALF_ARC
 
-        assert with_marker > 1.0, (
-            f'marker yaw signal is only rms {with_marker:.3f}'
-        )
-        assert with_marker > 50 * max(without, 1e-6), (
-            f'marker adds little over the unmarked baseline '
-            f'({with_marker:.4f} vs {without:.4f})'
-        )
+    e = make_env(width=224, height=224)
+    try:
+        for a, b in (
+            (0.0, DEFAULT_YAW_HALF_ARC),
+            (-DEFAULT_YAW_HALF_ARC, 0.0),
+            (-DEFAULT_YAW_HALF_ARC / 2, DEFAULT_YAW_HALF_ARC / 2),
+        ):
+            rms, _ = _yaw_rms(e, APPEARANCE, a, b)
+            assert rms > 3.0, (
+                f'yaws {np.degrees(a):.1f} and {np.degrees(b):.1f} deg differ '
+                f'by only rms {rms:.3f}; yaw would not be recoverable even on '
+                'the quotient'
+            )
     finally:
-        marked.close()
-        unmarked.close()
+        e.close()
 
 
-def test_yaw_is_observable_mod_quarter_turn_without_a_marker():
-    """Records what the marker is *not* responsible for.
+def test_yaw_separability_is_non_monotone_in_angle():
+    """Pixel separability peaks near 45 deg and *falls* toward 90 deg.
 
-    Yaws pi/4 apart change the cube's silhouette outright, so they are
-    strongly distinguishable with no marker at all -- more strongly, in fact,
-    than the marker distinguishes yaws pi/2 apart. Yaw recovery therefore has
-    two regimes: the within-quadrant angle, which is easy, and the quadrant
-    itself, which rests entirely on a ~48-pixel marker.
+    A direct consequence of the C4 symmetry, and a trap for anyone reading a
+    yaw-recovery curve: two cubes 85 deg apart look far more alike (rms ~1.2)
+    than two 43 deg apart (rms ~4.4), because 85 deg is nearly the 90 deg
+    identification. Measured at 224x224:
 
-    This is a property of the rendering, not of any encoder. A yaw metric that
-    reports a single number will average the two and misattribute the result.
+        separation   rms
+          21 deg     3.79
+          43 deg     4.36
+          86 deg     1.17
+
+    So "larger angular error" does not mean "more visibly wrong", and a metric
+    that assumes monotonicity in raw angle will misread the result. Recovery
+    should be scored on the quotient coordinate, which is what the registry
+    hands it.
     """
-    e = make_env(marker_enabled=False, width=224, height=224)
-    bare = {k: v for k, v in APPEARANCE.items() if k != 'marker.value'}
+    from stable_worldmodel.identifiability.latents import DEFAULT_YAW_HALF_ARC
+
+    e = make_env(width=224, height=224)
     try:
-        quarter, _ = _yaw_rms(e, bare, 0.0, np.pi / 2)
-        eighth, _ = _yaw_rms(e, bare, 0.0, np.pi / 4)
-        assert eighth > 100 * max(quarter, 1e-6), (
-            f'expected the silhouette to dominate at pi/4 (got {eighth:.4f}) '
-            f'while pi/2 is symmetric (got {quarter:.4f})'
+        near, _ = _yaw_rms(e, APPEARANCE, 0.0, DEFAULT_YAW_HALF_ARC)
+        far, _ = _yaw_rms(
+            e, APPEARANCE, -DEFAULT_YAW_HALF_ARC, DEFAULT_YAW_HALF_ARC
+        )
+        assert far < near, (
+            f'expected the wider separation to look MORE alike under C4 '
+            f'({far:.3f} vs {near:.3f})'
         )
     finally:
         e.close()
 
 
-def test_side_marker_is_stronger_but_occludable():
-    """Both horns of the SS9 marker-face tradeoff, measured rather than assumed.
+def test_fundamental_domain_contains_no_duplicate_configuration():
+    """No two sampled yaws may denote the same physical state.
 
-    A front-face marker presents more pixels to the camera than a foreshortened
-    top-face one -- but only while it faces the camera. The plan defaults to
-    ``top`` for exactly this reason; this test is what makes that a measured
-    choice.
+    The endpoints -pi/4 and +pi/4 differ by exactly pi/2 and are therefore the
+    same configuration. The default arc carries a margin so that even clipped
+    draws cannot land on both, which is what keeps the map from z to pixels
+    injective. Without the margin this test fails.
     """
-    top = make_env(marker_face='top', width=224, height=224)
-    front = make_env(marker_face='front', width=224, height=224)
-    try:
-        top_rms, _ = _yaw_rms(top, APPEARANCE, 0.0, np.pi / 2)
-        front_rms, _ = _yaw_rms(front, APPEARANCE, 0.0, np.pi / 2)
-        assert front_rms > top_rms, (
-            f'front-face marker ({front_rms:.3f}) was expected to present a '
-            f'stronger signal than top-face ({top_rms:.3f})'
-        )
+    from stable_worldmodel.identifiability.latents import (
+        DEFAULT_YAW_HALF_ARC,
+        YAW_FUNDAMENTAL_HALF_ARC,
+    )
 
-        # ...and the cost: turned away from the camera it contributes nothing.
-        away, frames = _yaw_rms(front, APPEARANCE, np.pi, np.pi + np.pi / 2)
-        assert away < front_rms, (
-            'a front-face marker facing away should carry less yaw signal '
-            f'than one facing the camera ({away:.3f} vs {front_rms:.3f})'
+    assert DEFAULT_YAW_HALF_ARC < YAW_FUNDAMENTAL_HALF_ARC
+
+    e = make_env(width=224, height=224)
+    try:
+        rms, _ = _yaw_rms(
+            e, APPEARANCE, -DEFAULT_YAW_HALF_ARC, DEFAULT_YAW_HALF_ARC
+        )
+        # If the arc reached the full domain these two would be identical.
+        assert rms > 1.0, (
+            'the two ends of the sampled arc render near-identically, so the '
+            'arc has reached the symmetry boundary and yaw is not injective'
         )
     finally:
-        top.close()
-        front.close()
+        e.close()
+
+
+def test_marker_is_off_by_default():
+    """A decal scores the encoder on a quadrant index no grasp depends on."""
+    e = make_env()
+    try:
+        assert e._marker_enabled is False
+        assert 'marker' not in e.variation_space.spaces
+        assert e._marker_geom_ids == []
+    finally:
+        e.close()
+
+
+def test_marker_still_works_when_explicitly_enabled():
+    """The machinery is kept and tested -- it is the way to study the full circle."""
+    e = make_env(marker_enabled=True, width=224, height=224)
+    try:
+        assert 'marker' in e.variation_space.spaces
+        marked, _ = _yaw_rms(e, MARKER_APPEARANCE, 0.0, np.pi / 2)
+        assert marked > 1.0, (
+            f'marker enabled but yaws pi/2 apart still differ by only '
+            f'rms {marked:.3f}'
+        )
+    finally:
+        e.close()
 
 
 @pytest.mark.parametrize('face', sorted(MARKER_FACES))
 def test_marker_face_is_a_knob(face):
-    """Every declared face builds and renders."""
-    e = make_env(marker_face=face)
+    """Every declared face builds and renders, when the marker is enabled."""
+    e = make_env(marker_enabled=True, marker_face=face)
     try:
         state, _ = content_state(e)
-        frame = e.render_content(state, APPEARANCE)
-        assert frame.shape == (128, 128, 3)
+        assert e.render_content(state, MARKER_APPEARANCE).shape == (128, 128, 3)
     finally:
         e.close()
 
 
-def test_marker_does_not_collide(env):
-    """The decal must be collision-free, or it changes the physics it decorates.
-
-    The predictor dataset is collected in the same environment, so a marker
-    with contacts would alter the very rollouts the planner is evaluated on.
-    """
-    for gid in env._marker_geom_ids:
-        assert env._model.geom_contype[gid] == 0
-        assert env._model.geom_conaffinity[gid] == 0
-
-
-def test_marker_value_is_recorded(env):
-    state, _ = content_state(env)
-    env.render_content(state, {**APPEARANCE, 'marker.value': np.array([6])})
-    info = env.content_info()
-    assert int(info['privileged/marker_0_value'][0]) == 6
+def test_marker_does_not_collide():
+    """The decal must be collision-free, or it changes the physics it decorates."""
+    e = make_env(marker_enabled=True)
+    try:
+        for gid in e._marker_geom_ids:
+            assert e._model.geom_contype[gid] == 0
+            assert e._model.geom_conaffinity[gid] == 0
+    finally:
+        e.close()
 
 
-def test_marker_scales_with_cube_size(env):
+def test_marker_value_is_recorded():
+    e = make_env(marker_enabled=True)
+    try:
+        state, _ = content_state(e)
+        e.render_content(state, {**MARKER_APPEARANCE, 'marker.value': np.array([6])})
+        assert int(e.content_info()['privileged/marker_0_value'][0]) == 6
+    finally:
+        e.close()
+
+
+def test_marker_scales_with_cube_size():
     """A marker sized for the stock cube would clip through a smaller one."""
-    for size in (0.016, 0.03):
-        state, _ = content_state(env)
-        env.render_content(state, {**APPEARANCE, 'cube.size': np.array([size])})
-        gid = env._marker_geom_ids[0]
-        axis, _ = MARKER_FACES[env._marker_face]
-        tile = [d for i, d in enumerate(env._model.geom_size[gid]) if i != axis]
-        assert all(t < size for t in tile), (
-            f'marker tile {tile} is not inside a cube of half-extent {size}'
+    e = make_env(marker_enabled=True)
+    try:
+        for size in (0.016, 0.03):
+            state, _ = content_state(e)
+            e.render_content(
+                state, {**MARKER_APPEARANCE, 'cube.size': np.array([size])}
+            )
+            gid = e._marker_geom_ids[0]
+            axis, _ = MARKER_FACES[e._marker_face]
+            tile = [
+                d for i, d in enumerate(e._model.geom_size[gid]) if i != axis
+            ]
+            assert all(t < size for t in tile), (
+                f'marker tile {tile} is not inside a cube of half-extent {size}'
+            )
+    finally:
+        e.close()
+
+
+# ------------------------------------------- floor decals and arm visibility
+
+
+def test_no_floor_digits_by_default():
+    """The distractors exist for a DR probe; nothing here reads them.
+
+    Against a scene whose content latents already occupy few pixels they are
+    pure occlusion risk -- a V6 contribution nobody asked for.
+    """
+    e = make_env()
+    try:
+        assert e._num_digits == 0
+        assert 'digit' not in e.variation_space.spaces
+        state, _ = content_state(e)
+        e.render_content(state, APPEARANCE)
+        info = e.content_info()
+        assert not [k for k in info if k.startswith('privileged/digit')]
+    finally:
+        e.close()
+
+
+def test_floor_digits_still_available_when_asked_for():
+    e = make_env(num_digits=1)
+    try:
+        assert 'digit' in e.variation_space.spaces
+        state, _ = content_state(e)
+        assert e.render_content(state, DIGIT_APPEARANCE).shape == (128, 128, 3)
+    finally:
+        e.close()
+
+
+def test_arm_is_opaque_by_default():
+    """The gripper is a content latent; it must not be rendered at alpha 0.1.
+
+    Upstream OGBench fades the arm so it does not occlude the object in a
+    manipulation benchmark. Here ``effector.pos``, ``effector.yaw`` and
+    ``gripper.opening`` are latents the encoder is *required* to recover, so
+    fading them would be asking it to recover something deliberately hidden.
+    """
+    e = make_env()
+    try:
+        assert e._pixel_transparent_arm is False
+        for name in ('ur5e/robotiq/black', 'ur5e/robotiq/pad_gray',
+                     'ur5e/robotiq/metal', 'ur5e/black'):
+            alpha = e._model.mat_rgba[e._model.material(name).id, 3]
+            assert alpha == pytest.approx(1.0), (
+                f'{name} renders at alpha {alpha}, not opaque'
+            )
+    finally:
+        e.close()
+
+
+def test_opaque_arm_is_more_visible_than_the_faded_one():
+    """The change must actually put gripper pixels in the frame.
+
+    Measured rather than asserted from the flag: comparing the two renders is
+    what shows the fade was materially hiding the content latent.
+    """
+    opaque = make_env(width=224, height=224)
+    faded = make_env(width=224, height=224, pixel_transparent_arm=True)
+    try:
+        state, _ = content_state(opaque)
+        a = opaque.render_content(state, APPEARANCE).astype(np.float64)
+        state_b, _ = content_state(faded)
+        b = faded.render_content(state_b, APPEARANCE).astype(np.float64)
+        rms = float(np.sqrt(((a - b) ** 2).mean()))
+        assert rms > 5.0, (
+            f'opaque and faded arms differ by only rms {rms:.3f}; the '
+            'transparency setting is not reaching the render'
         )
+    finally:
+        opaque.close()
+        faded.close()
 
 
 # ------------------------------------------------------------ new arm latents

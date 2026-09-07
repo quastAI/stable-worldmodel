@@ -26,10 +26,11 @@ world:
   width: 224
   height: 224
   visualize_info: False
+  pixel_transparent_arm: False
   terminate_at_goal: True
   # Must match the collection env, or the background/digit pool indices stored
   # in the dataset mean something else on replay.
-  num_digits: 1
+  num_digits: 0
   num_bg_materials: 8
   add_backdrop: True
 

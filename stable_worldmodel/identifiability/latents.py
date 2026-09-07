@@ -120,6 +120,26 @@ NOT_CONTENT_CAPABLE = {
 }
 
 
+# The cube's yaw symmetry group is C4: a rotation of pi/2 about z maps the cube
+# exactly onto itself -- zero differing pixels, and the same grasp. A
+# fundamental domain is therefore an arc of width pi/2, and every physically
+# distinct orientation has exactly one representative in it.
+YAW_FUNDAMENTAL_HALF_ARC = np.pi / 4
+
+# ...but the two endpoints of that arc, -pi/4 and +pi/4, denote the SAME
+# configuration (they differ by exactly pi/2). Sampling the full closed domain
+# would pile the ~0.27% of clipped draws onto both ends, and those two piles
+# are one physical state under two z-values -- a genuine, if small, injectivity
+# failure of precisely the kind these metrics exist to detect. The margin costs
+# 5% of the arc and removes it outright.
+DEFAULT_YAW_HALF_ARC = 0.95 * YAW_FUNDAMENTAL_HALF_ARC
+
+# The gripper's jaws are symmetric under a pi rotation about the approach axis,
+# so effector yaw is meaningful only modulo pi -- a fundamental domain of width
+# pi, i.e. [-pi/2, pi/2].
+EFFECTOR_YAW_HALF_ARC = np.pi / 2
+
+
 def _box(low, high, dim):
     return (
         np.broadcast_to(np.asarray(low, dtype=np.float64), (dim,)).copy(),
@@ -129,7 +149,7 @@ def _box(low, high, dim):
 
 def build_registry(
     env,
-    yaw_half_arc=np.pi / 2,
+    yaw_half_arc=DEFAULT_YAW_HALF_ARC,
     include_roll_pitch=False,
     include_discrete=False,
     pos_z_max=0.15,
@@ -144,13 +164,14 @@ def build_registry(
     Args:
         env: A ``LeJEPACubeEnv`` that has been reset at least once.
         yaw_half_arc: Half-width of the sampled ``cube.yaw`` arc, in radians.
-            Yaw is circular and has no Gaussian marginal, so it is sampled on
-            a sub-arc; this is the plan's SS9 yaw-wraparound mitigation, and
-            the restriction is a *declared* V5-type support truncation rather
-            than an anomaly to be discovered later. The default ``pi/2`` spans
-            two quadrants, which keeps the 4-fold ambiguity live and therefore
-            keeps the yaw marker load-bearing. Narrowing it below ``pi/4``
-            removes the ambiguity and makes the marker redundant.
+            Defaults to just inside :data:`YAW_FUNDAMENTAL_HALF_ARC`, one
+            fundamental domain of the cube's 4-fold symmetry. Every physically
+            distinct orientation has exactly one representative there, so yaw
+            is identifiable from the silhouette alone and no marker is needed
+            -- and no coordinate is scored on a quadrant index that no grasp
+            depends on. Widening this past ``pi/4`` reintroduces the 4-fold
+            ambiguity and requires ``marker_enabled=True`` to stay
+            identifiable at all.
         include_roll_pitch: Whether to enumerate cube roll/pitch. Off under
             the yaw-only decision; the sampler's tangent-space branch is
             written but unused.
@@ -209,10 +230,12 @@ def build_registry(
             slice_=slice(0, 1),
             default_role='content',
             content_capable=True,
-            notes=f'Sampled on a declared sub-arc of half-width '
-            f'{yaw_half_arc:.4f} rad -- a circular variable has no Gaussian '
-            f'marginal, so the restriction is an intentional V5-type '
-            f'truncation. Observable only via the marker beyond pi/4.',
+            notes=f'Sampled on a half-arc of {yaw_half_arc:.4f} rad. A '
+            f'rotation of pi/2 maps the cube exactly onto itself -- same '
+            f'pixels, same grasp -- so this is one fundamental domain of the '
+            f'C4 symmetry, not an arbitrary truncation: it is a coordinate on '
+            f'the quotient. Identifiable from the silhouette alone (rms 6.1 '
+            f'between the arc extremes); no marker required.',
         )
     )
     if include_roll_pitch:
@@ -252,15 +275,17 @@ def build_registry(
             'effector.yaw',
             1,
             'physical',
-            *_box(-np.pi / 2, np.pi / 2, 1),
+            *_box(-EFFECTOR_YAW_HALF_ARC, EFFECTOR_YAW_HALF_ARC, 1),
             channel='state',
             readback='privileged/ee_yaw',
             slice_=slice(0, 1),
             default_role='content',
             content_capable=True,
             notes='Needs LeJEPACubeEnv.agent.ee_start_yaw; the stock env draws '
-            'this from its own RNG. Restricted to a half-turn for the same '
-            'circular-variable reason as cube.yaw.',
+            'this from its own RNG. Restricted to [-pi/2, pi/2]: the jaws are '
+            'symmetric under a pi rotation about the approach axis, so this '
+            'is one fundamental domain of the jaws\' 2-fold symmetry -- the '
+            'same quotient argument as cube.yaw.',
         )
     )
     grip_lo, grip_hi = env.gripper_opening_bounds
@@ -333,13 +358,24 @@ def build_registry(
                    'because it would force an MJCF recompile per frame.'),
         var_latent('background.wall_rgb', 'background.wall_rgb', 3,
                    'privileged/wall_rgb'),
-        var_latent('digit.size', 'digit.size', env._num_digits,
-                   'privileged/digit_0_size'),
-        var_latent('digit.position', 'digit.position', 2 * env._num_digits,
-                   'privileged/digit_0_pos'),
-        var_latent('digit.yaw', 'digit.yaw', env._num_digits,
-                   'variation.digit.yaw'),
     ]
+
+    # Floor digit distractors, only when the environment actually has them.
+    # `LeJEPACubeEnv` defaults to `num_digits=0`: the decals exist to give a
+    # linear probe a nuisance target in the DR benchmark, nothing here reads
+    # them, and against a scene whose content latents are already small in the
+    # frame they are pure occlusion risk. Guarded rather than assumed, because
+    # at `num_digits=0` the `digit` sub-space does not exist at all and
+    # `var_latent` would raise on the lookup.
+    if env._num_digits > 0:
+        latents += [
+            var_latent('digit.size', 'digit.size', env._num_digits,
+                       'privileged/digit_0_size'),
+            var_latent('digit.position', 'digit.position',
+                       2 * env._num_digits, 'privileged/digit_0_pos'),
+            var_latent('digit.yaw', 'digit.yaw', env._num_digits,
+                       'variation.digit.yaw'),
+        ]
 
     # `light.position` -- only the rows that actually reach a pixel. The
     # directional row is excluded by the environment itself, and duplicating
@@ -373,13 +409,17 @@ def build_registry(
 
     # ---------------------------------------------------------- discrete
     discrete_role = 'content' if include_discrete else 'style'
-    for name, axis_path, card, readback in (
+    discrete_specs = [
         ('background.floor_material', 'background.floor_material',
          env._num_bg_materials, 'privileged/floor_material'),
         ('background.wall_material', 'background.wall_material',
          env._num_bg_materials, 'privileged/wall_material'),
-        ('digit.value', 'digit.value', 10, 'privileged/digit_0_value'),
-    ):
+    ]
+    if env._num_digits > 0:
+        discrete_specs.append(
+            ('digit.value', 'digit.value', 10, 'privileged/digit_0_value')
+        )
+    for name, axis_path, card, readback in discrete_specs:
         latents.append(
             Latent(
                 name, 1, 'discrete', *_box(0, card - 1, 1),
@@ -442,26 +482,53 @@ class LatentRegistry:
         Args:
             profile: Mapping from latent name to ``'content'``, ``'style'`` or
                 ``'excluded'``. Names absent from the profile keep their
-                default role. A special key ``'*'`` sets the default for every
-                name the profile does not mention.
+                default role. Two special forms:
+
+                * ``'*'`` sets the default for every name the profile does not
+                  mention.
+                * a leading ``'?'`` marks the entry **conditional** -- it is
+                  applied when the latent exists and ignored when it does not,
+                  without weakening the typo check on every other name. This
+                  exists because some latents are present only for certain
+                  environment configurations: ``digit.*`` only when
+                  ``num_digits > 0``, ``marker.value`` only when the yaw marker
+                  is enabled. Both default off.
 
         Returns:
             LatentRegistry: A new registry; this one is unchanged.
 
         Raises:
-            KeyError: If the profile names a latent that does not exist --
-                usually a typo, and silently ignoring it would change ``n``
-                without saying so.
+            KeyError: If the profile names an unconditional latent that does
+                not exist -- usually a typo, and silently ignoring it would
+                change ``n`` without saying so.
             ValueError: If it promotes a latent that cannot be content.
         """
         profile = dict(profile or {})
         fallback = profile.pop('*', None)
 
-        unknown = set(profile) - {latent.name for latent in self.latents}
+        # Conditional entries are stripped of their marker and merged in only
+        # where the latent actually exists.
+        known = {latent.name for latent in self.latents}
+        optional = {
+            key[1:]: role
+            for key, role in profile.items()
+            if key.startswith('?')
+        }
+        profile = {
+            key: role
+            for key, role in profile.items()
+            if not key.startswith('?')
+        }
+        profile.update(
+            {name: role for name, role in optional.items() if name in known}
+        )
+
+        unknown = set(profile) - known
         if unknown:
             raise KeyError(
                 f'profile names latents that are not in the registry: '
-                f'{sorted(unknown)}'
+                f'{sorted(unknown)}. Prefix a name with "?" if it is '
+                'conditional on the environment configuration.'
             )
 
         roles = {}
@@ -667,9 +734,18 @@ TASK_CONTENT_PROFILE = {
     'gripper.opening': 'content',
 }
 
-ALL_CONTENT_PROFILE = {'*': 'content', 'background.floor_material': 'style',
-                       'background.wall_material': 'style',
-                       'digit.value': 'style', 'marker.value': 'style'}
+# Discrete latents stay style even under all_content: they are renderable and
+# so content-capable, but have no Gaussian marginal at all -- a structural V1.
+# `digit.value` and `marker.value` are marked conditional ("?") because they
+# exist only when floor digits / the yaw marker are enabled, and both default
+# off in `LeJEPACubeEnv`.
+ALL_CONTENT_PROFILE = {
+    '*': 'content',
+    'background.floor_material': 'style',
+    'background.wall_material': 'style',
+    '?digit.value': 'style',
+    '?marker.value': 'style',
+}
 
 PROFILES = {
     'task_content': TASK_CONTENT_PROFILE,
