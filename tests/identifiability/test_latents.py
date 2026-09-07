@@ -53,16 +53,21 @@ def registry(env):
 # ------------------------------------------------------------------ profiles
 
 
-def test_task_content_profile_has_nine_physical_dims(registry):
+def test_task_content_profile_has_twelve_dims(registry):
     """The plan's SS3.1 subtotal, as a gate.
 
     ``task_content`` is the stage-A exit-criterion profile, and its ``n`` is
     quoted throughout the plan. If the registry drifts, every stage-A number
     silently refers to a different problem.
+
+    ``n`` is 9 physical + 3 for ``cube.color`` = 12 at ``n_cubes = 1`` --
+    ``cube.color`` was promoted to content, so ``violations.py`` /
+    ``run_v4_calibration.py``, which still calibrate against the
+    physical-only ``n = 9``, are stale against this profile.
     """
     resolved = registry.resolve(TASK_CONTENT_PROFILE)
-    assert resolved.n == 9, resolved.summary()
-    assert {latent.kind for latent in resolved.content} == {'physical'}
+    assert resolved.n == 12, resolved.summary()
+    assert {latent.kind for latent in resolved.content} == {'physical', 'appearance'}
 
 
 def test_task_content_leaves_style_to_discard(registry):

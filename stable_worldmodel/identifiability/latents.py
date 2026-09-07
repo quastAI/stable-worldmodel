@@ -25,13 +25,16 @@ latent -- silently accepting one would put a target into ``z`` that no encoder
 could recover, and the resulting floor would look exactly like an encoder
 failure.
 
-The two shipped profiles
-------------------------
+The shipped profiles
+---------------------
 ``task_content``
-    The 9 physical dimensions only; everything renderable-but-not-physical
-    becomes style. This is the profile the stage-A exit criterion runs on,
-    and the one that actually exercises the alignment loss's discard
-    behaviour.
+    The physical DOFs plus ``cube.color``; everything else
+    renderable-but-not-task-relevant becomes style. This is the profile the
+    stage-A exit criterion runs on, and the one that actually exercises the
+    alignment loss's discard behaviour. ``n`` is 9 + 3 * n_cubes -- NOT the
+    ``n = 9`` quoted in the stage-A plan and calibrated against in
+    ``violations.py`` / ``run_v4_calibration.py``; those predate ``cube.color``
+    joining this profile and assume the physical-only subtotal.
 ``all_content``
     Every content-capable latent is content, so ``n`` is large and there is no
     style left at all. Coherent with the theory -- a pair then differs only by
@@ -724,11 +727,16 @@ class LatentRegistry:
 
 
 # Shipped profiles. `task_content` is the stage-A exit-criterion profile.
+# `cube.color` is content here, not style: the cube's own color is treated as
+# task-relevant. n = 9 + 3 * n_cubes, not the physical-only n = 9 that
+# `violations.py` / `run_v4_calibration.py` calibrate against -- those predate
+# `cube.color` joining this profile.
 TASK_CONTENT_PROFILE = {
     '*': 'style',
     'cube.pos_xy': 'content',
     'cube.pos_z': 'content',
     'cube.yaw': 'content',
+    'cube.color': 'content',
     'effector.pos': 'content',
     'effector.yaw': 'content',
     'gripper.opening': 'content',

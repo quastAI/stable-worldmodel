@@ -53,11 +53,13 @@ env:
     scale: 0.85
 
 latents:
-  # 'task_content' (n=9, physical only) is the stage-A exit-criterion profile
-  # and the one that actually exercises the alignment loss's discard
-  # behaviour. 'all_content' (n=54) leaves no continuous style at all, so the
+  # 'task_content' is the stage-A exit-criterion profile: the physical DOFs
+  # plus cube.color as content, everything else style. n = 9 + 3 * n_cubes
+  # here, not the physical-only n=9 that violations.py / run_v4_calibration.py
+  # calibrate against -- those predate cube.color joining this profile.
+  # 'all_content' (n=54) leaves no continuous style at all, so the
   # style-invariance metric is vacuous under it -- run as a scaling datapoint.
-  profile: task_content
+  profile: task_content_color
 
   # One fundamental domain of the cube's C4 yaw symmetry (pi/4, less a 5%
   # margin so the arc's two endpoints -- which are the SAME configuration --
