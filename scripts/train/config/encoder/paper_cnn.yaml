@@ -20,6 +20,9 @@ embed_dim: 256           # = CNNEncoder.proj_dim, the head's input width
 # and no hidden layer -- this reproduces that exactly.
 head_hidden_dim: null
 head_norm: false
+# No hidden layer here, so this is never applied -- present only because
+# `lejepa.yaml`'s head interpolates it and needs the key to exist.
+head_hidden_norm_fn: null
 
 # App. H.11's settings for this architecture (AdamW). Distinctly different from
 # the ViT's, which is why they travel with the encoder rather than sitting in

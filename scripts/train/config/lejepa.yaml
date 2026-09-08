@@ -78,6 +78,9 @@ model:
     # diag(Cov(h)) to 1 and partly trivialise both epsilon and SIGReg.
     hidden_dim: ${head_hidden_dim}
     norm: ${head_norm}
+    # BatchNorm1d on the hidden layer for the ViT arms, null (unused, no
+    # hidden layer) for the CNN -- see `NDimHead.hidden_norm_fn`.
+    hidden_norm_fn: ${head_hidden_norm_fn}
 
 loss:
   sigreg:

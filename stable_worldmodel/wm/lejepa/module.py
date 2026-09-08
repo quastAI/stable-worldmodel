@@ -168,10 +168,19 @@ class NDimHead(nn.Module):
         norm: Whether to LayerNorm the CLS token first. On by default: the
             SIGReg term is scale-sensitive, and an unnormalised backbone
             output would let the head trade isotropy against overall scale.
+        hidden_norm_fn: Norm applied to the hidden layer, between the two
+            ``Linear``s -- ``None`` (bare, the CNN arm's setting; moot there
+            since it has no hidden layer) or ``torch.nn.BatchNorm1d`` for the
+            ViT arms. Mirrors where :class:`~stable_worldmodel.wm.lejepa.module.CNNEncoder`
+            places its own ``BatchNorm1d``, i.e. on a hidden projection, never
+            on the head's output -- so this gives the ViT arms the same
+            batch-wise anti-collapse signal the CNN gets structurally, without
+            normalising ``h`` itself and trivialising SIGReg/epsilon the way a
+            norm *after* the last ``Linear`` would.
     """
 
     def __init__(
-        self, input_dim, output_dim, hidden_dim=None, norm=True
+        self, input_dim, output_dim, hidden_dim=None, norm=True, hidden_norm_fn=None
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -179,8 +188,14 @@ class NDimHead(nn.Module):
 
         layers = [nn.LayerNorm(input_dim)] if norm else []
         if hidden_dim:
+            hidden_norm = (
+                hidden_norm_fn(hidden_dim)
+                if hidden_norm_fn is not None
+                else nn.Identity()
+            )
             layers += [
                 nn.Linear(input_dim, hidden_dim),
+                hidden_norm,
                 nn.GELU(),
                 nn.Linear(hidden_dim, output_dim),
             ]

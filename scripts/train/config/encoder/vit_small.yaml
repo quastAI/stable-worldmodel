@@ -12,8 +12,14 @@
 # difference between the two views of a positive pair -- and a from-scratch
 # ViT-small without augmentation on ~400k frames has neither the data nor the
 # inductive bias for spatial content. It also pools a CLS token that no
-# pretraining objective ever trained, and its LayerNorms give no protection
-# against the batch-wise collapse that BatchNorm was needed for in H.11.
+# pretraining objective ever trained.
+#
+# The head's hidden layer gets a BatchNorm1d (below), mirroring where
+# `CNNEncoder` places its own -- on a hidden projection, between a Linear and
+# a GELU, never on the output `h`. The ViT backbone itself is still
+# LayerNorm-only throughout (an HF ViTModel, not something this repo can
+# swap), so this closes only the head's share of the batch-wise collapse
+# protection H.11 relies on, not the backbone's.
 #
 # Run it as a labelled arm on the same data, so a failure here cannot
 # contaminate the headline identifiability number.
@@ -22,9 +28,18 @@ patch_size: 14
 encoder_scale: small
 embed_dim: 384
 
-# LeWM's head: LayerNorm(384) -> Linear(384, 2048) -> GELU -> Linear(2048, n).
+# LeWM's head shape: LayerNorm(384) -> Linear(384, 2048) -> BatchNorm1d(2048)
+# -> GELU -> Linear(2048, n). The BatchNorm1d is the one addition over LeWM's
+# own head (see head_hidden_norm_fn below).
 head_hidden_dim: 2048
 head_norm: true
+
+# Gives the hidden layer the same Linear -> BatchNorm1d -> GELU shape
+# CNNEncoder's own projection uses, so the ViT arm gets a comparable
+# batch-wise anti-collapse signal instead of relying on LayerNorm alone.
+head_hidden_norm_fn:
+  _target_: torch.nn.BatchNorm1d
+  _partial_: true
 
 encoder_lr: 5.0e-5
 encoder_weight_decay: 1.0e-3

@@ -1,0 +1,34 @@
+# @package _global_
+#
+# Smaller ViT arm. Same "worst regime" caveats as `vit_small` (no augmentation,
+# untrained CLS pooling, LayerNorm instead of BatchNorm) apply here too -- this
+# only shrinks the parameter count (192-wide, ~5.7M vs small's 22.4M), which is
+# the one axis of the problem that trades directly against dataset size at a
+# fixed data budget.
+#
+# lr/weight_decay are copied from `vit_small` (LeWM's own), not separately
+# calibrated for this width -- treat this as an uncalibrated arm.
+
+patch_size: 14
+encoder_scale: tiny
+embed_dim: 192
+
+# Same head shape as vit_small: LayerNorm(192) -> Linear(192, 2048) ->
+# BatchNorm1d(2048) -> GELU -> Linear(2048, n).
+head_hidden_dim: 2048
+head_norm: true
+
+head_hidden_norm_fn:
+  _target_: torch.nn.BatchNorm1d
+  _partial_: true
+
+encoder_lr: 5.0e-5
+encoder_weight_decay: 1.0e-3
+
+encoder_spec:
+  _target_: stable_pretraining.backbone.utils.vit_hf
+  size: ${encoder_scale}
+  patch_size: ${patch_size}
+  image_size: ${img_size}
+  pretrained: false
+  use_mask_token: false
