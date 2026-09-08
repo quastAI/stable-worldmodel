@@ -31,6 +31,8 @@ optimised**: it is the metric ``epsilon``, and the V8 sweep only means
 something if it is independent of what is being minimised.
 """
 
+import inspect
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -62,6 +64,15 @@ class LeJEPA(nn.Module):
         self.head = head
         self.interpolate_pos_encoding = interpolate_pos_encoding
 
+        # Two backbone conventions have to work here: the HF ViT, whose forward
+        # takes `interpolate_pos_encoding` and returns an object carrying
+        # `last_hidden_state`, and the paper's CNN, which is a plain module
+        # returning `(B, D)`. Decided once, from the signature, rather than
+        # per-forward with a try/except that would also swallow real errors.
+        self._takes_pos_encoding = 'interpolate_pos_encoding' in (
+            inspect.signature(encoder.forward).parameters
+        )
+
     @property
     def output_dim(self):
         """Embedding width ``m``. Equals ``n`` unless V7 is in play."""
@@ -81,12 +92,22 @@ class LeJEPA(nn.Module):
         b = pixels.size(0)
         pixels = rearrange(pixels, 'b t ... -> (b t) ...')
 
-        output = self.encoder(
-            pixels, interpolate_pos_encoding=self.interpolate_pos_encoding
-        )
-        cls_token = output.last_hidden_state[:, 0]
+        if self._takes_pos_encoding:
+            output = self.encoder(
+                pixels, interpolate_pos_encoding=self.interpolate_pos_encoding
+            )
+        else:
+            output = self.encoder(pixels)
 
-        info['emb'] = rearrange(self.head(cls_token), '(b t) d -> b t d', b=b)
+        # ViT: pool the CLS token, as the LeWM baseline does. CNN: the module
+        # has already pooled and projected, so its output *is* the feature.
+        features = (
+            output.last_hidden_state[:, 0]
+            if hasattr(output, 'last_hidden_state')
+            else output
+        )
+
+        info['emb'] = rearrange(self.head(features), '(b t) d -> b t d', b=b)
         return info
 
     @torch.no_grad()

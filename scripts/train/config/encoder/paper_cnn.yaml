@@ -1,0 +1,38 @@
+# @package _global_
+#
+# The LeJEPA paper's own pixel encoder (App. H.11), scaled from its 64px
+# reference to 224px. See `CNNEncoder`'s docstring for why the stage count
+# rather than the layer list is what gets preserved: the pool is global, so
+# each cell of the final map has to see most of the frame, and four stages at
+# 224px would leave a 14x14 map at ~21% receptive field whose average would
+# wash out the spatial content z is made of.
+#
+# The default, for two reasons. Every constant this program freezes -- lambda,
+# rho, the learning rate -- was calibrated on this architecture. And its
+# failures are interpretable: poor recovery from a from-scratch ViT cannot be
+# told apart from an optimisation or data-volume failure, which is fatal for a
+# claim about identifiability specifically.
+
+embed_dim: 256           # = CNNEncoder.proj_dim, the head's input width
+
+# The reference's final layer is a bare `Linear(256, d_latent)`. The encoder's
+# own projection already ends in BatchNorm1d + GELU, so the head takes no norm
+# and no hidden layer -- this reproduces that exactly.
+head_hidden_dim: null
+head_norm: false
+
+# App. H.11's settings for this architecture (AdamW). Distinctly different from
+# the ViT's, which is why they travel with the encoder rather than sitting in
+# the training config.
+encoder_lr: 3.0e-3
+encoder_weight_decay: 1.0e-4
+
+encoder_spec:
+  _target_: stable_worldmodel.wm.lejepa.CNNEncoder
+  # 32/64/128/256 is the reference progression; the two extra 256 stages are
+  # what bring a 224px input back to a small map at a near-global receptive
+  # field. Six stages -> 3x3 at ~85%, against the reference's 4x4 at ~72%.
+  channels: [32, 64, 128, 256, 256, 256]
+  in_channels: 3
+  proj_dim: ${embed_dim}
+  image_size: ${img_size}

@@ -62,13 +62,29 @@ env:
     scale: 0.85
 
 latents:
-  # 'task_content' is the stage-A exit-criterion profile: the physical DOFs
-  # plus cube.color as content, everything else style. n = 9 + 3 * n_cubes
-  # here, not the physical-only n=9 that violations.py / run_v4_calibration.py
-  # calibrate against -- those predate cube.color joining this profile.
+  # MUST match the `profile` every downstream config defaults to
+  # (lejepa.yaml, lejepa_predictor.yaml, metrics.yaml,
+  # ogb_cube_single_predictor.yaml). They interpolate it into the dataset name,
+  # so a disagreement here does not warn -- it just makes training look for a
+  # dataset collection never wrote.
+  #
+  # 'physical_content' (n=9) is the stage-A exit-criterion profile: the physical
+  # DOFs only. Every content latent has a privileged/proprio readback, and none
+  # shares a rendering channel with a style latent. It is also the n that
+  # violations.py / run_v4_calibration.py calibrate against.
+  #
+  # 'task_content' (n=12) additionally puts cube.color in z. Its 3 colour dims
+  # are entangled with the lighting that stays style -- the image constrains
+  # albedo x illumination, not the factors -- so they measure the cost of a
+  # shared rendering channel rather than clean recovery. A reported arm, not
+  # the default.
+  #
   # 'all_content' (n=54) leaves no continuous style at all, so the
   # style-invariance metric is vacuous under it -- run as a scaling datapoint.
-  profile: task_content
+  # Note its photometric block (ambient/diffuse/headlight/albedo) is jointly
+  # non-identifiable, so its recovery floor is set by the renderer, not the
+  # encoder.
+  profile: physical_content
 
   # One fundamental domain of the cube's C4 yaw symmetry (pi/4, less a 5%
   # margin so the arc's two endpoints -- which are the SAME configuration --

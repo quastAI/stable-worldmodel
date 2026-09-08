@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from stable_worldmodel.protocols import Dynamics
-from stable_worldmodel.wm.lejepa import LeJEPA, NDimHead
+from stable_worldmodel.wm.lejepa import CNNEncoder, LeJEPA, NDimHead
 from stable_worldmodel.wm.lejepa.losses import alignment_loss, whitening_loss
 from stable_worldmodel.wm.lejepa.module import (
     Embedder,
@@ -63,6 +63,95 @@ def frozen(encoder):
 
 def pixels(b=4, t=2):
     return torch.randn(b, t, 3, 8, 8)
+
+
+# --------------------------------------------------------- the paper's CNN
+
+
+def test_cnn_encoder_reproduces_the_reference_shape():
+    """`(B, C, H, W) -> (B, proj_dim)`, pooled and projected."""
+    enc = CNNEncoder(channels=(8, 16), proj_dim=DIM, image_size=32)
+    out = enc(torch.randn(4, 3, 32, 32))
+    assert out.shape == (4, DIM)
+    assert enc.output_dim == DIM
+
+
+def test_cnn_pool_stays_global_at_the_design_resolution():
+    """The invariant that decides the stage count.
+
+    The pool is global, so position has to be encoded in *which* channels fire.
+    That only works while each cell of the final map still sees most of the
+    frame. Six stages at 224px give a 3x3 map -- the reference's 64px/4-stage
+    design gives 4x4. A regression to 4 stages at 224px would leave 14x14 and
+    average the spatial content away, so this pins the geometry.
+    """
+    six = CNNEncoder(image_size=224)
+    assert six.feature_map == 3, six.feature_map
+    assert CNNEncoder(channels=(32, 64, 128, 256), image_size=64).feature_map == 4
+    assert CNNEncoder(channels=(32, 64, 128, 256), image_size=224).feature_map == 14
+
+
+def test_cnn_encoder_is_resolution_agnostic():
+    """Adaptive pooling, so a different input size runs rather than erroring.
+
+    The reference's fixed `AvgPool2d(4)` silently stops being global when the
+    input changes size; this must not.
+    """
+    enc = CNNEncoder(channels=(8, 16), proj_dim=DIM, image_size=32)
+    assert enc(torch.randn(2, 3, 64, 64)).shape == (2, DIM)
+
+
+def test_cnn_embedding_is_not_normalised():
+    """No norm *after* the projection to n.
+
+    BatchNorm on the embedding would force diag(Cov(h)) to one by
+    construction, partly trivialising both ``epsilon`` and SIGReg -- and
+    ``epsilon`` is a logged measurement the V8 sweep only means anything
+    against if it is independent of the objective. The paper's reference is
+    built the same way: every BatchNorm internal, the final projection bare.
+    """
+    model = LeJEPA(
+        CNNEncoder(channels=(8, 16), proj_dim=DIM, image_size=32),
+        NDimHead(DIM, N, hidden_dim=None, norm=False),
+    )
+    # The head the paper's config builds is exactly `Linear(proj_dim, n)`.
+    assert len(model.head.net) == 1
+    assert isinstance(model.head.net[0], nn.Linear)
+
+    emb = model.encode({'pixels': torch.randn(8, 2, 3, 32, 32)})['emb']
+    per_dim_var = emb.flatten(0, 1).var(dim=0)
+    assert not torch.allclose(
+        per_dim_var, torch.ones_like(per_dim_var), atol=0.2
+    ), 'embedding looks pre-whitened; SIGReg would be measuring itself'
+
+
+def test_encode_accepts_both_backbone_conventions():
+    """HF-style and plain modules both work, decided by signature.
+
+    `TinyBackbone.forward` takes `interpolate_pos_encoding` and returns an
+    object with `last_hidden_state`; `CNNEncoder.forward` takes neither and
+    returns a tensor. Passing the kwarg to the CNN would raise, so this pins
+    the detection rather than the happy path of whichever ran first.
+    """
+    vit = LeJEPA(TinyBackbone(), NDimHead(DIM, N, hidden_dim=16))
+    cnn = LeJEPA(
+        CNNEncoder(channels=(8, 16), proj_dim=DIM, image_size=8),
+        NDimHead(DIM, N, hidden_dim=None, norm=False),
+    )
+    assert vit._takes_pos_encoding is True
+    assert cnn._takes_pos_encoding is False
+    for model in (vit, cnn):
+        assert model.encode({'pixels': pixels()})['emb'].shape == (4, 2, N)
+
+
+def test_cnn_exposes_image_size_for_the_metric_suite():
+    """The metric suite must be able to preprocess exactly as training did.
+
+    HF backbones carry the resolution on `.config`; this one carries it on the
+    module. Scoring at the wrong resolution silently invalidates every column
+    of the scatter, so the attribute is part of the contract.
+    """
+    assert CNNEncoder(image_size=224).image_size == 224
 
 
 # ----------------------------------------------------------- passive encoder

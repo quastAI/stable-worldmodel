@@ -63,6 +63,46 @@ python scripts/data/collect_cube_single_ou.py latents.profile=task_content
 python scripts/train/lejepa.py profile=task_content
 ```
 
+**The two encoders.** A second `encoder=` group, independent of the profile.
+It carries the backbone, the head's shape *and* the optimizer settings
+calibrated for it, so the architecture and its learning rate cannot drift
+apart:
+
+| `encoder=` | params | head | lr / wd | Why |
+|---|---|---|---|---|
+| `paper_cnn` **(default)** | 2.86M | bare `Linear(256, n)` | 3e-3 / 1e-4 | **The paper's own pixel encoder** (App. H.11), scaled 64→224px. Every frozen constant — λ, ρ, the lr — was calibrated on it, and its failures are interpretable. |
+| `vit_small` | 22.4M | `LayerNorm → 2048 → n` | 5e-5 / 1e-3 | The LeWM baseline. A ViT↔CNN gap is itself a measurement (§8 of the paper names it open), but it is not the default — see below. |
+
+```bash
+python scripts/train/lejepa.py                      # paper_cnn
+python scripts/train/lejepa.py encoder=vit_small    # labelled second arm
+```
+
+> **The paper uses no transformer anywhere.** Its three encoders are a 4-layer
+> MLP (2D mixings), a matched inverse-RealNVP (the N=2…1024 sweep, chosen so
+> "any failure of identifiability is due to the optimization landscape, not the
+> encoder's function class"), and the CNN (pixels). The ViT came from LeWM, not
+> from the paper.
+
+> **Why the CNN is the default.** Thm 1 is architecture-agnostic — it asks only
+> that `h` be measurable — so a ViT can in principle reach the same optimum.
+> But the theorem is a statement about the *global optimum*, and §7 explicitly
+> declines to address training dynamics. If a from-scratch ViT gives poor
+> recovery you cannot separate "LeJEPA does not identify these latents" from
+> "a 22M-param ViT with no augmentation on 400k frames did not converge" — and
+> that ambiguity is fatal for an identifiability claim specifically. Note also
+> that augmentation is *forbidden* here (any random transform would be an
+> undeclared extra difference between the two views), which removes the main
+> thing that makes from-scratch ViTs trainable at this data scale.
+
+> **Scaling the CNN to 224px preserves the stage count, not the layer list.**
+> The pool is global, so position is encoded in *which* channels fire, which
+> only works while each cell of the final map sees most of the frame. The
+> reference gets 4×4 at a 46px receptive field (~72% of a 64px frame); four
+> stages at 224px would leave 14×14 at ~21% and average the spatial content
+> away. Six stages restore it: 3×3 at ~85%. Pinned by
+> `test_cnn_pool_stays_global_at_the_design_resolution`.
+
 ---
 
 ## 2. Environment
@@ -248,12 +288,11 @@ python scripts/train/lejepa.py data=ogb_cube_single_ou trainer.max_epochs=20    
 | `trainer.max_epochs` | 100 | V8 shortens this; severity 0 is the full schedule. |
 | `trainer.precision` / `.accelerator` | `bf16` / `gpu` | For a CPU smoke run: `trainer.accelerator=cpu trainer.precision=32 trainer.devices=1 loader.num_workers=0 loader.persistent_workers=false loader.prefetch_factor=null`. |
 | `loader.batch_size` | 256 | SIGReg is batch-size-scaled, so its absolute magnitude is not comparable across batch sizes. |
-| `optimizer.lr` / `.weight_decay` | 5e-5 / 1e-3 | AdamW. LR schedule is hardcoded: linear warmup (1% of steps) + cosine, per epoch. |
-| `encoder_scale` / `embed_dim` | `small` / 384 | Must agree — 384 is the ViT-small width. Changing one alone is a shape error at first forward. |
-| `img_size` / `patch_size` | 224 / 14 | |
+| `optimizer.lr` / `.weight_decay` | `${encoder_lr}` / `${encoder_weight_decay}` | From the encoder group — 3e-3/1e-4 for the CNN, 5e-5/1e-3 for the ViT. Schedule is hardcoded: linear warmup (1% of steps) + cosine, per epoch. |
+| `encoder` | `paper_cnn` | Config group; also sets `embed_dim`, the head shape and the optimizer (§1). |
+| `img_size` | 224 | Shared by both encoders. `patch_size`, `encoder_scale` and `embed_dim` come from the encoder group. |
 | `model.head.output_dim` | `null` | `null` ⇒ take `n` from the dataset's `latent/z` width, so `m = n` by construction. See below. |
-| `model.head.hidden_dim` | 2048 | `null` makes the head a bare linear map. |
-| `model.head.norm` | true | LayerNorm on the CLS token. On by default because SIGReg is scale-sensitive. |
+| `model.head.hidden_dim` / `.norm` | from the encoder group | `null`/`false` for the CNN (its projection already ends in BatchNorm1d + GELU, so the head is a bare `Linear(256, n)` exactly as the reference); `2048`/`true` for the ViT. **Never a norm after the output** — that would force `diag(Cov(h))` to 1 and partly trivialise both ε and SIGReg. |
 | `loss.sigreg.kwargs.knots` / `.num_proj` | 17 / 1024 | Epps–Pulley knots and random projections. |
 | `train_split` | 0.9 | |
 | `seed` | 3072 | **Only** seeds the train/val split and the DataLoader generators — not model init, not SIGReg's projections. Encoder hashes are therefore *not* reproducible from `seed` alone. |
@@ -366,6 +405,7 @@ raises `ValueError: Ambiguous checkpoint`.
 | `model.predictor.depth` / `.heads` / `.mlp_dim` | 6 / 16 / 2048 | |
 | `loader.batch_size` | 128 | Half the encoder's 256. |
 | `random_encoder.head.output_dim` | 9 | **Only used by arm R**; arm A takes its width from the loaded `config.json`. Read at runtime from `encoder_dataset`'s manifest (`latents.n`), so it follows the profile automatically — the literal is only a fallback for an unreachable manifest. |
+| `encoder` (group) | `paper_cnn` | **Must match what the encoder was trained under.** Arm R builds its untrained encoder from this group, so a mismatch would compare arms of different architectures. Verified parameter-identical to arm A for both groups. |
 
 There is **no `loss:` block** — SIGReg is deliberately absent from stage D.
 The optimizer is scoped to `model.predictor` and `model.action_encoder` only,

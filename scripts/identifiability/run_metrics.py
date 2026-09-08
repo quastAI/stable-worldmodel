@@ -31,11 +31,51 @@ import torch  # noqa: E402
 from loguru import logger as logging  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
+import stable_pretraining as spt  # noqa: E402
+from stable_pretraining import data as dt  # noqa: E402
+
 import stable_worldmodel as swm  # noqa: E402
 from stable_worldmodel.identifiability import metrics as ident_metrics  # noqa: E402
 from stable_worldmodel.identifiability.collect import load_manifest  # noqa: E402
 from stable_worldmodel.identifiability import scatter as ident_scatter  # noqa: E402
 from stable_worldmodel.wm.utils import load_pretrained  # noqa: E402
+
+
+def encoder_preprocessor(model):
+    """The **exact** preprocessing the encoder was trained under.
+
+    Not optional and not cosmetic. `scripts/train/lejepa.py` feeds the encoder
+    ImageNet-normalised tensors (range about [-2.1, 2.6]); a dataset loaded
+    without a transform yields raw [0, 255]. The layouts match, so nothing
+    raises -- the encoder is simply evaluated ~100x outside its input range and
+    every column of the scatter becomes a measurement of that, not of
+    identifiability.
+
+    `image_size` is read off the checkpoint's own encoder config rather than a
+    config field here, so a run cannot be scored at a resolution the encoder
+    was never trained at.
+    """
+    encoder = model.encoder
+    # Two conventions: HF backbones carry it on `.config`, the paper CNN on the
+    # module. Resolved rather than assumed, because guessing here silently
+    # rescales every frame the metrics are computed on.
+    img_size = getattr(
+        getattr(encoder, 'config', None), 'image_size', None
+    ) or getattr(encoder, 'image_size', None)
+    if img_size is None:
+        raise AttributeError(
+            f'cannot determine the input resolution of '
+            f'{type(encoder).__name__}: expose `image_size` on the module or '
+            '`config.image_size` as HF backbones do. Scoring at the wrong '
+            'resolution silently invalidates every column of the scatter.'
+        )
+    img_size = int(img_size)
+    return img_size, spt.data.transforms.Compose(
+        dt.transforms.ToImage(
+            **dt.dataset_stats.ImageNet, source='pixels', target='pixels'
+        ),
+        dt.transforms.Resize(img_size, source='pixels', target='pixels'),
+    )
 
 
 @torch.no_grad()
@@ -77,7 +117,11 @@ def run(cfg: DictConfig):
     """Score one checkpoint on both distributions."""
     device = cfg.device if torch.cuda.is_available() else 'cpu'
     model = load_pretrained(cfg.checkpoint)
-    logging.info(f'scoring {cfg.checkpoint} (m = {model.output_dim})')
+    img_size, transform = encoder_preprocessor(model)
+    logging.info(
+        f'scoring {cfg.checkpoint} (m = {model.output_dim}, '
+        f'img_size = {img_size})'
+    )
 
     # The style probe is content-matched by construction, so it is embedded
     # once and reused for both distributions: style invariance is a property
@@ -90,6 +134,7 @@ def run(cfg: DictConfig):
             frameskip=1,
             keys_to_load=['pixels', 'latent/z'],
         )
+        style_set.transform = transform
         z_s, h_style_a, z_s_next, h_style_b = embed_dataset(
             model, style_set, int(cfg.max_samples), device
         )
@@ -124,6 +169,7 @@ def run(cfg: DictConfig):
             frameskip=1,
             keys_to_load=['pixels', 'latent/z'],
         )
+        dataset.transform = transform
         z, h, z_next, h_next = embed_dataset(
             model, dataset, int(cfg.max_samples), device
         )

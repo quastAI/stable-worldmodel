@@ -62,6 +62,96 @@ def state_dict_hash(module: nn.Module) -> str:
     return digest.hexdigest()[:16]
 
 
+class CNNEncoder(nn.Module):
+    """The LeJEPA paper's pixel encoder, scaled to a larger input.
+
+    Faithful to the reference ``lejepa_id/models.py::make_cnn_encoder`` used
+    for the paper's pixel experiment (App. H.11) -- a stack of ``k=4, s=2,
+    p=1`` convolutions with BatchNorm and GELU, a **global** average pool, then
+    one projection with BatchNorm before the head. Chosen over the LeWM ViT
+    because every constant this program freezes (``lambda``, ``rho``, the
+    learning rate) was calibrated on it, and because it removes the encoder's
+    expressivity as a confound: a from-scratch ViT's failures cannot be told
+    apart from optimisation or data-volume failures.
+
+    **What is preserved when scaling from the reference's 64px to 224px.** The
+    pool is global, so position has to be encoded in *which* channels fire,
+    not in where they fire -- and that only works while each cell of the final
+    map still sees most of the image. The reference gets a 4x4 map with a 46px
+    receptive field at 64px input, i.e. ~72% of the frame. Four stages at 224px
+    would leave a 14x14 map at ~21%, and averaging 196 near-local descriptors
+    would wash out exactly the spatial content (cube and effector position)
+    that ``z`` is made of. Six stages restore the invariant: a 3x3 map at a
+    190px receptive field, ~85% of the frame.
+
+    **What is deliberately *not* normalised**: the head's output. BatchNorm on
+    the embedding would force the diagonal of ``Cov(h)`` to one by
+    construction, which partly trivialises both ``epsilon`` and SIGReg -- and
+    ``epsilon`` is a logged measurement that the V8 sweep only means anything
+    against if it is independent of the objective. The reference is built the
+    same way: every BatchNorm is internal and the final projection is bare.
+
+    Args:
+        channels: Output width of each stride-2 stage. The default
+            ``(32, 64, 128, 256, 256, 256)`` is the reference's
+            ``32, 64, 128, 256`` progression extended by two stages that hold
+            at 256, which is what brings a 224px input back to a small map.
+        in_channels: Input channels; 3 for RGB.
+        proj_dim: Width of the projection after the pool. 256 as in the
+            reference, and the ``input_dim`` the head should be given.
+        image_size: Only used to record :attr:`feature_map` for diagnosis; the
+            pool is adaptive, so the module works at any resolution.
+    """
+
+    def __init__(
+        self,
+        channels=(32, 64, 128, 256, 256, 256),
+        in_channels: int = 3,
+        proj_dim: int = 256,
+        image_size: int = 224,
+    ):
+        super().__init__()
+        self.output_dim = proj_dim
+        self.channels = tuple(channels)
+
+        layers = []
+        prev = in_channels
+        for width in self.channels:
+            layers += [
+                nn.Conv2d(prev, width, 4, 2, 1),
+                nn.BatchNorm2d(width),
+                nn.GELU(),
+            ]
+            prev = width
+        # Adaptive rather than the reference's `AvgPool2d(4)`: both are a global
+        # mean at the design resolution, but the fixed kernel silently stops
+        # being global the moment the input size changes.
+        layers += [nn.AdaptiveAvgPool2d(1), nn.Flatten()]
+        layers += [
+            nn.Linear(prev, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.GELU(),
+        ]
+        self.net = nn.Sequential(*layers)
+
+        self.image_size = image_size
+        """Input resolution this encoder is built for. The pool is adaptive so
+        other sizes run, but the metric suite reads this to preprocess exactly
+        as training did -- mirroring an HF backbone's ``config.image_size``."""
+
+        size = image_size
+        for _ in self.channels:
+            size = (size + 2 - 4) // 2 + 1
+        self.feature_map = size
+        """Spatial extent of the last conv map at ``image_size``, for the
+        record: the global pool discards whatever spatial detail survives here,
+        so a large value means position is being averaged away."""
+
+    def forward(self, x):
+        """``(B, C, H, W) -> (B, proj_dim)``."""
+        return self.net(x)
+
+
 class NDimHead(nn.Module):
     """Project the encoder's CLS token to exactly ``n`` dimensions.
 
@@ -267,6 +357,7 @@ class FrozenEncoderWM(nn.Module):
 
 
 __all__ = [
+    'CNNEncoder',
     'MLP',
     'Attention',
     'Block',

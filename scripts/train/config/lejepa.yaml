@@ -3,6 +3,10 @@
 defaults:
   - _self_
   - launcher: local
+  # Carries the backbone, the head's shape and the optimiser settings
+  # calibrated for it. `encoder=vit_small` swaps all four together, so the
+  # arch and its learning rate can never drift apart.
+  - encoder: paper_cnn
   - data: ogb_cube_single_ou
 
 # Which latent profile's dataset to train on. `physical_content` (n=9) is the
@@ -18,9 +22,6 @@ num_workers: 6
 train_split: 0.9
 seed: 3072
 img_size: 224
-patch_size: 14
-encoder_scale: small
-embed_dim: 384
 
 # Frozen before Env 1 and copied verbatim into every result row by the metric
 # writer. A run that deviates from these is a first-class event in the scatter,
@@ -57,28 +58,26 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 5e-5
-  weight_decay: 1e-3
+  # From the encoder group: the CNN wants 3e-3/1e-4 (App. H.11), the ViT
+  # 5e-5/1e-3 (LeWM). Interpolated so switching `encoder=` switches these too.
+  lr: ${encoder_lr}
+  weight_decay: ${encoder_weight_decay}
 
 model:
   _target_: stable_worldmodel.wm.lejepa.LeJEPA
-  encoder:
-    # The LeWM baseline backbone, unchanged, so encoder capacity is held fixed
-    # against that baseline rather than becoming another free variable.
-    _target_: stable_pretraining.backbone.utils.vit_hf
-    size: ${encoder_scale}
-    patch_size: ${patch_size}
-    image_size: ${img_size}
-    pretrained: false
-    use_mask_token: false
+  encoder: ${encoder_spec}
   head:
     _target_: stable_worldmodel.wm.lejepa.NDimHead
     input_dim: ${embed_dim}
     # null => take n from the dataset's own `latent/z` width, so m = n by
     # construction. Set explicitly for V7a (n - k) or V7b (n + k).
     output_dim: null
-    hidden_dim: 2048
-    norm: true
+    # Shape follows the encoder: bare `Linear(256, n)` for the paper CNN, whose
+    # projection already ends in BatchNorm1d + GELU; LayerNorm + a 2048 hidden
+    # layer for the ViT. Never a norm *after* the output -- that would force
+    # diag(Cov(h)) to 1 and partly trivialise both epsilon and SIGReg.
+    hidden_dim: ${head_hidden_dim}
+    norm: ${head_norm}
 
 loss:
   sigreg:

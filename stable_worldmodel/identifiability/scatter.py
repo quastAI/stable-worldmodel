@@ -143,6 +143,10 @@ def build_row(
         'hermite2_excess': metrics.get('hermite2_excess'),
         'sigreg_z': metrics.get('sigreg_z'),
         'style_sensitivity': metrics.get('style_sensitivity'),
+        # Distinguishes "measured, and the encoder is invariant" from
+        # "there was no style to resample" (all_content) and from "no probe was
+        # supplied" (null). Without it a vacuous zero reads as a perfect score.
+        'style_vacuous': metrics.get('style_vacuous'),
         # --- configuration that cannot be recovered later ---
         'rho_per_dim': rho.tolist(),
         'rho_mean': float(np.mean(rho)),

@@ -1,0 +1,38 @@
+# @package _global_
+#
+# The LeWM baseline backbone. Kept selectable, not default.
+#
+# Selectable because a ViT-vs-CNN gap is itself a measurement: Sec. 8 of the
+# paper names the interaction between objective and architecture as open, and
+# Thm 1 itself is architecture-agnostic (it asks only that h be measurable), so
+# a ViT reaching the same optimum is a real possibility worth testing.
+#
+# Not default because this task is a ViT's worst regime. Augmentation is
+# *forbidden* here -- any random transform would be an undeclared extra
+# difference between the two views of a positive pair -- and a from-scratch
+# ViT-small without augmentation on ~400k frames has neither the data nor the
+# inductive bias for spatial content. It also pools a CLS token that no
+# pretraining objective ever trained, and its LayerNorms give no protection
+# against the batch-wise collapse that BatchNorm was needed for in H.11.
+#
+# Run it as a labelled arm on the same data, so a failure here cannot
+# contaminate the headline identifiability number.
+
+patch_size: 14
+encoder_scale: small
+embed_dim: 384
+
+# LeWM's head: LayerNorm(384) -> Linear(384, 2048) -> GELU -> Linear(2048, n).
+head_hidden_dim: 2048
+head_norm: true
+
+encoder_lr: 5.0e-5
+encoder_weight_decay: 1.0e-3
+
+encoder_spec:
+  _target_: stable_pretraining.backbone.utils.vit_hf
+  size: ${encoder_scale}
+  patch_size: ${patch_size}
+  image_size: ${img_size}
+  pretrained: false
+  use_mask_token: false
