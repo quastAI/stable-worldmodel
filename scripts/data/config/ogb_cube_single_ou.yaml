@@ -8,7 +8,16 @@
 defaults:
   - _self_
 
-dataset_name: ogbench/cube_single_ou.lance
+# The profile is in the name on purpose. `physical_content` and
+# `task_content` are two different z's, so they are two different datasets;
+# sharing one filename would mean whichever ran last silently became "the"
+# encoder set, with only the manifest's config_hash to tell afterwards.
+#
+# Style probe for the style-invariance metric -- same collector, content held
+# fixed (see `program_constants.rho` below):
+#   dataset_name=ogbench/cube_single_ou_style_${latents.profile}.lance \
+#   program_constants.rho=0.99999999
+dataset_name: ogbench/cube_single_ou_${latents.profile}.lance
 cache_dir: null
 write_mode: overwrite
 

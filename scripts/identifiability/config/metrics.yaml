@@ -9,8 +9,21 @@ arm: A
 # BOTH are required for a complete row. The encoder trains on OU-set states and
 # the planner only ever sees rollouts; the gap between them is a measurement,
 # not a nuisance to be asserted away.
-ou_dataset: ogbench/cube_single_ou.lance
+profile: physical_content
+ou_dataset: ogbench/cube_single_ou_${profile}.lance
 rollout_dataset: ogbench/cube_single_predictor.lance
+
+# Same-content/different-style probe, for the style-invariance metric: the
+# term the alignment loss is supposed to discard, and the only thing that
+# distinguishes `task_content` from Thm 1's setting. Collect it with the OU
+# collector at `program_constants.rho=0.99999999`: the sampler rejects rho=1
+# outright (the paper's rho lies strictly in (0, 1)), and at 1-1e-8 the
+# residual content drift is ~7e-4 in z units -- sub-pixel once rendered,
+# against ~2.0 for a real step at rho=0.9. So the two views of each pair share
+# their content for all practical purposes and differ only in style.
+# Vacuous under `all_content` (no continuous style left); null skips it.
+# e.g. ogbench/cube_single_ou_style_${profile}.lance
+style_dataset: null
 
 cache_dir: null
 max_samples: 20000

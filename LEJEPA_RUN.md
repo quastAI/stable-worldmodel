@@ -44,6 +44,25 @@ fixed (`predictor_hidden_dim: 512`, identical across arms):
 | **R** | Random init, frozen | `encoder=random` — architecturally identical, never trained |
 | **C1 / C2** | Trajectory-derived pairs instead of OU pairs | `scripts/data/collect_cube_single_arm_c.py arm=c1\|c2` |
 
+**The two latent profiles.** Orthogonal to the arms, and the single knob
+`profile=` selects one end to end — collection, training, the predictor and the
+metrics all interpolate it, so the two never share a filename:
+
+| `profile=` | `n` | z contains | Use |
+|---|---|---|---|
+| `physical_content` **(default)** | 9 | the 9 physical DOFs | The stage-A exit criterion, and the `n` the V4 calibration and the plan quote. Well-posed: every content latent has a physical readback and none shares a rendering channel with a style latent. |
+| `task_content` | 12 | + `cube.color` | A deliberate, separately-reported arm. `cube.color` is entangled with the lighting that stays style, so its 3 dims measure *the cost of a shared rendering channel* rather than clean recovery — see §12. |
+
+```bash
+# the exit criterion
+python scripts/data/collect_cube_single_ou.py                    # profile default
+python scripts/train/lejepa.py
+
+# the shared-channel arm
+python scripts/data/collect_cube_single_ou.py latents.profile=task_content
+python scripts/train/lejepa.py profile=task_content
+```
+
 ---
 
 ## 2. Environment
@@ -76,8 +95,8 @@ run_v4_calibration.py              ->  outputs/v4_calibration.json
    (gate: run once before spending the sweep budget; needs nothing)
         |
         v
-collect_cube_single_ou.py          ->  datasets/ogbench/cube_single_ou.lance
-                                        + cube_single_ou_manifest.json
+collect_cube_single_ou.py          ->  datasets/ogbench/cube_single_ou_<profile>.lance
+                                        + cube_single_ou_<profile>_manifest.json
         |
         +---------------------------+
         |                           |
@@ -116,8 +135,8 @@ cd stable-worldmodel
 python scripts/data/collect_cube_single_ou.py num_pairs=200000 seed=3072
 ```
 
-Writes `$STABLEWM_HOME/datasets/ogbench/cube_single_ou.lance` plus a sidecar
-`cube_single_ou_manifest.json`
+Writes `$STABLEWM_HOME/datasets/ogbench/cube_single_ou_<profile>.lance` plus a sidecar
+`cube_single_ou_<profile>_manifest.json`
 ([`collect.py:379-386`](stable_worldmodel/identifiability/collect.py#L379-L386)).
 
 One positive pair per **two-step episode**: `pixels (2,H,W,3)`, `latent/z (2,n)`,
@@ -133,11 +152,11 @@ rebuilt from those recorded rows without re-running the environment
 | `num_pairs` | 200000 | Pairs, i.e. 2× that many rendered frames. Split across shards, not per shard. |
 | `seed` | 3072 | Sampler seed is `seed + shard*1_000_003`; the style stream uses `base_seed + 7`. |
 | `shard` / `num_shards` | 0 / 1 | Disjoint slice + disjoint seed block. Validated `0 <= shard < num_shards`. |
-| `dataset_name` | `ogbench/cube_single_ou.lance` | Sharded runs get a `_shard{i}` suffix on the stem. |
+| `dataset_name` | `ogbench/cube_single_ou_${latents.profile}.lance` | Interpolates the profile, so two profiles cannot overwrite each other. Sharded runs add `_shard{i}`. |
 | `write_mode` | `overwrite` | Passed to `LanceWriter`. |
 | `program_constants.rho` | 0.9 | The OU autocorrelation — the positive-pair strength. |
 | `program_constants.lambda` | 3.0e-3 | Recorded into the manifest only; the **encoder** reads its own copy. |
-| `latents.profile` | `task_content` | One of `task_content` (n=12), `physical_content` (n=9) or `all_content` (n=54) — see §12. |
+| `latents.profile` | `physical_content` | `physical_content` (n=9), `task_content` (n=12) or `all_content` (n=54) — see §1 and §12. |
 | `latents.yaw_half_arc` | 0.746… | `0.95 · π/4`, one fundamental domain of the cube's C4 yaw symmetry. Widening past `π/4` requires `env.marker.enabled=true`. |
 | `latents.include_roll_pitch` | false | Switches the sampler to its tangent-space branch. |
 | `latents.include_discrete` | false | Discrete latents are renderable but non-Gaussian — a structural V1. |
@@ -178,14 +197,16 @@ for i in 0 1 2 3 4 5 6 7; do
       num_pairs=200000 shard=$i num_shards=8 &
 done; wait
 
-swm merge $(for i in 0 1 2 3 4 5 6 7; do printf 'ogbench/cube_single_ou_shard%d.lance ' $i; done) \
-    --output ogbench/cube_single_ou --overwrite
+swm merge $(for i in 0 1 2 3 4 5 6 7; do printf 'ogbench/cube_single_ou_<profile>_shard%d.lance ' $i; done) \
+    --output ogbench/cube_single_ou_<profile> --overwrite
 ```
 
 > **`swm merge` does not merge manifests.** Each shard writes its own
-> `cube_single_ou_shard{i}_manifest.json`, and the predictor collector looks for
-> `cube_single_ou_manifest.json` (§6). After merging, copy one shard's manifest
-> to the merged name, or point `encoder_manifest=` at a shard's.
+> `cube_single_ou_<profile>_shard{i}_manifest.json`, while everything
+> downstream derives the sidecar name from the *dataset* name and so looks for
+> `cube_single_ou_<profile>_manifest.json` (§6, §9). After merging, copy one
+> shard's manifest to the merged name — the shards share every field that
+> matters except the shard index.
 
 > `swm merge` appends the format suffix itself — pass `--output name`, not
 > `--output name.lance`. It needs at least two sources.
@@ -200,10 +221,11 @@ Lance's background thread, and doing so deadlocks at zero CPU
 ## 5. Stage A training — the encoder
 
 ```bash
-python scripts/train/lejepa.py data=ogb_cube_single_ou
+python scripts/train/lejepa.py
 ```
 
-`data=ogb_cube_single_ou` is already the default. Useful overrides:
+`data=ogb_cube_single_ou` is the default data group; `profile=` picks which
+profile's dataset inside it (§1). Useful overrides:
 
 ```bash
 python scripts/train/lejepa.py data=ogb_cube_single_ou \
@@ -300,7 +322,7 @@ is not supposed to be Gaussian, so V1–V4 and V9 do not apply here
 |---|---|---|
 | `num_traj` | 5000 | Split across shards. |
 | `shard` / `num_shards` | 0 / 1 | Seed spacing `seed + shard*(num_traj + world.num_envs)`. |
-| `encoder_manifest` | `ogbench/cube_single_ou_manifest.json` | The gate — see below. |
+| `encoder_dataset` | `ogbench/cube_single_ou_${profile}.lance` | The gate — see below. Its *sidecar manifest* carries the declared env config. |
 | `eval_fraction` | 0.1 | Tail of episodes reserved for eval. |
 | `policy_type` | `plan_oracle` | Must be `plan_oracle` or `markov_oracle`. |
 | `policy_mixture` | 0.25 | Fraction of random actions mixed into the expert. `0` uses the bare expert. |
@@ -309,8 +331,8 @@ is not supposed to be Gaussian, so V1–V4 and V9 do not apply here
 | `world.max_episode_steps` | 400 | |
 
 > **The manifest gate raises rather than warns.**
-> `assert_style_range_matches` reads
-> `$STABLEWM_HOME/datasets/<encoder_manifest>` and raises `FileNotFoundError`
+> `assert_style_range_matches` reads the sidecar manifest of
+> `encoder_dataset` and raises `FileNotFoundError`
 > if absent, or `ValueError` if `num_cubes`, `num_digits`, `marker_enabled` or
 > `marker_face` disagree with the live env
 > ([`collect_cube_single_predictor.py:94-129`](scripts/data/collect_cube_single_predictor.py#L94-L129)).
@@ -343,7 +365,7 @@ raises `ValueError: Ambiguous checkpoint`.
 | `wm.num_preds` | 1 | Target offset. The data config derives `num_steps` from these two, so overriding them re-derives it — overriding `data.dataset.num_steps` by hand breaks the alignment with only a shape error. |
 | `model.predictor.depth` / `.heads` / `.mlp_dim` | 6 / 16 / 2048 | |
 | `loader.batch_size` | 128 | Half the encoder's 256. |
-| `random_encoder.head.output_dim` | 12 | Hardcoded, and **only used by arm R** — arm A takes its width from the loaded `config.json`. It must equal the encoder dataset's `n`; 12 matches `task_content`. Change the profile and you must change this too. |
+| `random_encoder.head.output_dim` | 9 | **Only used by arm R**; arm A takes its width from the loaded `config.json`. Read at runtime from `encoder_dataset`'s manifest (`latents.n`), so it follows the profile automatically — the literal is only a fallback for an unreachable manifest. |
 
 There is **no `loss:` block** — SIGReg is deliberately absent from stage D.
 The optimizer is scoped to `model.predictor` and `model.action_encoder` only,
@@ -432,7 +454,7 @@ you to run C2 before attributing the A→C1 gap to anything.
 ```bash
 python scripts/identifiability/run_metrics.py \
     checkpoint=lejepa/weights_epoch_100.pt \
-    ou_dataset=ogbench/cube_single_ou.lance \
+    ou_dataset=ogbench/cube_single_ou_<profile>.lance \
     rollout_dataset=ogbench/cube_single_predictor.lance
 ```
 
@@ -453,6 +475,7 @@ A `lejepa_predictor` checkpoint is not an input here.
 | `max_samples` | 20000 | Embedding batch size is hardcoded at 64 — not a knob. |
 | `device` | `cuda` | Falls back to `cpu` when CUDA is unavailable. |
 | `success_rate`, `success_rate_oracle`, `success_rate_state` | `null` | **Filled in by hand** — see below. |
+| `style_dataset` | `null` | A same-content/different-style probe; enables the style-invariance metric. See below. |
 | `scatter_path` | `outputs/lejepa_scatter.jsonl` | Relative to the **launch directory**, not `$STABLEWM_HOME`. |
 
 **Both datasets are loaded with `keys_to_load=['pixels', 'latent/z']`** — the
@@ -475,7 +498,7 @@ the run.**
 > ```bash
 > python scripts/identifiability/run_metrics.py \
 >     checkpoint=lejepa/weights_epoch_100.pt \
->     ou_dataset=ogbench/cube_single_ou.lance \
+>     ou_dataset=ogbench/cube_single_ou_<profile>.lance \
 >     rollout_dataset=null
 > ```
 >
@@ -522,12 +545,40 @@ Frozen and versioned. `compute_all` runs, in order:
 | `probe_divergence` | `probe_linear_r2 − 1/(1 + orth_err_normalized)` — how far probe-ability has come apart from orthogonal recovery. |
 | `recovery_in_gap_units` | Recovery error in spectral-gap units, for cross-environment comparability. |
 
-> **`style_sensitivity` is always `null`.** `style_invariance` is defined and
-> exported ([`metrics.py:478-502`](stable_worldmodel/identifiability/metrics.py#L478-L502))
-> but **never called by `compute_all`**. So despite the registry docstring's
-> framing — "the style-invariance metric measures whether it did [discard
-> style]" — nothing currently measures it. If you care whether the alignment
-> loss actually discarded style, this is the gap to close.
+### The style probe
+
+`style_sensitivity` measures the thing the alignment loss is *supposed* to do:
+discard style. It is the only number that distinguishes `task_content` from
+Thm 1's setting, so under that profile it is not optional.
+
+It cannot be computed from an ordinary OU pair — those two views differ by one
+OU step **as well as** style, and scoring that would charge the transition as
+style leakage. It needs a probe whose two views share content exactly, and the
+OU collector already makes one: hold the content fixed by pushing ρ to 1.
+
+```bash
+# collect the probe -- same collector, content held fixed
+python scripts/data/collect_cube_single_ou.py \
+    dataset_name=ogbench/cube_single_ou_style_physical_content.lance \
+    program_constants.rho=0.99999999 num_pairs=20000
+
+# pass it to the metrics run
+python scripts/identifiability/run_metrics.py \
+    checkpoint=lejepa/weights_epoch_100.pt \
+    style_dataset=ogbench/cube_single_ou_style_physical_content.lance \
+    rollout_dataset=null
+```
+
+> **ρ=1 is rejected** — the sampler enforces the paper's ρ ∈ (0,1) strictly. At
+> 1e-8 below it the residual content drift is ~7e-4 in z units, sub-pixel once
+> rendered, against ~2.0 for a real step at ρ=0.9. `run_metrics` warns when a
+> probe's drift exceeds 1e-2, so one collected at the wrong ρ cannot quietly be
+> scored as style leakage.
+
+Vacuous under `all_content` (no continuous style left to resample); the metric
+sets `style_vacuous` when the two views embed identically. With no
+`style_dataset` the field is **absent** from the row rather than recorded as a
+measured zero.
 
 ### Arm-C rows
 
@@ -627,9 +678,9 @@ everything else at 3 seeds.
 $STABLEWM_HOME/                                  # default ~/.stable_worldmodel
 ├── datasets/
 │   └── ogbench/
-│       ├── cube_single_ou.lance                 # stage A pairs
-│       ├── cube_single_ou_manifest.json         # the predictor collector's gate
-│       ├── cube_single_ou_shard{i}.lance         # transient, see §4
+│       ├── cube_single_ou_<profile>.lance                 # stage A pairs
+│       ├── cube_single_ou_<profile>_manifest.json         # the predictor collector's gate
+│       ├── cube_single_ou_<profile>_shard{i}.lance         # transient, see §4
 │       ├── cube_single_predictor.lance          # stage D rollouts
 │       ├── cube_single_predictor_split.json     # held-out eval episodes
 │       └── cube_single_arm_c{1,2}.lance         # controls
@@ -726,6 +777,7 @@ anything that could be clipped or coupled it would matter, so do not promote a
 | `KeyError: latent/z` in `run_metrics.py` | The rollout dataset has no such column — §12 defect 4. Use `rollout_dataset=null`. |
 | Metrics row logged as "incomplete" | Expected with `rollout_dataset=null`; the OU/rollout gap is simply not measured. |
 | `V4 calibration failed: …` non-zero exit | The suite cannot resolve the published boundary. Do not start the sweep; the JSON evidence is still written (§9). |
-| `style_sensitivity` is always empty | `style_invariance` is never called by `compute_all` (§9). Not a config problem. |
+| `style_sensitivity` absent from the row | No `style_dataset` was given (§9). Absent, deliberately, rather than a measured zero. |
+| `style probe ... has content drift` warning | The probe was not collected at ρ≈1, so it also absorbs the OU step (§9). |
 | Scatter rows not where you expected | `scatter_path` is relative to the **launch directory**, not `$STABLEWM_HOME`. |
 | wandb project is `stable-wm`, not `lejepa-identifiability` | `launcher/local.yaml` is merged after `_self_` and wins. Pass `wandb.config.project=` on the CLI. |

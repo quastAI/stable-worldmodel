@@ -17,9 +17,10 @@ baseline.
 
 Usage::
 
-    python scripts/train/lejepa.py data=ogb_cube_single_ou
-    python scripts/train/lejepa.py data=ogb_cube_single_ou model.head.output_dim=7   # V7a
-    python scripts/train/lejepa.py data=ogb_cube_single_ou trainer.max_epochs=20     # V8
+    python scripts/train/lejepa.py                                  # physical_content
+    python scripts/train/lejepa.py profile=task_content              # + cube.color
+    python scripts/train/lejepa.py model.head.output_dim=7           # V7a
+    python scripts/train/lejepa.py trainer.max_epochs=20             # V8
 """
 
 import os

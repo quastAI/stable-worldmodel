@@ -502,7 +502,10 @@ def style_invariance(h_style_a, h_style_b):
     }
 
 
-def compute_all(z, h, z_next=None, h_next=None, rho=0.9, seed=0):
+def compute_all(
+    z, h, z_next=None, h_next=None, rho=0.9, seed=0,
+    h_style_a=None, h_style_b=None,
+):
     """Run the whole suite on one (z, h) pair of matrices.
 
     Args:
@@ -516,6 +519,17 @@ def compute_all(z, h, z_next=None, h_next=None, rho=0.9, seed=0):
         h_next: ``(B, m)`` second-view embeddings, needed for the bound.
         rho: Scalar or per-dimension autocorrelation.
         seed: Seed for the stochastic metrics.
+        h_style_a: ``(B, m)`` embeddings of a **style probe** -- one view of a
+            pair whose two frames share their content exactly and differ only
+            in style. Cannot be the ordinary OU pair: those differ by one OU
+            step *as well as* style, which would score the transition as if it
+            were style leakage. Collect a probe set with ``rho = 1``, where
+            ``z' = z`` identically.
+        h_style_b: ``(B, m)`` the other view of that same probe set.
+
+    Both style arguments must be given together; when either is missing the
+    style-invariance metric is simply absent from the result, and the scatter
+    records it as null rather than as a measured zero.
 
     Returns:
         dict: Every metric, flat, plus ``metric_suite_version``.
@@ -542,6 +556,13 @@ def compute_all(z, h, z_next=None, h_next=None, rho=0.9, seed=0):
     out['recovery_in_gap_units'] = in_gap_units(
         out['procrustes_mse_per_dim'], rho
     )
+
+    # The term the alignment loss is *supposed* to discard. Only measurable
+    # against a same-content/different-style probe, so it stays absent rather
+    # than defaulting to a number nothing computed.
+    if h_style_a is not None and h_style_b is not None:
+        out.update(style_invariance(h_style_a, h_style_b))
+
     return out
 
 

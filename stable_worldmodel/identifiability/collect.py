@@ -54,6 +54,7 @@ from loguru import logger as logging
 
 from stable_worldmodel import utils as swm_utils
 from stable_worldmodel.data.format import EPISODE_DATA_KEY
+from stable_worldmodel.data.utils import get_cache_dir
 
 
 def variation_shape(env, dotted):
@@ -386,6 +387,44 @@ def write_manifest(path, manifest):
     return sidecar
 
 
+def load_manifest(dataset_name, cache_dir=None):
+    """Read the sidecar manifest for a dataset name.
+
+    Args:
+        dataset_name: Dataset name or path, e.g.
+            ``'ogbench/cube_single_ou.lance'``. The manifest is looked up as
+            ``<cache>/datasets/<stem>_manifest.json``.
+        cache_dir: Cache root; defaults to ``STABLEWM_HOME``.
+
+    Returns:
+        dict: The manifest.
+
+    Raises:
+        FileNotFoundError: If no manifest is there. Every consumer of a
+            manifest needs the dataset config it came from, and guessing a
+            default is how two runs end up indistinguishable in the scatter.
+    """
+    name = Path(dataset_name)
+    # `name.parent` matters: datasets are namespaced (`ogbench/...`) and
+    # `write_manifest` drops the sidecar *next to* the dataset. Using only the
+    # stem would look in `datasets/` for a file that lives in
+    # `datasets/ogbench/`.
+    path = (
+        Path(cache_dir or get_cache_dir())
+        / 'datasets'
+        / name.parent
+        / f'{name.stem}_manifest.json'
+    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f'no manifest at {path}. It is written next to the dataset by the '
+            'OU and arm-C collectors; a sharded run writes one per shard, and '
+            '`swm merge` does not merge them.'
+        )
+    with open(path) as handle:
+        return json.load(handle)
+
+
 def audit_dataset(registry, sampler, z_recorded, z_next_recorded):
     """Post-hoc check that the dataset carries the process it claims to.
 
@@ -419,6 +458,7 @@ def audit_dataset(registry, sampler, z_recorded, z_next_recorded):
 
 
 __all__ = [
+    'load_manifest',
     'audit_dataset',
     'build_manifest',
     'collect_pairs',

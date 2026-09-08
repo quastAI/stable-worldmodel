@@ -36,6 +36,7 @@ from omegaconf import OmegaConf, open_dict
 from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
+from stable_worldmodel.identifiability.collect import load_manifest
 from stable_worldmodel.wm.lejepa.module import FrozenEncoderWM, state_dict_hash
 from stable_worldmodel.wm.utils import load_pretrained, save_pretrained
 
@@ -108,6 +109,22 @@ def run(cfg):
         # Arm R. A randomly initialised encoder of *identical architecture*,
         # so the arm isolates what training bought rather than what the
         # architecture bought.
+        #
+        # Its width cannot come from a checkpoint, so it comes from the encoder
+        # dataset's manifest. Arm A reads `n` off the loaded `config.json`; if
+        # arm R kept a hardcoded literal the two arms could differ in `m` and
+        # the comparison would quietly stop being about training.
+        encoder_dataset = cfg.get('encoder_dataset')
+        if encoder_dataset:
+            n = int(load_manifest(encoder_dataset)['latents']['n'])
+            declared = cfg.random_encoder.head.output_dim
+            if declared != n:
+                print(
+                    f'arm R: taking m = {n} from {encoder_dataset} '
+                    f'(config said {declared})'
+                )
+            with open_dict(cfg):
+                cfg.random_encoder.head.output_dim = n
         encoder = hydra.utils.instantiate(cfg.random_encoder)
     else:
         encoder = load_pretrained(cfg.encoder)

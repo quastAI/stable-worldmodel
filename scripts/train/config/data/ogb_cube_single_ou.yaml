@@ -4,7 +4,7 @@
 # pair it was written as -- `pixels` arrives as (2, C, H, W) and `latent/z` as
 # (2, n). No custom loader is involved anywhere in this pipeline.
 dataset:
-  name: ogbench/cube_single_ou.lance
+  name: ogbench/cube_single_ou_${profile}.lance
   num_steps: 2
   frameskip: 1
   keys_to_load:

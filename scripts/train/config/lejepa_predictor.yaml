@@ -13,6 +13,12 @@ subdir: ${hydra:job.id}
 # A checkpoint path for arm A, or the literal `random` for arm R.
 encoder: lejepa/weights_epoch_100.pt
 
+# Must match the profile the encoder was trained on -- arm R reads `n` off
+# this dataset's manifest, since it has no checkpoint to read it from. Arm A
+# ignores it (its width comes from the loaded `config.json`).
+profile: physical_content
+encoder_dataset: ogbench/cube_single_ou_${profile}.lance
+
 num_workers: 6
 train_split: 0.9
 seed: 3072
@@ -31,7 +37,7 @@ wm:
 
 trainer:
   max_epochs: 100
-  devices: auto
+  devices: 1        # as lejepa.yaml; multi-rank is untested on this path
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
@@ -64,8 +70,11 @@ random_encoder:
   head:
     _target_: stable_worldmodel.wm.lejepa.NDimHead
     input_dim: ${embed_dim}
-    output_dim: 12       # must match the encoder dataset's n (task_content:
-                         # 9 physical + 3 cube.color at n_cubes = 1)
+    # Overwritten at runtime from `encoder_dataset`'s manifest `latents.n`, so
+    # arm R cannot silently train at a width the encoder dataset never had.
+    # The literal is only a fallback for an unreachable manifest; it tracks the
+    # default profile (physical_content, n=9).
+    output_dim: 9
     hidden_dim: 2048
 
 model:

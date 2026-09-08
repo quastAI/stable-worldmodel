@@ -49,6 +49,7 @@ from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 import stable_worldmodel as swm  # noqa: E402
 from stable_worldmodel.envs.ogbench import ExpertPolicy  # noqa: E402
+from stable_worldmodel.identifiability.collect import load_manifest  # noqa: E402
 from stable_worldmodel.envs.ogbench.lejepa_cube_env import (  # noqa: E402,F401
     LeJEPACubeEnv,
 )
@@ -91,7 +92,7 @@ class MixturePolicy:
         return action
 
 
-def assert_style_range_matches(encoder_manifest_path, env):
+def assert_style_range_matches(encoder_dataset, env, cache_dir=None):
     """Refuse to run if appearance randomisation differs from the encoder's.
 
     Not a warning. Appearance outside the encoder's training range is exactly
@@ -99,17 +100,15 @@ def assert_style_range_matches(encoder_manifest_path, env):
     guarantee, and the resulting leakage would show up as an unexplained gap
     between the OU and rollout metrics -- attributed, wrongly, to distribution
     shift in the *states*.
-    """
-    path = Path(encoder_manifest_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f'encoder manifest not found at {path}. The predictor dataset must '
-            'be checked against the encoder dataset it will be paired with; '
-            'point `encoder_manifest` at it.'
-        )
-    with open(path) as handle:
-        manifest = json.load(handle)
 
+    Args:
+        encoder_dataset: Name of the encoder dataset this predictor set will be
+            paired with, e.g. ``'ogbench/cube_single_ou_physical_content.lance'``.
+            Its sidecar manifest is what carries the declared env config.
+        env: The live unwrapped env to check against.
+        cache_dir: Cache root; defaults to ``STABLEWM_HOME``.
+    """
+    manifest = load_manifest(encoder_dataset, cache_dir)
     declared = manifest['env']
     mismatches = []
     for key, actual in (
@@ -155,10 +154,9 @@ def run(cfg: DictConfig):
 
     # The gate: refuse a mismatch rather than record one.
     assert_style_range_matches(
-        Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
-        / 'datasets'
-        / cfg.encoder_manifest,
+        cfg.encoder_dataset,
         world.envs.envs[0].unwrapped,
+        cfg.get('cache_dir'),
     )
 
     expert = ExpertPolicy(

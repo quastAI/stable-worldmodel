@@ -25,9 +25,17 @@ disjoint block of sampler seeds, and writes its own ``*_shard{i}`` dataset for
 Usage::
 
     python scripts/data/collect_cube_single_ou.py num_pairs=200000
-    python scripts/data/collect_cube_single_ou.py latents.profile=all_content
+    python scripts/data/collect_cube_single_ou.py latents.profile=task_content
     python scripts/data/collect_cube_single_ou.py violation.name=v4 violation.severity=0.32
     python scripts/data/collect_cube_single_ou.py num_pairs=200000 shard=0 num_shards=8
+
+`dataset_name` interpolates `latents.profile`, so profiles cannot overwrite one
+another. The style-invariance probe is this same collector with the content
+held fixed -- rho pushed to 1, so the pair's two views differ only in style::
+
+    python scripts/data/collect_cube_single_ou.py \
+        dataset_name=ogbench/cube_single_ou_style_physical_content.lance \
+        program_constants.rho=0.99999999 num_pairs=20000
 """
 
 import os

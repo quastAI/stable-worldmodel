@@ -19,7 +19,8 @@ num_shards: 1
 # range is asserted against, and a mismatch aborts: appearance outside the
 # encoder's training range is not covered by the alignment loss and leaks
 # straight into the embedding.
-encoder_manifest: ogbench/cube_single_ou_manifest.json
+profile: physical_content
+encoder_dataset: ogbench/cube_single_ou_${profile}.lance
 
 # Fraction of episodes held out as the rollout-distribution eval set. Every
 # identifiability metric is reported on both this and the OU eval set.

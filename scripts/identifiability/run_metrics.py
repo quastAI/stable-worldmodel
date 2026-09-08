@@ -14,7 +14,6 @@ Usage::
         rollout_dataset=ogbench/cube_single_predictor.lance
 """
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -34,24 +33,9 @@ from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 import stable_worldmodel as swm  # noqa: E402
 from stable_worldmodel.identifiability import metrics as ident_metrics  # noqa: E402
+from stable_worldmodel.identifiability.collect import load_manifest  # noqa: E402
 from stable_worldmodel.identifiability import scatter as ident_scatter  # noqa: E402
 from stable_worldmodel.wm.utils import load_pretrained  # noqa: E402
-
-
-def load_manifest(dataset_name, cache_dir):
-    path = (
-        Path(cache_dir or swm.data.utils.get_cache_dir())
-        / 'datasets'
-        / f'{Path(dataset_name).stem}_manifest.json'
-    )
-    if not path.exists():
-        raise FileNotFoundError(
-            f'no manifest at {path}. Every scatter row must carry the dataset '
-            'config it came from; a row without it cannot be told apart later '
-            'from one configured differently.'
-        )
-    with open(path) as handle:
-        return json.load(handle)
 
 
 @torch.no_grad()
@@ -95,6 +79,33 @@ def run(cfg: DictConfig):
     model = load_pretrained(cfg.checkpoint)
     logging.info(f'scoring {cfg.checkpoint} (m = {model.output_dim})')
 
+    # The style probe is content-matched by construction, so it is embedded
+    # once and reused for both distributions: style invariance is a property
+    # of the encoder, not of the distribution being scored.
+    h_style_a = h_style_b = None
+    if cfg.get('style_dataset'):
+        style_set = swm.data.load_dataset(
+            cfg.style_dataset,
+            num_steps=2,
+            frameskip=1,
+            keys_to_load=['pixels', 'latent/z'],
+        )
+        z_s, h_style_a, z_s_next, h_style_b = embed_dataset(
+            model, style_set, int(cfg.max_samples), device
+        )
+        # A real OU step at rho=0.9 puts max|dz| near 2.0; a probe at
+        # rho=1-1e-8 puts it near 7e-4. Anything above 1e-2 is a step, not
+        # rounding, and the metric would then be scoring the transition as if
+        # it were style leakage.
+        drift = float(np.abs(z_s - z_s_next).max())
+        if drift > 1e-2:
+            logging.warning(
+                f'style probe {cfg.style_dataset} has content drift '
+                f'{drift:.3e} between views -- it was not collected at '
+                'rho ~ 1, so style_sensitivity also absorbs the OU step.'
+            )
+        logging.info(f'style probe: {len(h_style_a)} content-matched pairs')
+
     rows = []
     for distribution, dataset_name in (
         ('ou', cfg.ou_dataset),
@@ -120,7 +131,8 @@ def run(cfg: DictConfig):
         rho = manifest.get('ou', {}).get('rho', cfg.program_constants.rho)
 
         scores = ident_metrics.compute_all(
-            z, h, z_next, h_next, rho=rho, seed=int(cfg.seed)
+            z, h, z_next, h_next, rho=rho, seed=int(cfg.seed),
+            h_style_a=h_style_a, h_style_b=h_style_b,
         )
         logging.info(
             f'[{distribution}] procrustes/dim '

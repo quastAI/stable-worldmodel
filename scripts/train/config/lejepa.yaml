@@ -5,6 +5,12 @@ defaults:
   - launcher: local
   - data: ogb_cube_single_ou
 
+# Which latent profile's dataset to train on. `physical_content` (n=9) is the
+# stage-A exit criterion; `task_content` (n=12) additionally puts cube.color in
+# z, which is entangled with the lighting that stays style -- a deliberate,
+# separately-reported arm, not the default.
+profile: physical_content
+
 output_model_name: lejepa
 subdir: ${hydra:job.id}
 
@@ -26,9 +32,18 @@ program_constants:
 
 trainer:
   max_epochs: 100      # V8 shortens this; severity 0 is the full schedule
-  devices: auto
+  # SIGReg is a *batch* statistic scaled by the batch size and is never
+  # gathered across ranks (`wm/loss.py`: "only support single-gpu"). On two
+  # devices you would silently get two statistics over half the batch each,
+  # which changes the effective lambda and moves the run off the calibrated
+  # (lambda, rho) region. Pinned rather than `auto`.
+  devices: 1
   accelerator: gpu
-  precision: bf16
+  # NOT bf16. SIGReg's inner term is `(cos_mean - phi)^2`, a difference of two
+  # O(1) quantities whose true value is O(1/sqrt(B)) ~ 0.06, then multiplied by
+  # B. In bf16's 8-bit mantissa that subtraction keeps about one significant
+  # digit -- catastrophic cancellation in the only term preventing collapse.
+  precision: 32
   gradient_clip_val: 1.0
 
 loader:
