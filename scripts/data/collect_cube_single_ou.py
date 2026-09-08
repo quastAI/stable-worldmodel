@@ -175,6 +175,15 @@ def run(cfg: DictConfig):
         / dataset_name
     )
 
+    resample_style = bool(cfg.style.resample_within_pair)
+    if not resample_style:
+        logging.warning(
+            'style.resample_within_pair=false: both views of a pair share one '
+            'style draw, so x = g(z) is deterministic (the theory\'s literal '
+            'setting) -- but style is then exactly as slow as content and the '
+            'objective can no longer tell them apart. Control arm only.'
+        )
+
     manifest = ident_collect.build_manifest(
         env,
         registry,
@@ -183,6 +192,7 @@ def run(cfg: DictConfig):
         pairs,
         base_seed,
         profile_name,
+        resample_style_within_pair=resample_style,
         extra={
             'shard': shard,
             'num_shards': num_shards,
@@ -211,6 +221,7 @@ def run(cfg: DictConfig):
                 pairs,
                 seed=base_seed + 7,
                 camera=cfg.env.camera,
+                resample_style_within_pair=resample_style,
             ),
         )
 

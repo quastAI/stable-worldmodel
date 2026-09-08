@@ -155,17 +155,75 @@ def test_recorded_process_matches_the_declared_one(env):
     assert np.abs(report['marginal_mean']).max() < 0.1
 
 
+def test_excluded_axes_are_pinned_to_a_recorded_constant(env):
+    """An excluded axis must hold one value, and the manifest must say which.
+
+    Excluded latents used to be simply unwritten, which left them holding
+    whatever the opening ``reset(options={'variation': ['all']})`` drew --
+    a random constant, and a *different* one per shard, since ``base_seed``
+    differs. That is a nuisance perfectly correlated with shard identity:
+    invisible within a shard and unrecorded anywhere.
+    """
+    registry, sampler = make(env, profile='physical_content')
+    pinned = ident.excluded_payload(env, registry)
+
+    assert 'camera.angle_delta' in pinned
+    assert np.allclose(pinned['camera.angle_delta'], 0.0)
+
+    # Independent of the reset draw: re-randomise everything, and the pin holds.
+    env.reset(seed=12345, options={'variation': ['all']})
+    again = ident.excluded_payload(env, registry)
+    assert np.allclose(again['camera.angle_delta'], pinned['camera.angle_delta'])
+
+    manifest = ident.build_manifest(
+        env, registry, sampler, make_violation('none', 0.0), 4, 0,
+        'physical_content',
+    )
+    assert 'camera.angle_delta' in manifest['excluded_pinned']
+
+
+def test_style_may_be_shared_across_a_pair(env):
+    """``resample_within_pair=False`` makes ``x = g(z)`` deterministic.
+
+    The control arm: with one style draw per pair the two views differ only by
+    the OU step, which is the theory's literal setting. It is not the default
+    because style then carries the same autocorrelation as content, so the
+    transition operator no longer ranks appearance below content and nothing in
+    the objective prefers cube position over light colour.
+    """
+    registry, sampler = make(env, profile='physical_content')
+
+    shared = list(
+        ident.collect_pairs(
+            env, registry, sampler, 6, log_every=0,
+            resample_style_within_pair=False,
+        )
+    )
+    for episode in shared:
+        a, b = episode['latent/style']
+        assert np.allclose(a, b), 'views should share one style draw'
+
+    independent = list(
+        ident.collect_pairs(env, registry, sampler, 6, log_every=0)
+    )
+    assert any(
+        not np.allclose(*episode['latent/style'])
+        for episode in independent
+    ), 'default must redraw style per view'
+
+
 def test_readback_recovers_the_latents_that_were_written(env):
     """Simulator ground truth must track the requested z, not drift from it.
 
-    On ``physical_content``: the drift this guards against -- a clipped value,
-    an unconverged IK solve, a coupled joint that did not track its driver --
-    is a property of latents written into ``qpos``. An appearance axis like
-    ``task_content``'s ``cube.color`` is a direct ``geom.rgba`` write with
-    nothing in between, so there is no divergence to detect, and it has no
-    ``privileged/*`` column in the recorded row to read back from either.
+    On ``arm_c_content``: the drift this guards against -- a clipped value, an
+    unconverged IK solve, a coupled joint that did not track its driver -- is a
+    property of latents written into ``qpos``. Appearance axes like
+    ``task_content``'s ``cube.color`` and ``physical_content``'s ``cube.size``
+    are direct ``geom.rgba`` / ``geom_size`` writes with nothing in between, so
+    there is no divergence to detect, and neither has a ``privileged/*`` column
+    in the recorded row to read back from either.
     """
-    registry, sampler = make(env, profile='physical_content')
+    registry, sampler = make(env, profile='arm_c_content')
     episodes = list(
         ident.collect_pairs(env, registry, sampler, 120, log_every=0)
     )

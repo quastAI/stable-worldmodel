@@ -90,6 +90,40 @@ def sample_style(env, registry, rng):
     )
 
 
+def excluded_payload(env, registry):
+    """Pin every ``excluded`` variation axis to its canonical ``init_value``.
+
+    Excluded latents used to be simply *unwritten*: ``content_payload`` handles
+    content axes and :func:`sample_style` handles style axes, so an excluded
+    axis was left holding whatever the opening
+    ``env.reset(options={'variation': ['all']})`` happened to draw for it.
+
+    That is not "pinned" -- it is pinned to a random value, and ``base_seed``
+    differs per shard, so a sharded collection would hold a *different*
+    constant in every shard. The result is a nuisance perfectly correlated with
+    shard identity: invisible within a shard, and worse than either style or
+    content once the shards are merged, because nothing downstream records it.
+
+    Writing the axis's own ``init_value`` on every frame makes the exclusion
+    deterministic, shard-independent, and identical to what the manifest says
+    it is.
+
+    Returns:
+        dict: Axis path -> pinned value, for ``render_content``.
+    """
+    payload = {}
+    for latent in registry.by_role('excluded'):
+        if not latent.channel.startswith('variation:'):
+            continue
+        axis = latent.channel.split(':', 1)[1]
+        space = swm_utils.get_in(env.variation_space, axis.split('.'))
+        pinned = space.init_value
+        if pinned is None:
+            continue
+        payload[axis] = np.array(pinned)
+    return payload
+
+
 def content_payload(env, registry, values, index):
     """Split one row of decoded content latents into state and appearance.
 
@@ -184,6 +218,7 @@ def collect_pairs(
     seed=0,
     camera='front_pixels',
     log_every=2000,
+    resample_style_within_pair=True,
 ):
     """Generate encoder-dataset episodes, one two-step episode per pair.
 
@@ -199,6 +234,25 @@ def collect_pairs(
         seed: Seed for the style stream, kept separate from the sampler's own.
         camera: Camera to record.
         log_every: Progress cadence, in pairs.
+        resample_style_within_pair: Whether the two views of a pair get
+            *independent* style draws (the default) or share one.
+
+            Independent draws are what makes style discardable, and the reason
+            is spectral rather than incidental. Style redrawn per view is
+            independent across the pair, so the transition operator annihilates
+            every function of it -- eigenvalue 0 -- while the content
+            coordinates sit at ``rho`` and their degree-2 Hermite terms at
+            ``rho^2``. At the frozen ``rho = 0.9`` the ordering is 0.90
+            (content, linear) > 0.81 (content, quadratic) > ... > 0 (anything
+            touching style), so the top-``n`` eigenspace is exactly the content
+            block and slowness alone selects it.
+
+            Sharing one draw per pair sets style's autocorrelation to the same
+            ``rho`` as content, which collapses that ordering: appearance
+            becomes exactly as slow as physics and nothing in the objective
+            prefers cube position over light colour. Set ``False`` only to
+            recover the theory's literal setting -- a deterministic ``x =
+            g(z)`` -- as a control arm.
 
     Yields:
         dict: One episode, two steps deep.
@@ -217,6 +271,10 @@ def collect_pairs(
     clip_total = 0.0
     batch = 256
 
+    # Constant for the whole run, so an excluded axis holds the same value in
+    # every frame of every shard. See `excluded_payload`.
+    pinned = excluded_payload(env, registry)
+
     written = 0
     while written < num_pairs:
         size = min(batch, num_pairs - written)
@@ -228,17 +286,30 @@ def collect_pairs(
 
         for k in range(size):
             steps = {}
+            # One draw per pair when style is not resampled within it, so both
+            # views share it and `x = g(z)` becomes deterministic.
+            shared_style = (
+                None
+                if resample_style_within_pair
+                else sample_style(env, registry, rng)
+            )
             for view, (zz, values) in enumerate(
                 ((z, values_a), (z_next, values_b))
             ):
                 physical, variation = content_payload(
                     env, registry, values, k
                 )
-                style, style_flat = sample_style(env, registry, rng)
+                style, style_flat = (
+                    sample_style(env, registry, rng)
+                    if shared_style is None
+                    else shared_style
+                )
 
                 state = env.set_content_state(physical)
                 frame = env.render_content(
-                    state, {**variation, **style}, camera=camera
+                    state,
+                    {**pinned, **variation, **style},
+                    camera=camera,
                 )
                 info = env.content_info()
 
@@ -336,7 +407,15 @@ def write_chunked(writer, episodes, chunk_size=WRITE_CHUNK):
 
 
 def build_manifest(
-    env, registry, sampler, violation, num_pairs, seed, profile_name, extra=None
+    env,
+    registry,
+    sampler,
+    violation,
+    num_pairs,
+    seed,
+    profile_name,
+    extra=None,
+    resample_style_within_pair=True,
 ):
     """Everything needed to tell this dataset apart from any other.
 
@@ -370,6 +449,18 @@ def build_manifest(
                 'high': latent.high.tolist(),
             }
             for latent in registry.style
+        },
+        # Independent style per view is what puts style at autocorrelation 0
+        # and so below content's degree-2 Hermite terms in the transition
+        # operator's spectrum. Flipping it changes which latents the objective
+        # can distinguish at all, so it is part of the dataset's identity.
+        'resample_style_within_pair': bool(resample_style_within_pair),
+        # The value every excluded axis was actually held at. Recorded because
+        # "excluded" is a claim about a constant, and an unrecorded constant
+        # that silently differed per shard is exactly the bug this replaced.
+        'excluded_pinned': {
+            axis: np.asarray(value).tolist()
+            for axis, value in excluded_payload(env, registry).items()
         },
         **(extra or {}),
     }

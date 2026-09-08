@@ -10,5 +10,3 @@ dataset:
   keys_to_load:
     - pixels
     - latent/z
-  keys_to_cache:
-    - latent/z

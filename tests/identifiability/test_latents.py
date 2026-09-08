@@ -22,7 +22,9 @@ from stable_worldmodel.envs.ogbench.lejepa_cube_env import (  # noqa: E402
 )
 from stable_worldmodel.identifiability.latents import (  # noqa: E402
     ALL_CONTENT_PROFILE,
+    ARM_C_CONTENT_PROFILE,
     PHYSICAL_CONTENT_PROFILE,
+    PROFILES,
     TASK_CONTENT_PROFILE,
     LatentRegistry,
     build_registry,
@@ -54,39 +56,82 @@ def registry(env):
 # ------------------------------------------------------------------ profiles
 
 
-def test_task_content_profile_has_twelve_dims(registry):
-    """The plan's SS3.1 subtotal, as a gate.
+def test_task_content_profile_has_thirteen_dims(registry):
+    """The shared-channel arm's ``n``, as a gate.
 
-    ``task_content`` is the stage-A exit-criterion profile, and its ``n`` is
-    quoted throughout the plan. If the registry drifts, every stage-A number
-    silently refers to a different problem.
-
-    ``n`` is 9 physical + 3 for ``cube.color`` = 12 at ``n_cubes = 1``. The
-    physical-only ``n = 9`` subtotal lives in ``physical_content``, which the
-    test below pins.
+    ``n`` is 9 physical + 1 for ``cube.size`` + 3 for ``cube.color`` = 13 at
+    ``n_cubes = 1``. If the registry drifts, every number reported under this
+    profile silently refers to a different problem.
     """
     resolved = registry.resolve(TASK_CONTENT_PROFILE)
-    assert resolved.n == 12, resolved.summary()
+    assert resolved.n == 13, resolved.summary()
     assert {latent.kind for latent in resolved.content} == {'physical', 'appearance'}
 
 
-def test_physical_content_is_nine_physical_dims(registry):
-    """The plan's SS3.1 subtotal, and arm C's readback constraint.
+def test_physical_content_is_ten_dims_with_cube_size(registry):
+    """The stage-A exit-criterion profile: 9 physical DOFs + ``cube.size``.
 
-    Two things ride on this profile. The stage-A plan and
-    ``run_v4_calibration.py`` quote ``n = 9``; and arm C rebuilds ``z`` from
-    ``env.compute_ob_info()``, which carries only ``privileged/*`` and
-    ``proprio/*`` keys -- so a content latent whose readback is a
-    ``variation.*`` axis makes its collector silently gather nothing rather
-    than fail. Asserting `physical` here is what keeps that from regressing.
+    ``cube.size`` is content, not style, because it shares the
+    apparent-footprint cue with ``cube.pos_z`` and dominates it: sweeping size
+    moves the cube's footprint 153 -> 585 px while sweeping ``pos_z`` over its
+    *entire* range moves it only 272 -> 428 px. As style it would demand a
+    size-invariant height estimate from shading and contact cues alone, on a
+    20x20 px patch. Pinned here because moving it back to style silently
+    reintroduces that confound.
     """
     resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
+    assert resolved.n == 10, resolved.summary()
+    assert 'cube.size' in {latent.name for latent in resolved.content}
+
+
+def test_arm_c_content_is_nine_readable_physical_dims(registry):
+    """Arm C's readback constraint, as a gate.
+
+    Arm C rebuilds ``z`` from ``env.compute_ob_info()``, which carries only
+    ``privileged/*`` and ``proprio/*`` keys -- so a content latent whose
+    readback is a ``variation.*`` axis makes its collector silently gather
+    nothing rather than fail. This profile is what keeps that from regressing.
+    """
+    resolved = registry.resolve(ARM_C_CONTENT_PROFILE)
     assert resolved.n == 9, resolved.summary()
     assert {latent.kind for latent in resolved.content} == {'physical'}
     assert all(
         latent.readback.startswith(('privileged/', 'proprio/'))
         for latent in resolved.content
     ), resolved.summary()
+
+
+def test_physical_content_would_fail_arm_c_readback_gate(registry):
+    """Why ``arm_c_content`` has to exist, asserted rather than noted.
+
+    ``cube.size`` reads back from ``variation.cube.size``, which is not in
+    ``compute_ob_info()``. So ``physical_content`` deliberately no longer
+    satisfies arm C's gate, and pointing arm C at it would collect zero
+    trajectories without raising. If this test ever fails, the two profiles can
+    be reconsidered -- until then they cannot be merged.
+    """
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
+    unreadable = [
+        latent.name
+        for latent in resolved.content
+        if not (latent.readback or '').startswith(('privileged/', 'proprio/'))
+    ]
+    assert unreadable == ['cube.size'], resolved.summary()
+
+
+def test_camera_angle_is_excluded_from_every_shipped_profile(registry):
+    """Camera DR is off, and stays off by construction.
+
+    At +-10 deg, ``camera.angle_delta`` moves the cube's image centroid 32-36
+    px, while ``cube.pos_xy``'s x component moves only 24-31 px across its
+    entire range -- a nuisance larger than the signal it hides. Excluded rather
+    than promoted to content because eval holds the camera fixed; if that
+    changes, promote it to content rather than returning it to style.
+    """
+    for name, profile in PROFILES.items():
+        resolved = registry.resolve(profile)
+        excluded = {latent.name for latent in resolved.by_role('excluded')}
+        assert 'camera.angle_delta' in excluded, f'{name}: {resolved.summary()}'
 
 
 def test_task_content_leaves_style_to_discard(registry):
@@ -273,14 +318,15 @@ def test_read_info_recovers_the_physical_latents(env, registry):
 def test_readback_z_matches_requested_z(env, registry):
     """The full loop: z -> physical -> sim -> info -> z.
 
-    On ``physical_content``, not ``task_content``: this is a *readback* loop,
-    and it closes only for latents the simulator reports back through
-    ``content_info()``. ``task_content``'s ``cube.color`` is a variation axis
-    with no ``privileged/*`` entry, so it has no place in a round-trip that
-    goes through the simulator at all -- the same constraint that gives arm C
-    its own profile.
+    On ``arm_c_content``, not ``task_content`` or ``physical_content``: this is
+    a *readback* loop, and it closes only for latents the simulator reports
+    back through ``content_info()``. ``task_content``'s ``cube.color`` and
+    ``physical_content``'s ``cube.size`` are variation axes with no
+    ``privileged/*`` entry, so neither has a place in a round-trip that goes
+    through the simulator at all -- the same constraint that gives arm C its
+    own profile.
     """
-    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
+    resolved = registry.resolve(ARM_C_CONTENT_PROFILE)
     rng = np.random.default_rng(4)
     z = rng.uniform(-2.0, 2.0, (1, resolved.n))
     values, _ = resolved.to_physical(z)

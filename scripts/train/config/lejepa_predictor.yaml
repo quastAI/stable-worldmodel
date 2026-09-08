@@ -12,7 +12,11 @@ defaults:
   - data: ogb_cube_single_pred
 
 output_model_name: lejepa_predictor
-subdir: ${hydra:job.id}
+# NOT ${hydra:job.id}: that resolves to an empty string on a plain single run,
+# so config.yaml and encoder_hash.txt land in the checkpoints/ root and the
+# next run silently overwrites them -- and the hash is the only way to pair a
+# predictor with the encoder it was trained against.
+subdir: ${output_model_name}_s${seed}
 
 # A checkpoint path for arm A, or the literal `random` for arm R.
 encoder: lejepa/weights_epoch_100.pt
@@ -71,8 +75,8 @@ random_encoder:
     # Overwritten at runtime from `encoder_dataset`'s manifest `latents.n`, so
     # arm R cannot silently train at a width the encoder dataset never had.
     # The literal is only a fallback for an unreachable manifest; it tracks the
-    # default profile (physical_content, n=9).
-    output_dim: 9
+    # default profile (physical_content = 9 physical DOFs + cube.size, n=10).
+    output_dim: 10
     hidden_dim: ${head_hidden_dim}
 
 model:

@@ -9,14 +9,24 @@ defaults:
   - encoder: paper_cnn
   - data: ogb_cube_single_ou
 
-# Which latent profile's dataset to train on. `physical_content` (n=9) is the
-# stage-A exit criterion; `task_content` (n=12) additionally puts cube.color in
-# z, which is entangled with the lighting that stays style -- a deliberate,
-# separately-reported arm, not the default.
+# Which latent profile's dataset to train on. `physical_content` (n=10) is the
+# stage-A exit criterion: the 9 physical DOFs plus cube.size. `task_content`
+# (n=13) additionally puts cube.color in z, which is entangled with the
+# lighting that stays style -- a deliberate, separately-reported arm, not the
+# default. `arm_c_content` (n=9) drops cube.size for the consumers that need a
+# privileged/proprio readback for every content latent.
+#
+# camera.angle_delta is excluded in every profile, so no camera DR reaches the
+# encoder. See identifiability/latents.py for why cube.size is content and the
+# camera is pinned -- both share a rendering channel with a content latent.
 profile: physical_content
 
 output_model_name: lejepa
-subdir: ${hydra:job.id}
+# NOT ${hydra:job.id}: that resolves to an empty string on a plain single run,
+# so config.yaml and encoder_hash.txt land in the checkpoints/ root and the
+# next run silently overwrites them -- and the hash is the only way to pair a
+# predictor with the encoder it was trained against.
+subdir: ${output_model_name}_s${seed}
 
 num_workers: 6
 train_split: 0.9

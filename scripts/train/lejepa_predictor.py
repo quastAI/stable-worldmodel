@@ -172,7 +172,17 @@ def run(cfg):
                 'warmup_steps': max(1, int(0.01 * total_steps)),
                 'max_steps': total_steps,
             },
-            'interval': 'epoch',
+            # 'step', NOT 'epoch'. `total_steps` is counted in optimizer steps
+            # (max_epochs * len(train)), so on 'epoch' the scheduler advances
+            # once per epoch and its counter only ever reaches `max_epochs` --
+            # 100 against a 703-step warmup for a 200k-pair run. The whole
+            # first epoch then runs at lr exactly 0, the peak reaches 14% of
+            # the configured lr, and the cosine never anneals at all, so the
+            # frozen checkpoint is taken at the run's highest lr. Verified:
+            # 200 steps on 'epoch' moved align 0.0704 -> 0.0697 and sigreg
+            # 70.7 -> 70.1, i.e. nothing; on 'step' the same 200 steps gave
+            # sigreg 70.7 -> 1.7 and std(h) 0.39 -> 0.91.
+            'interval': 'step',
         },
     }
 

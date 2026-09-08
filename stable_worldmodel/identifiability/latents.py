@@ -25,26 +25,38 @@ latent -- silently accepting one would put a target into ``z`` that no encoder
 could recover, and the resulting floor would look exactly like an encoder
 failure.
 
+``cube.size`` is content in every shipped profile, and ``camera.angle_delta``
+is excluded from all of them -- both under one rule: **a nuisance that shares a
+rendering channel with a content latent must not be style**, because style
+demands exact invariance along a direction the content itself depends on. The
+per-latent measurements behind that are recorded with the profiles below.
+
 The shipped profiles
 ---------------------
-``task_content``
-    The physical DOFs plus ``cube.color``; everything else
-    renderable-but-not-task-relevant becomes style. This is the profile the
-    stage-A exit criterion runs on, and the one that actually exercises the
-    alignment loss's discard behaviour. ``n`` is 9 + 3 * n_cubes, not the
-    ``n = 9`` the stage-A plan quotes -- that subtotal is now
-    :data:`PHYSICAL_CONTENT_PROFILE`.
 ``physical_content``
-    The 9 physical DOFs only -- ``task_content`` minus ``cube.color``. Exists
-    for arm C, which rebuilds ``z`` from ``env.compute_ob_info()`` and so can
-    only carry latents with a ``privileged/*`` / ``proprio/*`` readback. Also
-    the profile the stage-A plan's ``n = 9`` subtotal refers to.
+    The stage-A exit-criterion profile. The 9 physical DOFs plus
+    ``cube.size``, so ``n = 10`` at one cube.
+``task_content``
+    ``physical_content`` plus ``cube.color``, so ``n = 13`` at one cube. Those
+    3 colour dims share a rendering channel with the lighting that stays style
+    -- the image constrains albedo x illumination, not the factors -- so they
+    measure the cost of a shared channel rather than clean recovery. A
+    separately-reported arm, not the default.
+``arm_c_content``
+    ``physical_content`` minus ``cube.size``, so ``n = 9``. Exists for arm C,
+    which rebuilds ``z`` from ``env.compute_ob_info()`` and so can only carry
+    latents with a ``privileged/*`` / ``proprio/*`` readback -- and which runs
+    under frozen appearance, where ``cube.size`` would have no variance to
+    recover anyway. Also the ``n`` that ``violations.py`` and
+    ``run_v4_calibration.py`` were calibrated against.
 ``all_content``
     Every content-capable latent is content, so ``n`` is large and there is no
-    style left at all. Coherent with the theory -- a pair then differs only by
-    the OU step, which is exactly Thm 1's setting -- but it means the
-    style-invariance metric is vacuous under it. Both are run; the divergence
-    is a measurement, not a bug.
+    continuous style left. Run as a scaling datapoint, not as a candidate
+    encoder: with no style resampled within a pair the transition operator no
+    longer separates content from appearance (every latent is equally slow), and
+    the photometric block is jointly non-identifiable from a single frame, which
+    puts it in the ``m > n_effective`` regime the theory declines to cover. The
+    style-invariance metric is vacuous under it.
 """
 
 from dataclasses import dataclass, field
@@ -730,17 +742,76 @@ class LatentRegistry:
         return '\n'.join(lines)
 
 
-# Shipped profiles. `task_content` is the stage-A exit-criterion profile.
-# `cube.color` is content here, not style: the cube's own color is treated as
-# task-relevant, so n = 9 + 3 * n_cubes. `physical_content` below is the
-# physical-only n = 9 subtotal, for the consumers that need a readback for
-# every content latent.
+# `cube.size` is content in every shipped profile, and `camera.angle_delta` is
+# excluded from all of them. Both follow one rule: **a nuisance that shares a
+# rendering channel with a content latent must not be style.**
+#
+# As style, a latent is resampled independently within a pair, so the alignment
+# term asks the encoder to project that direction *out* -- to be exactly
+# invariant to it. That is only cheap when the direction is orthogonal to
+# everything being recovered. It is not, for these two:
+#
+# * ``cube.size`` and ``cube.pos_z`` share the apparent-footprint cue, and size
+#   dominates it. Measured at 224px: sweeping size over its range moves the
+#   cube's footprint 153 -> 585 px, while sweeping ``pos_z`` over its *entire*
+#   +-3 sigma moves it only 272 -> 428 px. The content interval sits strictly
+#   inside the style interval, so footprint carries no information about height
+#   and a size-invariant height estimate has to come from shading and contact
+#   cues alone, on a 20x20 px patch. As *content* the requirement collapses
+#   from "project size out" to "span the 2-D subspace size and height
+#   generate" -- and since identifiability is only up to a rotation *within*
+#   the content block, a mixture is an acceptable optimum that a linear probe
+#   separates afterwards. Same cues, far weaker requirement.
+#
+# * ``camera.angle_delta`` shares the projection channel with every positional
+#   latent. Measured: +-10 deg on one axis moves the cube's image centroid
+#   32-36 px, while ``cube.pos_xy``'s x component moves only 24-31 px across
+#   its whole range -- the nuisance is larger than the entire signal. Recovering
+#   world-frame position under it means inferring camera pose from the floor
+#   grid, whose material and colour are themselves style. Excluded rather than
+#   promoted to content because the eval side is ours to choose and holds the
+#   camera fixed; if that ever changes, promote it to content (n += 2) rather
+#   than returning it to style.
+#
+# Excluded latents are pinned to their axis's canonical ``init_value`` by
+# `identifiability.collect.excluded_payload`, not merely left unwritten -- see
+# that function for why "unwritten" was a shard-dependent nuisance.
+
+# n = 13 at n_cubes = 1: 9 physical DOFs + cube.color (3) + cube.size (1).
+# `cube.color` is content here, not style: the cube's own colour is treated as
+# task-relevant. Its 3 dims share a rendering channel with the lighting that
+# stays style (the image constrains albedo x illumination, not the factors), so
+# they measure the cost of a shared channel rather than clean recovery.
 TASK_CONTENT_PROFILE = {
     '*': 'style',
+    'camera.angle_delta': 'excluded',
     'cube.pos_xy': 'content',
     'cube.pos_z': 'content',
     'cube.yaw': 'content',
     'cube.color': 'content',
+    'cube.size': 'content',
+    'effector.pos': 'content',
+    'effector.yaw': 'content',
+    'gripper.opening': 'content',
+}
+
+# The stage-A exit-criterion profile. n = 10 at n_cubes = 1: the 9 physical
+# DOFs plus `cube.size`.
+#
+# `cube.size` has no `privileged/*` / `proprio/*` readback -- it reads back from
+# `variation.cube.size` -- so it is scored from the recorded `latent/z` column,
+# exactly as `cube.color` is under `task_content`. That is sound here because it
+# is a direct post-compilation `model.geom_size` write with nothing in between
+# to clip or decouple, so there is no readback divergence for a physical
+# readback to detect. Consumers that need a readback for *every* content latent
+# want `arm_c_content` below instead.
+PHYSICAL_CONTENT_PROFILE = {
+    '*': 'style',
+    'camera.angle_delta': 'excluded',
+    'cube.pos_xy': 'content',
+    'cube.pos_z': 'content',
+    'cube.yaw': 'content',
+    'cube.size': 'content',
     'effector.pos': 'content',
     'effector.yaw': 'content',
     'gripper.opening': 'content',
@@ -749,15 +820,21 @@ TASK_CONTENT_PROFILE = {
 # Arm C rebuilds ``z`` from ``env.compute_ob_info()`` rather than from a
 # recorded ``latent/z`` column, and that dict carries only ``privileged/*`` and
 # ``proprio/*`` keys -- no ``variation.*`` axes. Every content latent here must
-# therefore have a *physical* readback. This is `task_content` restricted to the
-# DOFs arm C can actually read back, which is why it is a separate profile
-# rather than an override: promoting an appearance latent into it does not fail
-# loudly, it silently collects zero trajectories.
+# therefore have a *physical* readback, which is why this is a separate profile
+# rather than an override of `physical_content`: promoting an appearance latent
+# into it does not fail loudly, the collector's "every content latent readable"
+# gate silently rejects every frame and the run ends in "no usable trajectories
+# were collected".
 #
-# n = 9 at n_cubes = 1 -- the physical-only subtotal the stage-A plan quotes,
-# and what `violations.py` / `run_v4_calibration.py` were calibrated against.
-PHYSICAL_CONTENT_PROFILE = {
+# So this is `physical_content` minus `cube.size`. Arm C also runs under
+# `freeze_appearance: true`, so `cube.size` would be constant along its
+# trajectories and carry no variance to recover even if it could be read back.
+#
+# n = 9 at n_cubes = 1 -- the physical-only subtotal, and what `violations.py` /
+# `run_v4_calibration.py` were calibrated against.
+ARM_C_CONTENT_PROFILE = {
     '*': 'style',
+    'camera.angle_delta': 'excluded',
     'cube.pos_xy': 'content',
     'cube.pos_z': 'content',
     'cube.yaw': 'content',
@@ -773,6 +850,7 @@ PHYSICAL_CONTENT_PROFILE = {
 # off in `LeJEPACubeEnv`.
 ALL_CONTENT_PROFILE = {
     '*': 'content',
+    'camera.angle_delta': 'excluded',
     'background.floor_material': 'style',
     'background.wall_material': 'style',
     '?digit.value': 'style',
@@ -782,12 +860,14 @@ ALL_CONTENT_PROFILE = {
 PROFILES = {
     'task_content': TASK_CONTENT_PROFILE,
     'physical_content': PHYSICAL_CONTENT_PROFILE,
+    'arm_c_content': ARM_C_CONTENT_PROFILE,
     'all_content': ALL_CONTENT_PROFILE,
 }
 
 
 __all__ = [
     'ALL_CONTENT_PROFILE',
+    'ARM_C_CONTENT_PROFILE',
     'NOT_CONTENT_CAPABLE',
     'PHYSICAL_CONTENT_PROFILE',
     'PROFILES',

@@ -34,13 +34,18 @@ program_constants:
   seed_budget: 5
 
 latents:
-  # NOT `task_content`. Arm C rebuilds z from `env.compute_ob_info()`, which
-  # carries only privileged/* and proprio/* keys -- `task_content`'s cube.color
-  # reads back from `variation.cube.color`, which is not in that dict, so the
-  # collector's "every content latent readable" gate would reject every frame
-  # and the run would end in `no usable trajectories were collected`.
-  # `physical_content` is the same profile restricted to the physical DOFs.
-  profile: physical_content
+  # NOT `task_content`, and NOT `physical_content`. Arm C rebuilds z from
+  # `env.compute_ob_info()`, which carries only privileged/* and proprio/* keys.
+  # `task_content`'s cube.color and `physical_content`'s cube.size both read
+  # back from `variation.*`, which is not in that dict, so the collector's
+  # "every content latent readable" gate would reject every frame and the run
+  # would end in `no usable trajectories were collected`.
+  #
+  # `arm_c_content` is `physical_content` minus cube.size -- the physical DOFs
+  # only. Arm C also runs `freeze_appearance: true`, so cube.size would be
+  # constant along every trajectory and carry no variance to recover even if it
+  # could be read back.
+  profile: arm_c_content
   yaw_half_arc: 0.7461282552275249
   include_roll_pitch: false
   include_discrete: false

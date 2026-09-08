@@ -44,14 +44,42 @@ fixed (`predictor_hidden_dim: 512`, identical across arms):
 | **R** | Random init, frozen | `encoder=random` — architecturally identical, never trained |
 | **C1 / C2** | Trajectory-derived pairs instead of OU pairs | `scripts/data/collect_cube_single_arm_c.py arm=c1\|c2` |
 
-**The two latent profiles.** Orthogonal to the arms, and the single knob
+**The latent profiles.** Orthogonal to the arms, and the single knob
 `profile=` selects one end to end — collection, training, the predictor and the
-metrics all interpolate it, so the two never share a filename:
+metrics all interpolate it, so no two ever share a filename:
 
 | `profile=` | `n` | z contains | Use |
 |---|---|---|---|
-| `physical_content` **(default)** | 9 | the 9 physical DOFs | The stage-A exit criterion, and the `n` the V4 calibration and the plan quote. Well-posed: every content latent has a physical readback and none shares a rendering channel with a style latent. |
-| `task_content` | 12 | + `cube.color` | A deliberate, separately-reported arm. `cube.color` is entangled with the lighting that stays style, so its 3 dims measure *the cost of a shared rendering channel* rather than clean recovery — see §12. |
+| `physical_content` **(default)** | 10 | the 9 physical DOFs + `cube.size` | The stage-A exit criterion, and the `n` the V4 calibration quotes. |
+| `task_content` | 13 | + `cube.color` | A deliberate, separately-reported arm. `cube.color` is entangled with the lighting that stays style, so its 3 dims measure *the cost of a shared rendering channel* rather than clean recovery — see §12. |
+| `arm_c_content` | 9 | the 9 physical DOFs only | For arm C, which rebuilds `z` from `compute_ob_info()` and so needs a `privileged/`/`proprio/` readback for every content latent. Also the round-trip tests. |
+
+> **`cube.size` is content and `camera.angle_delta` is excluded, in every
+> profile.** One rule: *a nuisance that shares a rendering channel with a
+> content latent must not be style*, because style demands exact invariance
+> along a direction the content itself depends on.
+>
+> `cube.size` shares the apparent-footprint cue with `cube.pos_z` and dominates
+> it — sweeping size moves the cube's footprint 153 → 585 px, while sweeping
+> `pos_z` over its *entire* ±3σ moves it only 272 → 428 px, so the content
+> interval sits strictly inside the style interval and footprint carries no
+> information about height. As content the requirement drops from "project size
+> out" to "span the subspace size and height generate", and since
+> identifiability is only up to a rotation *within* the content block, a mixture
+> is an acceptable optimum that a linear probe separates afterwards.
+>
+> `camera.angle_delta` shares the projection channel with every positional
+> latent: ±10° moves the cube's image centroid 32–36 px, while `cube.pos_xy`'s
+> x component moves only 24–31 px across its whole range — the nuisance was
+> larger than the signal. Excluded rather than promoted to content because eval
+> holds the camera fixed; if that changes, promote it to content (`n += 2`)
+> rather than returning it to style.
+>
+> Excluded axes are pinned to their axis's `init_value` on every frame and the
+> value is recorded in the manifest as `excluded_pinned`. They used to be simply
+> *unwritten*, which left them holding whatever the opening `reset` drew — a
+> random constant, and a **different one per shard**, i.e. a nuisance correlated
+> with shard identity.
 
 ```bash
 # the exit criterion
@@ -286,9 +314,9 @@ python scripts/train/lejepa.py data=ogb_cube_single_ou trainer.max_epochs=20    
 | `program_constants.lambda` | 3.0e-3 | `loss = λ·sigreg + (1-λ)·align`. The only program constant this script reads. |
 | `program_constants.rho` | 0.9 | **Not read here** — it is the collector's knob, carried so the metric writer can copy it verbatim. |
 | `trainer.max_epochs` | 100 | V8 shortens this; severity 0 is the full schedule. |
-| `trainer.precision` / `.accelerator` | `bf16` / `gpu` | For a CPU smoke run: `trainer.accelerator=cpu trainer.precision=32 trainer.devices=1 loader.num_workers=0 loader.persistent_workers=false loader.prefetch_factor=null`. |
+| `trainer.precision` / `.accelerator` | `32` / `gpu` | **Not bf16**: SIGReg's inner term is a difference of two O(1) quantities whose true value is O(1/√B), then multiplied by B. For a CPU smoke run: `trainer.accelerator=cpu trainer.precision=32 trainer.devices=1 loader.num_workers=0 loader.persistent_workers=false loader.prefetch_factor=null`. |
 | `loader.batch_size` | 256 | SIGReg is batch-size-scaled, so its absolute magnitude is not comparable across batch sizes. |
-| `optimizer.lr` / `.weight_decay` | `${encoder_lr}` / `${encoder_weight_decay}` | From the encoder group — 3e-3/1e-4 for the CNN, 5e-5/1e-3 for the ViT. Schedule is hardcoded: linear warmup (1% of steps) + cosine, per epoch. |
+| `optimizer.lr` / `.weight_decay` | `${encoder_lr}` / `${encoder_weight_decay}` | From the encoder group — 3e-3/1e-4 for the CNN, 5e-5/1e-3 for the ViT. Schedule is hardcoded: linear warmup (1% of steps) + cosine, stepped **per optimizer step**. It used to be `interval: 'epoch'` against a step-counted `max_steps`, which left the whole first epoch at lr exactly 0 and capped the peak at 14% of the configured lr with no annealing at all — see §12 defect 6. |
 | `encoder` | `paper_cnn` | Config group; also sets `embed_dim`, the head shape and the optimizer (§1). |
 | `img_size` | 224 | Shared by both encoders. `patch_size`, `encoder_scale` and `embed_dim` come from the encoder group. |
 | `model.head.output_dim` | `null` | `null` ⇒ take `n` from the dataset's `latent/z` width, so `m = n` by construction. See below. |
@@ -328,10 +356,11 @@ $STABLEWM_HOME/checkpoints/<subdir>/
     encoder_hash.txt                              # 16-char digest, see §7
 ```
 
-> **`subdir` defaults to `${hydra:job.id}`, which is empty on a plain single
-> run.** So `config.yaml` and `encoder_hash.txt` land directly in
-> `checkpoints/` — and consecutive runs **overwrite** them. Pass `subdir=`
-> explicitly (e.g. `subdir=armA_seed3072`) to keep them per-run.
+> **`subdir` now defaults to `${output_model_name}_s${seed}`**, not
+> `${hydra:job.id}` — the latter resolves to an empty string on a plain single
+> run, so `config.yaml` and `encoder_hash.txt` landed in the `checkpoints/`
+> root and consecutive runs silently overwrote them. Still overridable
+> (`subdir=armA_seed3072`).
 
 > The encoder hash is printed as `encoder hash: <hash>` at the end of the run.
 > **Record it with the run.** `seed` does not make it reproducible (see the knob
@@ -749,18 +778,37 @@ still have them.
 | 2 | `lejepa_predictor.yaml` hardcoded `random_encoder.head.output_dim: 9`, so arm R trained at the wrong width | `output_dim: 12`, matching `task_content` (9 physical + 3 `cube.color`) |
 | 3 | Arm C used `task_content`, whose `cube.color` has no physical readback, so it collected **zero** trajectories — and two readback tests failed the same way | Arm C has its own `physical_content` profile, and both readback tests now use it — see below |
 | 4 | `collect_cube_single_predictor.py` writes no manifest and no `latent/z`, so the rollout half of a metrics run cannot be scored | **Still open** — use `rollout_dataset=null` (§9) |
-| 5 | `v4_calibration.yaml` pinned `n: 9` and called it "the stage-A exit-criterion profile (task_content)" | `n: 12`, with a note that the boundary does not actually depend on `n` |
+| 5 | `v4_calibration.yaml` pinned `n: 9` and called it "the stage-A exit-criterion profile (task_content)" | `n: 10`, naming `physical_content`, with a note that the boundary does not actually depend on `n` |
+| 6 | **The blocker.** All three train scripts computed `total_steps = max_epochs * len(train)` and `warmup_steps = 1%` of it, then set `'interval': 'epoch'` — so the scheduler advanced once per *epoch* and its counter only ever reached `max_epochs` (100, against a 703-step warmup). The whole first epoch ran at lr **exactly 0**, the peak reached 14% of the configured lr, and the cosine never annealed, so the frozen checkpoint was taken at the run's highest lr. Measured: 200 steps moved `align` 0.0704→0.0697 and `sigreg` 70.7→70.1, i.e. nothing | `'interval': 'step'` in `lejepa.py` and `lejepa_predictor.py`. The same 200 steps then gave `sigreg` 70.7→1.7 and `std(h)` 0.39→0.91. **`lewm.py` and `smwm.py` are deliberately left alone** — the existing DR baselines were trained with them, so changing them now would make future baseline runs incomparable to those checkpoints |
+| 7 | `style.resample_within_pair` existed in `ogb_cube_single_ou.yaml` and was read **nowhere** — that yaml line was its only occurrence in the repo, so style was always resampled per view with no way to turn it off | Wired through `collect_pairs`, recorded in the manifest, and covered by `test_style_may_be_shared_across_a_pair`. Setting it false gives the theory's literal deterministic `x = g(z)` as a control arm |
+| 8 | `excluded` latents were simply never written — `content_payload` handles content axes and `sample_style` handles style axes — so an excluded axis held whatever the opening `reset(options={'variation': ['all']})` drew for it. Since `base_seed` differs per shard, a sharded collection held a **different constant in every shard**: a nuisance perfectly correlated with shard identity, and recorded nowhere | `excluded_payload` pins every excluded variation axis to its axis's `init_value` on every frame, and the manifest records the values as `excluded_pinned` |
+| 9 | `lejepa_predictor.yaml`'s arm-R fallback width `output_dim: 9` tracked the old `physical_content` | `output_dim: 10`. Still only a fallback — the width is read from the encoder dataset's manifest at runtime |
+| 10 | The val loader set `drop_last: False`, but SIGReg's statistic is multiplied by the batch size, so the short tail batch (32 of 256 at 20k val samples) reported ~1/8 the statistic and dragged `validate/sigreg_loss_epoch` | `drop_last` stays True on val |
 
 ### The `physical_content` profile
 
-There are now three profiles, not two
+There are now four profiles, not two
 ([`latents.py`](stable_worldmodel/identifiability/latents.py)):
 
 | Profile | `n` (at 1 cube) | Content | For |
 |---|---|---|---|
-| `task_content` | 12 | 9 physical DOFs + `cube.color` | Stage A. The exit-criterion profile. |
-| `physical_content` | 9 | The 9 physical DOFs only | **Arm C**, and anything else that needs a readback for every content latent. |
-| `all_content` | 54 | Every content-capable latent | Scaling datapoint. No continuous style, so style-invariance is vacuous. |
+| `physical_content` | 10 | 9 physical DOFs + `cube.size` | **Stage A. The exit-criterion profile.** |
+| `task_content` | 13 | + `cube.color` | The shared-rendering-channel arm. |
+| `arm_c_content` | 9 | The 9 physical DOFs only | **Arm C**, and anything else that needs a readback for every content latent. |
+| `all_content` | 52 | Every content-capable latent | Scaling datapoint only — see the warning below. |
+
+> **`all_content` is not the way to get a robust content encoder**, even though
+> it does make `x = g(z)` deterministic. Two things break instead. With no style
+> resampled within a pair, appearance carries the same autocorrelation as
+> physics, so the transition operator no longer ranks it below content and
+> *nothing in the objective prefers cube position over light colour*. And the
+> photometric block is jointly non-identifiable from a single frame (the image
+> constrains albedo × illumination, not the factors), so `g` collapses
+> directions in the 52-dim `z`: nominal `m = n`, but the effective `n` is
+> smaller, which is the `m > n` regime the theory explicitly declines to cover.
+> SIGReg then demands unit variance in directions carrying no image
+> information, which the encoder can only supply by amplifying JPEG and
+> aliasing noise or by bleeding content into them.
 
 The split exists because the two collectors get `z` from different places. The
 OU collector *writes* `z` from the sampler and the metric suite reads it back

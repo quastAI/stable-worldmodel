@@ -68,16 +68,28 @@ latents:
   # so a disagreement here does not warn -- it just makes training look for a
   # dataset collection never wrote.
   #
-  # 'physical_content' (n=9) is the stage-A exit-criterion profile: the physical
-  # DOFs only. Every content latent has a privileged/proprio readback, and none
-  # shares a rendering channel with a style latent. It is also the n that
-  # violations.py / run_v4_calibration.py calibrate against.
+  # 'physical_content' (n=10) is the stage-A exit-criterion profile: the 9
+  # physical DOFs plus cube.size. cube.size is content, not style, because it
+  # shares the apparent-footprint cue with cube.pos_z and dominates it -- as
+  # style it would demand a size-invariant height estimate from shading alone;
+  # as content it only has to span the subspace the two generate. See
+  # identifiability/latents.py for the measurements.
   #
-  # 'task_content' (n=12) additionally puts cube.color in z. Its 3 colour dims
+  # 'task_content' (n=13) additionally puts cube.color in z. Its 3 colour dims
   # are entangled with the lighting that stays style -- the image constrains
   # albedo x illumination, not the factors -- so they measure the cost of a
   # shared rendering channel rather than clean recovery. A reported arm, not
   # the default.
+  #
+  # 'arm_c_content' (n=9) is physical_content minus cube.size, for arm C, which
+  # needs a privileged/proprio readback for every content latent. It is also
+  # the n that violations.py / run_v4_calibration.py calibrate against.
+  #
+  # camera.angle_delta is 'excluded' in every profile: at +-10 deg it moves the
+  # cube's image centroid 32-36 px, more than cube.pos_xy's x component moves
+  # across its entire range (24-31 px), so it was a nuisance larger than the
+  # signal. Pinned rather than promoted to content because eval holds the
+  # camera fixed.
   #
   # 'all_content' (n=54) leaves no continuous style at all, so the
   # style-invariance metric is vacuous under it -- run as a scaling datapoint.
@@ -121,5 +133,14 @@ violation:
 
 style:
   # Style latents are resampled *within* a pair -- the two views get
-  # independent draws. This is what the alignment term is asked to discard.
+  # independent draws. This is what the alignment term is asked to discard,
+  # and it is load-bearing rather than incidental: independent draws put style
+  # at autocorrelation 0, so the transition operator ranks it below even
+  # content's degree-2 Hermite terms (0.90 > 0.81 > ... > 0 at rho=0.9) and the
+  # top-n eigenspace is exactly the content block.
+  #
+  # Setting this false makes both views share one draw, so x = g(z) is
+  # deterministic -- the theory's literal setting -- but style then has the
+  # same rho as content and nothing in the objective prefers cube position over
+  # light colour. Use it as a control arm, not as a default.
   resample_within_pair: true

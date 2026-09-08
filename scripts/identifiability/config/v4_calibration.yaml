@@ -8,12 +8,12 @@
 defaults:
   - _self_
 
-# `n` for the stage-A exit-criterion profile (task_content): 9 physical DOFs
-# plus 3 for cube.color at n_cubes = 1. The boundary's location does not
+# `n` for the stage-A exit-criterion profile (physical_content): 9 physical
+# DOFs plus 1 for cube.size at n_cubes = 1. The boundary's location does not
 # actually depend on n -- the per-dim rho fan is +/-spread for any n > 1, so
 # the crossing stays at severity ~0.32 -- but the ladder is reported alongside
 # this number, so it should name the profile actually being swept.
-n: 12
+n: 10
 
 # The frozen program constant. The boundary's location depends on it, so a
 # calibration run at a different rho does not license the production sweep.
