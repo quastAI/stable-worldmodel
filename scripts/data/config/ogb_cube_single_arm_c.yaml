@@ -34,7 +34,13 @@ program_constants:
   seed_budget: 5
 
 latents:
-  profile: task_content
+  # NOT `task_content`. Arm C rebuilds z from `env.compute_ob_info()`, which
+  # carries only privileged/* and proprio/* keys -- `task_content`'s cube.color
+  # reads back from `variation.cube.color`, which is not in that dict, so the
+  # collector's "every content latent readable" gate would reject every frame
+  # and the run would end in `no usable trajectories were collected`.
+  # `physical_content` is the same profile restricted to the physical DOFs.
+  profile: physical_content
   yaw_half_arc: 0.7461282552275249
   include_roll_pitch: false
   include_discrete: false
@@ -55,6 +61,6 @@ env:
 # whatever a trajectory gives you, with none of the designed randomisation.
 freeze_appearance: true
 
-policy_type: plan
+policy_type: plan_oracle
 p_stack: 0.8
 max_episode_steps: 400

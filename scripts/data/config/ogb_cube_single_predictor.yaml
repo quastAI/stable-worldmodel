@@ -27,7 +27,7 @@ eval_fraction: 0.1
 
 # Excitation is the design target: a transition model fitted only to expert
 # trajectories has never seen the states a planner's candidates will visit.
-policy_type: plan
+policy_type: plan_oracle
 policy_mixture: 0.25    # fraction of steps drawn at random
 p_stack: 0.8
 

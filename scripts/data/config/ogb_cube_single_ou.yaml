@@ -59,7 +59,7 @@ latents:
   # calibrate against -- those predate cube.color joining this profile.
   # 'all_content' (n=54) leaves no continuous style at all, so the
   # style-invariance metric is vacuous under it -- run as a scaling datapoint.
-  profile: task_content_color
+  profile: task_content
 
   # One fundamental domain of the cube's C4 yaw symmetry (pi/4, less a 5%
   # margin so the arc's two endpoints -- which are the SAME configuration --

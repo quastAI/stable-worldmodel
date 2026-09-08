@@ -64,7 +64,8 @@ random_encoder:
   head:
     _target_: stable_worldmodel.wm.lejepa.NDimHead
     input_dim: ${embed_dim}
-    output_dim: 9        # must match the encoder dataset's n
+    output_dim: 12       # must match the encoder dataset's n (task_content:
+                         # 9 physical + 3 cube.color at n_cubes = 1)
     hidden_dim: 2048
 
 model:

@@ -156,8 +156,16 @@ def test_recorded_process_matches_the_declared_one(env):
 
 
 def test_readback_recovers_the_latents_that_were_written(env):
-    """Simulator ground truth must track the requested z, not drift from it."""
-    registry, sampler = make(env)
+    """Simulator ground truth must track the requested z, not drift from it.
+
+    On ``physical_content``: the drift this guards against -- a clipped value,
+    an unconverged IK solve, a coupled joint that did not track its driver --
+    is a property of latents written into ``qpos``. An appearance axis like
+    ``task_content``'s ``cube.color`` is a direct ``geom.rgba`` write with
+    nothing in between, so there is no divergence to detect, and it has no
+    ``privileged/*`` column in the recorded row to read back from either.
+    """
+    registry, sampler = make(env, profile='physical_content')
     episodes = list(
         ident.collect_pairs(env, registry, sampler, 120, log_every=0)
     )

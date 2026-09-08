@@ -31,10 +31,14 @@ The shipped profiles
     The physical DOFs plus ``cube.color``; everything else
     renderable-but-not-task-relevant becomes style. This is the profile the
     stage-A exit criterion runs on, and the one that actually exercises the
-    alignment loss's discard behaviour. ``n`` is 9 + 3 * n_cubes -- NOT the
-    ``n = 9`` quoted in the stage-A plan and calibrated against in
-    ``violations.py`` / ``run_v4_calibration.py``; those predate ``cube.color``
-    joining this profile and assume the physical-only subtotal.
+    alignment loss's discard behaviour. ``n`` is 9 + 3 * n_cubes, not the
+    ``n = 9`` the stage-A plan quotes -- that subtotal is now
+    :data:`PHYSICAL_CONTENT_PROFILE`.
+``physical_content``
+    The 9 physical DOFs only -- ``task_content`` minus ``cube.color``. Exists
+    for arm C, which rebuilds ``z`` from ``env.compute_ob_info()`` and so can
+    only carry latents with a ``privileged/*`` / ``proprio/*`` readback. Also
+    the profile the stage-A plan's ``n = 9`` subtotal refers to.
 ``all_content``
     Every content-capable latent is content, so ``n`` is large and there is no
     style left at all. Coherent with the theory -- a pair then differs only by
@@ -728,15 +732,35 @@ class LatentRegistry:
 
 # Shipped profiles. `task_content` is the stage-A exit-criterion profile.
 # `cube.color` is content here, not style: the cube's own color is treated as
-# task-relevant. n = 9 + 3 * n_cubes, not the physical-only n = 9 that
-# `violations.py` / `run_v4_calibration.py` calibrate against -- those predate
-# `cube.color` joining this profile.
+# task-relevant, so n = 9 + 3 * n_cubes. `physical_content` below is the
+# physical-only n = 9 subtotal, for the consumers that need a readback for
+# every content latent.
 TASK_CONTENT_PROFILE = {
     '*': 'style',
     'cube.pos_xy': 'content',
     'cube.pos_z': 'content',
     'cube.yaw': 'content',
     'cube.color': 'content',
+    'effector.pos': 'content',
+    'effector.yaw': 'content',
+    'gripper.opening': 'content',
+}
+
+# Arm C rebuilds ``z`` from ``env.compute_ob_info()`` rather than from a
+# recorded ``latent/z`` column, and that dict carries only ``privileged/*`` and
+# ``proprio/*`` keys -- no ``variation.*`` axes. Every content latent here must
+# therefore have a *physical* readback. This is `task_content` restricted to the
+# DOFs arm C can actually read back, which is why it is a separate profile
+# rather than an override: promoting an appearance latent into it does not fail
+# loudly, it silently collects zero trajectories.
+#
+# n = 9 at n_cubes = 1 -- the physical-only subtotal the stage-A plan quotes,
+# and what `violations.py` / `run_v4_calibration.py` were calibrated against.
+PHYSICAL_CONTENT_PROFILE = {
+    '*': 'style',
+    'cube.pos_xy': 'content',
+    'cube.pos_z': 'content',
+    'cube.yaw': 'content',
     'effector.pos': 'content',
     'effector.yaw': 'content',
     'gripper.opening': 'content',
@@ -757,6 +781,7 @@ ALL_CONTENT_PROFILE = {
 
 PROFILES = {
     'task_content': TASK_CONTENT_PROFILE,
+    'physical_content': PHYSICAL_CONTENT_PROFILE,
     'all_content': ALL_CONTENT_PROFILE,
 }
 
@@ -764,6 +789,7 @@ PROFILES = {
 __all__ = [
     'ALL_CONTENT_PROFILE',
     'NOT_CONTENT_CAPABLE',
+    'PHYSICAL_CONTENT_PROFILE',
     'PROFILES',
     'TASK_CONTENT_PROFILE',
     'Latent',

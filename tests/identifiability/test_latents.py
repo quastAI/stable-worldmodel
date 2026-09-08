@@ -22,6 +22,7 @@ from stable_worldmodel.envs.ogbench.lejepa_cube_env import (  # noqa: E402
 )
 from stable_worldmodel.identifiability.latents import (  # noqa: E402
     ALL_CONTENT_PROFILE,
+    PHYSICAL_CONTENT_PROFILE,
     TASK_CONTENT_PROFILE,
     LatentRegistry,
     build_registry,
@@ -60,14 +61,32 @@ def test_task_content_profile_has_twelve_dims(registry):
     quoted throughout the plan. If the registry drifts, every stage-A number
     silently refers to a different problem.
 
-    ``n`` is 9 physical + 3 for ``cube.color`` = 12 at ``n_cubes = 1`` --
-    ``cube.color`` was promoted to content, so ``violations.py`` /
-    ``run_v4_calibration.py``, which still calibrate against the
-    physical-only ``n = 9``, are stale against this profile.
+    ``n`` is 9 physical + 3 for ``cube.color`` = 12 at ``n_cubes = 1``. The
+    physical-only ``n = 9`` subtotal lives in ``physical_content``, which the
+    test below pins.
     """
     resolved = registry.resolve(TASK_CONTENT_PROFILE)
     assert resolved.n == 12, resolved.summary()
     assert {latent.kind for latent in resolved.content} == {'physical', 'appearance'}
+
+
+def test_physical_content_is_nine_physical_dims(registry):
+    """The plan's SS3.1 subtotal, and arm C's readback constraint.
+
+    Two things ride on this profile. The stage-A plan and
+    ``run_v4_calibration.py`` quote ``n = 9``; and arm C rebuilds ``z`` from
+    ``env.compute_ob_info()``, which carries only ``privileged/*`` and
+    ``proprio/*`` keys -- so a content latent whose readback is a
+    ``variation.*`` axis makes its collector silently gather nothing rather
+    than fail. Asserting `physical` here is what keeps that from regressing.
+    """
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
+    assert resolved.n == 9, resolved.summary()
+    assert {latent.kind for latent in resolved.content} == {'physical'}
+    assert all(
+        latent.readback.startswith(('privileged/', 'proprio/'))
+        for latent in resolved.content
+    ), resolved.summary()
 
 
 def test_task_content_leaves_style_to_discard(registry):
@@ -252,8 +271,16 @@ def test_read_info_recovers_the_physical_latents(env, registry):
 
 
 def test_readback_z_matches_requested_z(env, registry):
-    """The full loop: z -> physical -> sim -> info -> z."""
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    """The full loop: z -> physical -> sim -> info -> z.
+
+    On ``physical_content``, not ``task_content``: this is a *readback* loop,
+    and it closes only for latents the simulator reports back through
+    ``content_info()``. ``task_content``'s ``cube.color`` is a variation axis
+    with no ``privileged/*`` entry, so it has no place in a round-trip that
+    goes through the simulator at all -- the same constraint that gives arm C
+    its own profile.
+    """
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     rng = np.random.default_rng(4)
     z = rng.uniform(-2.0, 2.0, (1, resolved.n))
     values, _ = resolved.to_physical(z)
