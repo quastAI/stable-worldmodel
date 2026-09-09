@@ -493,3 +493,108 @@ def test_training_diagnostics_match_the_metric_suite():
     assert logged['L'].item() == pytest.approx(
         4 * case['n'] * alignment_loss(h).item(), rel=1e-6
     )
+
+
+def test_live_recovery_diagnostics_match_the_metric_suite():
+    """`recovery/*` logged during training must be the suite's own numbers.
+
+    They exist to kill a broken run inside the first epoch instead of at the
+    tenth, which only works if they are on the same scale as the scatter
+    columns they share a name with. One is a torch port on a batch, the other
+    numpy on the eval set, so nothing but a test keeps them in step.
+
+    The encoder here is deliberately imperfect -- an anisotropic scaling, a
+    second-Hermite term and observation noise on top of a rotation -- so every
+    metric sits away from its trivial value and a disagreement has room to show.
+    """
+    torch = pytest.importorskip('torch')
+    from stable_worldmodel.wm.lejepa.losses import recovery_diagnostics
+
+    rng = np.random.default_rng(0)
+    n, batch, rho = 10, 4096, 0.9
+    q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    scale = np.linspace(0.4, 1.3, n)
+
+    z = rng.standard_normal((batch, n))
+    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((batch, n))
+
+    def encode(x):
+        return (x * scale) @ q.T + 0.12 * (x**2 - 1) + 0.05 * rng.standard_normal(x.shape)
+
+    h, h_next = encode(z), encode(z_next)
+
+    # The suite gets exactly what the torch port pools internally: both views
+    # stacked, in the same order.
+    pooled_z = np.concatenate([z, z_next])
+    pooled_h = np.concatenate([h, h_next])
+    expected = {}
+    expected.update(metrics.procrustes_recovery(pooled_z, pooled_h))
+    expected.update(metrics.orthogonality_gap(pooled_z, pooled_h))
+    expected.update(metrics.bidirectional_r2(pooled_z, pooled_h))
+
+    logged = recovery_diagnostics(
+        torch.stack([torch.tensor(h), torch.tensor(h_next)]),
+        torch.stack([torch.tensor(z), torch.tensor(z_next)]),
+    )
+    for key in (
+        'procrustes_mse_per_dim',
+        'orth_err_normalized',
+        'cond',
+        'r2_z_to_h',
+        'r2_h_to_z',
+    ):
+        assert logged[key].item() == pytest.approx(expected[key], rel=1e-6), key
+
+    # Guard against a test that would pass on a degenerate case.
+    assert 0.01 < expected['procrustes_mse_per_dim'] < 10.0
+    assert expected['cond'] > 1.5
+
+
+def test_recovery_diagnostics_refuse_a_v7_width_mismatch():
+    """Under V7 there is no square Q, so there is no recovery number to report.
+
+    Silently scoring a `(B, m)` embedding against a `(B, n)` latent would put a
+    meaningless column next to five meaningful ones.
+    """
+    torch = pytest.importorskip('torch')
+    from stable_worldmodel.wm.lejepa.losses import recovery_diagnostics
+
+    assert recovery_diagnostics(torch.randn(2, 64, 7), torch.randn(2, 64, 10)) == {}
+
+
+def test_spectrum_diagnostics_see_a_collapse_epsilon_hides():
+    """One dead direction out of n, which the Frobenius aggregate absorbs.
+
+    This is the whole case for logging the spectrum: `epsilon` barely moves
+    between a whitened embedding and one missing a direction entirely, while
+    the smallest eigenvalue goes to zero and the participation ratio drops by
+    exactly one.
+    """
+    torch = pytest.importorskip('torch')
+    from stable_worldmodel.wm.lejepa.losses import (
+        spectrum_diagnostics,
+        whitening_loss,
+    )
+
+    rng = np.random.default_rng(0)
+    n, batch = 10, 8192
+    healthy = rng.standard_normal((2, batch, n))
+    collapsed = healthy.copy()
+    collapsed[..., 3] = 0.0
+
+    healthy_t = torch.tensor(healthy)
+    collapsed_t = torch.tensor(collapsed)
+
+    healthy_spec = spectrum_diagnostics(healthy_t)
+    collapsed_spec = spectrum_diagnostics(collapsed_t)
+
+    assert healthy_spec['cov_eig_min'].item() > 0.8
+    assert collapsed_spec['cov_eig_min'].item() < 1e-9
+    assert healthy_spec['effective_rank'].item() == pytest.approx(n, rel=0.02)
+    assert collapsed_spec['effective_rank'].item() == pytest.approx(n - 1, rel=0.02)
+
+    # And the thing it is there to catch: epsilon hardly reacts.
+    epsilon_shift = abs(
+        whitening_loss(collapsed_t).item() - whitening_loss(healthy_t).item()
+    )
+    assert epsilon_shift < 0.02

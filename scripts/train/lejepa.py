@@ -9,10 +9,15 @@
 2. ``model.head.output_dim`` is set from the dataset's own ``latent/z`` width,
    so ``m = n`` is enforced by the data rather than by a config that could
    drift from it.
-3. ``whitening_loss`` and :func:`alignment_diagnostics` are logged every step
-   and never optimised. The latter reports ``L``, ``delta`` and ``epsilon`` in
-   the paper's units, which the raw losses are not in; it is why
-   ``program_constants.rho`` is read here at all.
+3. ``whitening_loss``, :func:`alignment_diagnostics`,
+   :func:`spectrum_diagnostics` and :func:`recovery_diagnostics` are logged
+   every step and **never optimised**. ``alignment_diagnostics`` reports ``L``,
+   ``delta``, ``epsilon`` and the bound they combine into, in the paper's
+   units, which the raw losses are not in -- it is why
+   ``program_constants.rho`` is read here at all. ``recovery_diagnostics``
+   scores ``h`` against the recorded ``latent/z``, which the loader has always
+   loaded and the forward never read; it is a label, so it stays out of the
+   objective.
 
 Optimiser, schedule, checkpointing and the ``SaveCkptCallback`` are inherited
 unchanged, so encoder capacity and training budget stay comparable to the LeWM
@@ -34,7 +39,7 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
-from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 from stable_pretraining import data as dt
@@ -43,6 +48,8 @@ import stable_worldmodel as swm
 from stable_worldmodel.wm.lejepa.losses import (
     alignment_diagnostics,
     alignment_loss,
+    recovery_diagnostics,
+    spectrum_diagnostics,
     whitening_loss,
 )
 from stable_worldmodel.wm.lejepa.module import state_dict_hash
@@ -129,10 +136,46 @@ def lejepa_forward(self, batch, stage, cfg):
         {f'bound/{k}': v for k, v in diagnostics.items()}
     )
 
+    # Partial collapse is invisible in `epsilon`, which is an aggregate: a
+    # single dead direction out of n moves it less than ordinary early-training
+    # noise does. The smallest eigenvalue of Cov(h) and the participation ratio
+    # do not average it away.
+    output.update(
+        {f'spectrum/{k}': v for k, v in spectrum_diagnostics(h).items()}
+    )
+
+    # The criterion metric itself, live. `latent/z` is already in every batch
+    # -- the data config loads it and the forward has simply never read it --
+    # so this costs a handful of n x n decompositions and answers "is it
+    # recovering the latents", which no loss curve does. Never optimised: z is
+    # a label, and a label in the objective would make this supervised
+    # regression rather than an identifiability claim.
+    latents = batch.get('latent/z')
+    if latents is not None:
+        output.update(
+            {
+                f'recovery/{k}': v
+                for k, v in recovery_diagnostics(
+                    h, latents.transpose(0, 1).to(h.dtype)
+                ).items()
+            }
+        )
+
+    # Which term is actually being minimised. `align_loss` flattening while
+    # `sigreg_loss` still falls is the signature of lambda being too high, and
+    # reading that off two separately-scaled curves is guesswork; the share is
+    # one number in [0, 1].
+    weighted_sigreg = lambd * output['sigreg_loss'].detach()
+    output['balance/sigreg_share'] = weighted_sigreg / (
+        weighted_sigreg + (1.0 - lambd) * output['align_loss'].detach()
+    ).clamp_min(1e-12)
+
     logs = {
         f'{stage}/{k}': v.detach()
         for k, v in output.items()
-        if 'loss' in k or k == 'whitening_metric' or k.startswith('bound/')
+        if 'loss' in k
+        or k == 'whitening_metric'
+        or k.startswith(('bound/', 'spectrum/', 'recovery/', 'balance/'))
     }
     self.log_dict(logs, on_step=True, sync_dist=True)
     return output
@@ -245,13 +288,22 @@ def run(cfg):
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
+    callbacks = [
+        SaveCkptCallback(
+            run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1
+        )
+    ]
+    if logger is not None:
+        # The schedule is the one thing here that has already failed silently:
+        # `interval: 'epoch'` against a step-counted `max_steps` held the whole
+        # first epoch at lr exactly 0 and capped the peak at 14% of the
+        # configured value, and nothing logged it. LearningRateMonitor requires
+        # a logger, hence the guard.
+        callbacks.append(LearningRateMonitor(logging_interval='step'))
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[
-            SaveCkptCallback(
-                run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1
-            )
-        ],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
