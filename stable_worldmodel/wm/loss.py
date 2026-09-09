@@ -8,11 +8,36 @@ class SIGReg(torch.nn.Module):
 
     Warning: This version only support single-gpu.
     Reference: https://arxiv.org/abs/2511.08544
+
+    Args:
+        knots: Quadrature knots for the Epps-Pulley integral over ``[0, 3]``.
+        num_proj: Random 1-D projections the statistic is sketched over.
+        pool_views: Which of two conventions to use when the input carries a
+            view axis. **This changes the magnitude of the statistic, and
+            therefore what a given ``lambda`` means.**
+
+            ``False`` (default, and what LeWM has always used) computes the
+            statistic **per view** over ``B`` samples and scales each by ``B``,
+            then averages over views.
+
+            ``True`` **pools** the views into one set of ``V * B`` samples and
+            scales by ``V * B``, which is what the identifiability paper's own
+            implementation does
+            (``lejepa-identifiability/experiments/lejepa_id/losses.py``).
+
+            Away from the optimum the pooled statistic is exactly ``V`` times
+            the per-view one -- measured at 2.00x for ``V = 2`` -- so a
+            ``lambda`` tuned against the paper's figures is off by that factor
+            under the default. The flag exists rather than a change of default
+            because LeWM's baselines were trained under the per-view
+            convention, and silently rescaling their regulariser would make
+            new baseline runs incomparable to the existing checkpoints.
     """
 
-    def __init__(self, knots=17, num_proj=1024):
+    def __init__(self, knots=17, num_proj=1024, pool_views=False):
         super().__init__()
         self.num_proj = num_proj
+        self.pool_views = pool_views
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
@@ -26,6 +51,8 @@ class SIGReg(torch.nn.Module):
         """
         proj: (T, B, D)
         """
+        if self.pool_views and proj.dim() > 2:
+            proj = proj.flatten(0, -2).unsqueeze(0)
         # sample random projections
         A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
         A = A.div_(A.norm(p=2, dim=0))

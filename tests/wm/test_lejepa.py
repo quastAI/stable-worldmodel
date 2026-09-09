@@ -375,3 +375,33 @@ def test_predictor_blocks_are_shared_with_lewm():
     from stable_worldmodel.wm.lewm.module import Predictor as LeWMPredictor
 
     assert Predictor is LeWMPredictor
+
+
+def test_sigreg_pool_views_matches_the_reference_convention():
+    """`pool_views=True` is what puts `lambda` in the paper's units.
+
+    The identifiability paper's own implementation pools both views into one set
+    of 2B samples and scales by 2B; this repo's default takes a per-view
+    statistic over B samples and averages. Away from the optimum the two differ
+    by exactly a factor of V, so a `lambda` read off the paper's figures is off
+    by that factor under the default -- which is the whole reason the flag
+    exists.
+    """
+    import torch
+
+    from stable_worldmodel.wm.loss import SIGReg
+
+    torch.manual_seed(0)
+    per_view = SIGReg(num_proj=4096, pool_views=False)
+    pooled = SIGReg(num_proj=4096, pool_views=True)
+
+    # Away from the optimum: the pooled statistic is V times the per-view one.
+    h = 0.35 * torch.randn(2, 256, 10)
+    ratio = pooled(h).item() / per_view(h).item()
+    assert 1.8 < ratio < 2.2, ratio
+
+    # A single view is unaffected by pooling.
+    single = torch.randn(1, 256, 10)
+    assert pooled(single).item() == pytest.approx(
+        per_view(single).item(), rel=0.25
+    )

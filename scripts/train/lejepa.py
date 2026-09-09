@@ -9,7 +9,10 @@
 2. ``model.head.output_dim`` is set from the dataset's own ``latent/z`` width,
    so ``m = n`` is enforced by the data rather than by a config that could
    drift from it.
-3. ``whitening_loss`` is logged every step and never optimised.
+3. ``whitening_loss`` and :func:`alignment_diagnostics` are logged every step
+   and never optimised. The latter reports ``L``, ``delta`` and ``epsilon`` in
+   the paper's units, which the raw losses are not in; it is why
+   ``program_constants.rho`` is read here at all.
 
 Optimiser, schedule, checkpointing and the ``SaveCkptCallback`` are inherited
 unchanged, so encoder capacity and training budget stay comparable to the LeWM
@@ -37,7 +40,11 @@ from omegaconf import OmegaConf, open_dict
 from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
-from stable_worldmodel.wm.lejepa.losses import alignment_loss, whitening_loss
+from stable_worldmodel.wm.lejepa.losses import (
+    alignment_diagnostics,
+    alignment_loss,
+    whitening_loss,
+)
 from stable_worldmodel.wm.lejepa.module import state_dict_hash
 from stable_worldmodel.wm.loss import SIGReg
 from stable_worldmodel.wm.utils import save_pretrained
@@ -111,10 +118,21 @@ def lejepa_forward(self, batch, stage, cfg):
     # something if it is independent of the objective being minimised.
     output['whitening_metric'] = whitening_loss(h)
 
+    # The bound's own quantities, in the bound's own units -- `align_loss` and
+    # `whitening_metric` are a per-element mean and a per-element mean-square,
+    # neither of which is comparable to the paper's `L` or `epsilon`. `delta` is
+    # the one App. H.8 finds binding, and nothing computed it before.
+    diagnostics = alignment_diagnostics(
+        h, float(cfg.program_constants['rho'])
+    )
+    output.update(
+        {f'bound/{k}': v for k, v in diagnostics.items()}
+    )
+
     logs = {
         f'{stage}/{k}': v.detach()
         for k, v in output.items()
-        if 'loss' in k or k == 'whitening_metric'
+        if 'loss' in k or k == 'whitening_metric' or k.startswith('bound/')
     }
     self.log_dict(logs, on_step=True, sync_dist=True)
     return output

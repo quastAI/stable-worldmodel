@@ -38,7 +38,29 @@ img_size: 224
 # not a footnote -- which is only enforceable if they live in one place.
 program_constants:
   rho: 0.9          # mid-range of Fig. 6's best region, clear of the rho=0.99 collapse
-  lambda: 3.0e-3    # in [1e-3, 1e-2] per Fig. 6
+
+  # In the PAPER's units -- see `loss.sigreg.kwargs.pool_views` below, which is
+  # what makes that true. Chosen from App. H.11, the paper's own *pixel*
+  # experiment, not from Fig. 6's 2-D grid: Fig. 14 sweeps
+  # lambda in {1e-3, 5e-3, 1e-2, 5e-2} on a CNN and 5e-2 is the best of them at
+  # rho=0.9 (~0.93 against ~0.75-0.82 for the three lower values). Fig. 6 puts
+  # 5e-2 at rho=0.9 in its good region too (0.992), degrading only from 1e-1.
+  #
+  # The previous 3.0e-3 was 1.5e-3 in paper units under the per-view
+  # convention -- ~30x below the paper's best pixel setting, and only ~15x above
+  # the lambda < 1e-4 regime Fig. 6 shows fails outright at every rho. That is
+  # the wrong side to err on here: `bound/trace_cov` starts near 1.4 against
+  # n=10, so SIGReg has to *inflate* the representation out of near-collapse,
+  # and the risk is asymmetric -- too low fails outright, too high degrades
+  # gracefully (0.847 at 1e-1; only 5e-1 collapses).
+  #
+  # Confirm on the shakedown before spending the seed budget:
+  #   for l in 1.0e-2 5.0e-2; do
+  #     python scripts/train/lejepa.py program_constants.lambda=$l \
+  #         trainer.max_epochs=10 subdir=lam_$l
+  #   done
+  # If `fit/align_loss` stops falling, SIGReg is dominating: drop to 1e-2.
+  lambda: 5.0e-2
   seed_budget: 5
 
 trainer:
@@ -97,6 +119,15 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+      # Pool the two views into one set of 2B samples, as the identifiability
+      # paper's own implementation does, instead of taking a per-view statistic
+      # and averaging. Away from the optimum the pooled statistic is exactly 2x
+      # the per-view one (measured 2.00x), so this is what puts
+      # `program_constants.lambda` in the same units as the paper's figures
+      # rather than leaving a factor of 2 to be remembered forever.
+      #
+      # LeWM keeps the per-view default: its baselines were trained under it.
+      pool_views: true
 
 wandb:
   enabled: false

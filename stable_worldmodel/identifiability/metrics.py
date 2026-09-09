@@ -37,7 +37,7 @@ import numpy as np
 #: Bumped whenever any metric's *definition* changes. Recorded into every
 #: result row. Changing a metric without bumping this makes old and new rows
 #: silently incomparable.
-METRIC_SUITE_VERSION = '1.0.0'
+METRIC_SUITE_VERSION = '1.1.0'
 
 
 def _as2d(x):
@@ -281,6 +281,124 @@ def predicted_error(epsilon, delta, rho, anisotropic=False):
         'predicted_error': float(d + (epsilon + d) ** 2),
         'spectral_gap': float(gap),
         'anisotropic': anisotropic,
+    }
+
+
+def style_variance(h_style_a, h_style_b):
+    """``sigma^2 = E||xi||^2``, the absolute style variance in the embedding.
+
+    The observation here is not ``x = g(z)``: style is redrawn per view, so
+    ``f(x)`` is random given ``z``. Write ``phi(z) = E_S[f(g(z, S))]`` for the
+    style-averaged encoder and ``xi = f(g(z, S)) - phi(z)`` for the residual.
+    The two views of a style probe share their content, so their difference is
+    ``xi_a - xi_b`` with independent residuals, giving
+    ``E||a - b||^2 = 2 sigma^2``.
+
+    This is the *absolute* quantity the loss floor and the alignment gap are
+    written in; :func:`style_invariance` reports the scale-free ratio, which is
+    the right thing for comparing runs but cannot be substituted into either.
+
+    ``sigma^2`` is also the continuous stand-in for the assumption this setup
+    does not satisfy. At ``sigma^2 = 0`` the composition ``f . g`` is
+    deterministic at the optimum -- ``f(g(z, s)) = Qz`` for every ``s`` -- even
+    though ``g`` is not, so the theory's conclusion is recovered without its
+    premise. How far ``sigma^2`` sits above zero is how far the run is from
+    that.
+
+    Returns:
+        dict: ``sigma_sq`` and ``sigma_sq_per_dim``.
+    """
+    a = _as2d(h_style_a)
+    b = _as2d(h_style_b)
+    sigma_sq = 0.5 * float(((a - b) ** 2).sum(axis=1).mean())
+    return {
+        'sigma_sq': sigma_sq,
+        'sigma_sq_per_dim': sigma_sq / a.shape[1] if a.shape[1] else 0.0,
+    }
+
+
+def alignment_floor(n, rho, sigma_sq=0.0):
+    """The lowest alignment loss any encoder can reach, style included.
+
+    With a deterministic ``g`` the floor is Thm 1's ``2(1 - rho) n``. With style
+    redrawn per view it rises:
+
+        ``L >= 2(1 - rho) n + 2 rho sigma^2``
+
+    which follows from splitting ``L`` into ``E||phi(z') - phi(z)||^2 + 2
+    sigma^2``, noting that whitening constrains the *total* output so
+    ``tr Cov(phi) = n - sigma^2``, and applying the bound to ``phi``.
+
+    Two things worth reading off it. The style term carries ``2 rho`` against
+    the content term's ``2(1 - rho)`` -- 9:1 at ``rho = 0.9`` -- so the
+    objective does prefer discarding style, which is why the setup works at
+    all. And ``sigma^2 = 0`` is the unique minimiser, so a style-invariant
+    encoder is not merely permitted but selected.
+
+    Args:
+        n: Embedding width ``m`` (equal to the latent dimension by
+            construction).
+        rho: Scalar or per-dimension autocorrelation, reduced by its mean.
+        sigma_sq: Measured style variance from :func:`style_variance`. Zero
+            gives the deterministic-``g`` floor.
+
+    Returns:
+        dict: ``align_floor``, ``align_floor_deterministic`` and
+        ``align_floor_style_term``.
+    """
+    rho_mean = float(np.mean(np.asarray(rho, dtype=np.float64)))
+    deterministic = 2.0 * (1.0 - rho_mean) * float(n)
+    style_term = 2.0 * rho_mean * float(sigma_sq)
+    return {
+        'align_floor': deterministic + style_term,
+        'align_floor_deterministic': deterministic,
+        'align_floor_style_term': style_term,
+    }
+
+
+def split_alignment_gap(delta, rho, sigma_sq):
+    """Separate the nonlinearity in ``phi`` from style leakage in ``delta``.
+
+    :func:`alignment_gap` measures ``delta`` against ``2(1 - rho) tr Cov(h)``,
+    and under a stochastic ``g`` that quantity decomposes exactly:
+
+        ``delta = delta_content + 2 rho sigma^2``
+
+    Only ``delta_content`` is the nonlinear energy Thm 3's ``D`` is meant to
+    bound. Feeding the total in instead attributes style leakage to
+    nonlinearity, and since the bound is ``D + (eps + D)^2`` the error is then
+    squared: at ``rho = 0.9`` a style contribution of ``sigma^2`` enters ``D``
+    as ``sigma^2 / (1 - rho) = 10 sigma^2``. That reads as "the encoder is
+    nonlinear" when the cause is style reaching the output, which is the one
+    misreading this whole measurement exists to prevent.
+
+    Clamped at zero for the same reason :func:`alignment_gap` is: sampling
+    noise can push the estimate slightly negative, and a negative gap produces
+    an uninterpretable bound.
+
+    Returns:
+        dict: ``delta_total``, ``delta_content`` and ``delta_style``.
+    """
+    rho_mean = float(np.mean(np.asarray(rho, dtype=np.float64)))
+    style = 2.0 * rho_mean * float(sigma_sq)
+    return {
+        'delta_total': float(delta),
+        'delta_content': max(float(delta) - style, 0.0),
+        'delta_style': style,
+    }
+
+
+def bound_is_vacuous(predicted, n):
+    """Whether the recovery bound beats predicting ``h = 0``.
+
+    ``E||h - Qz||^2 <= D + (eps + D)^2`` says nothing once it exceeds
+    ``E||z||^2 = n``, which the trivial encoder already achieves. Reported
+    rather than left implicit, because a bound of 20 against ``n = 10`` looks
+    like a number and is not one.
+    """
+    return {
+        'bound_vacuous': bool(predicted >= float(n)),
+        'bound_headroom': float(n) - float(predicted),
     }
 
 
@@ -546,9 +664,27 @@ def compute_all(
 
     out['epsilon'] = whitening_error(h)
     out['has_second_view'] = z_next is not None and h_next is not None
+
+    # The term the alignment loss is *supposed* to discard. Only measurable
+    # against a same-content/different-style probe, so it stays absent rather
+    # than defaulting to a number nothing computed -- and `sigma_sq` is
+    # resolved before the bound, because the bound depends on it.
+    out['has_style_probe'] = h_style_a is not None and h_style_b is not None
+    if out['has_style_probe']:
+        out.update(style_invariance(h_style_a, h_style_b))
+        out.update(style_variance(h_style_a, h_style_b))
+    out.update(alignment_floor(h.shape[1], rho, out.get('sigma_sq', 0.0)))
+
     if h_next is not None:
         out['delta'] = alignment_gap(h, h_next, rho)
-        out.update(predicted_error(out['epsilon'], out['delta'], rho))
+        out.update(split_alignment_gap(out['delta'], rho, out.get('sigma_sq', 0.0)))
+        # `delta_content`, not `delta`: only the nonlinearity of `phi` is what
+        # Thm 3's D bounds. Without a style probe the two coincide, and the
+        # `has_style_probe` flag is what says which of the two was reported.
+        out.update(
+            predicted_error(out['epsilon'], out['delta_content'], rho)
+        )
+        out.update(bound_is_vacuous(out['predicted_error'], h.shape[1]))
 
     out['probe_divergence'] = probe_divergence(
         out['probe_linear_r2'], out['orth_err_normalized']
@@ -557,19 +693,15 @@ def compute_all(
         out['procrustes_mse_per_dim'], rho
     )
 
-    # The term the alignment loss is *supposed* to discard. Only measurable
-    # against a same-content/different-style probe, so it stays absent rather
-    # than defaulting to a number nothing computed.
-    if h_style_a is not None and h_style_b is not None:
-        out.update(style_invariance(h_style_a, h_style_b))
-
     return out
 
 
 __all__ = [
     'METRIC_SUITE_VERSION',
+    'alignment_floor',
     'alignment_gap',
     'bidirectional_r2',
+    'bound_is_vacuous',
     'compute_all',
     'hermite2_substitution',
     'in_gap_units',
@@ -582,6 +714,8 @@ __all__ = [
     'procrustes_recovery',
     'r2',
     'sigreg_z_score',
+    'split_alignment_gap',
     'style_invariance',
+    'style_variance',
     'whitening_error',
 ]

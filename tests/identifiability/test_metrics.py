@@ -10,6 +10,9 @@ here for the same reason.
 import numpy as np
 import pytest
 
+# The new bound-decomposition tests reach for several functions at once, so the
+# module is imported alongside the flat names the older tests use.
+from stable_worldmodel.identifiability import metrics
 from stable_worldmodel.identifiability.metrics import (
     METRIC_SUITE_VERSION,
     alignment_gap,
@@ -332,3 +335,161 @@ def test_perfect_recovery_beats_a_random_encoder(rng):
     assert good['procrustes_mse_per_dim'] < bad['procrustes_mse_per_dim']
     assert good['orth_err_normalized'] < bad['orth_err_normalized']
     assert good['r2_h_to_z'] > bad['r2_h_to_z']
+
+
+# --------------------------------------------------- style variance and delta
+
+
+def _linear_encoder_with_style(n=8, batch=20000, rho=0.9, style_sd=0.2, seed=0):
+    """An encoder that is *exactly* linear, plus style noise of known variance.
+
+    Everything below is checked against this, because it is the case where the
+    right answer is known: `delta_content` must be zero no matter how much
+    style leaks, since `phi` has no nonlinearity at all.
+    """
+    rng = np.random.default_rng(seed)
+    q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    z = rng.standard_normal((batch, n))
+    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((batch, n))
+
+    def noise():
+        return style_sd * rng.standard_normal((batch, n))
+
+    return {
+        'n': n,
+        'rho': rho,
+        'sigma_sq': n * style_sd**2,
+        'h': z @ q.T + noise(),
+        'h_next': z_next @ q.T + noise(),
+        'style_a': z @ q.T + noise(),
+        'style_b': z @ q.T + noise(),
+    }
+
+
+def test_style_variance_recovers_the_injected_variance():
+    """sigma^2 = E||xi||^2, from a probe whose two views share content."""
+    case = _linear_encoder_with_style()
+    out = metrics.style_variance(case['style_a'], case['style_b'])
+    assert out['sigma_sq'] == pytest.approx(case['sigma_sq'], rel=0.05)
+    assert out['sigma_sq_per_dim'] == pytest.approx(
+        case['sigma_sq'] / case['n'], rel=0.05
+    )
+
+
+def test_alignment_floor_rises_with_style():
+    """The floor is 2(1-rho)n + 2*rho*sigma^2, not Thm 1's 2(1-rho)n.
+
+    Comparing an observed loss against the deterministic floor reads a
+    style-invariant encoder as if it had failed to align.
+    """
+    case = _linear_encoder_with_style()
+    out = metrics.alignment_floor(case['n'], case['rho'], case['sigma_sq'])
+
+    deterministic = 2 * (1 - case['rho']) * case['n']
+    assert out['align_floor_deterministic'] == pytest.approx(deterministic)
+    assert out['align_floor_style_term'] == pytest.approx(
+        2 * case['rho'] * case['sigma_sq']
+    )
+    assert out['align_floor'] > out['align_floor_deterministic']
+
+    # Zero style recovers the theorem's floor exactly.
+    assert metrics.alignment_floor(case['n'], case['rho'], 0.0)[
+        'align_floor'
+    ] == pytest.approx(deterministic)
+
+
+def test_delta_splits_style_leakage_out_of_nonlinearity():
+    """The regression this guards: `delta` is not all nonlinear energy.
+
+    For an encoder that is exactly linear, every bit of `delta` is style, so
+    `delta_content` must come out at zero. Feeding the total into the bound
+    instead attributes style to nonlinearity -- and since the bound squares it,
+    the error is large enough to flip the verdict.
+    """
+    case = _linear_encoder_with_style()
+    delta = metrics.alignment_gap(case['h'], case['h_next'], case['rho'])
+    sigma_sq = metrics.style_variance(case['style_a'], case['style_b'])[
+        'sigma_sq'
+    ]
+    split = metrics.split_alignment_gap(delta, case['rho'], sigma_sq)
+
+    assert split['delta_total'] == pytest.approx(delta)
+    assert split['delta_style'] == pytest.approx(
+        2 * case['rho'] * case['sigma_sq'], rel=0.05
+    )
+    # The encoder is linear, so the nonlinear energy is zero.
+    assert split['delta_content'] == pytest.approx(0.0, abs=1e-2)
+
+    epsilon = metrics.whitening_error(case['h'])
+    honest = metrics.predicted_error(epsilon, split['delta_content'], case['rho'])
+    misattributed = metrics.predicted_error(
+        epsilon, split['delta_total'], case['rho']
+    )
+    assert honest['predicted_error'] < misattributed['predicted_error'] / 100
+    assert not metrics.bound_is_vacuous(
+        honest['predicted_error'], case['n']
+    )['bound_vacuous']
+    assert metrics.bound_is_vacuous(
+        misattributed['predicted_error'], case['n']
+    )['bound_vacuous']
+
+
+def test_delta_is_never_negative_under_sampling_noise():
+    """A negative gap yields a negative D and an uninterpretable bound."""
+    split = metrics.split_alignment_gap(0.01, 0.9, sigma_sq=5.0)
+    assert split['delta_content'] == 0.0
+
+
+def test_compute_all_uses_delta_content_for_the_bound():
+    """End-to-end: the suite must not feed the raw gap into the bound."""
+    case = _linear_encoder_with_style()
+    rng = np.random.default_rng(1)
+    z = rng.standard_normal((len(case['h']), case['n']))
+
+    with_probe = metrics.compute_all(
+        z, case['h'], h_next=case['h_next'], rho=case['rho'],
+        h_style_a=case['style_a'], h_style_b=case['style_b'],
+    )
+    without = metrics.compute_all(
+        z, case['h'], h_next=case['h_next'], rho=case['rho'],
+    )
+
+    assert with_probe['has_style_probe'] is True
+    assert without['has_style_probe'] is False
+    # Absent a probe the two coincide, so the bound is the pessimistic one.
+    assert without['delta_content'] == pytest.approx(without['delta_total'])
+    assert with_probe['delta_content'] < with_probe['delta_total']
+    assert with_probe['predicted_error'] < without['predicted_error']
+    assert with_probe['align_floor'] > with_probe['align_floor_deterministic']
+
+
+def test_training_diagnostics_match_the_metric_suite():
+    """The logged `bound/*` keys must be the same quantities the suite reports.
+
+    They are computed in torch on a batch and in numpy on the eval set, so a
+    unit mismatch between them would be invisible -- and the whole point of the
+    training-time numbers is that they are comparable to the suite's.
+    """
+    torch = pytest.importorskip('torch')
+    from stable_worldmodel.wm.lejepa.losses import alignment_diagnostics
+
+    case = _linear_encoder_with_style()
+    h = torch.stack(
+        [torch.tensor(case['h']), torch.tensor(case['h_next'])]
+    )
+    logged = alignment_diagnostics(h, case['rho'])
+
+    assert logged['epsilon'].item() == pytest.approx(
+        metrics.whitening_error(case['h']), rel=1e-6
+    )
+    assert logged['delta'].item() == pytest.approx(
+        metrics.alignment_gap(case['h'], case['h_next'], case['rho']),
+        rel=1e-6,
+    )
+    # `L` is the paper's sum-over-dims loss, which is 4n times the repo's
+    # per-element `alignment_loss`.
+    from stable_worldmodel.wm.lejepa.losses import alignment_loss
+
+    assert logged['L'].item() == pytest.approx(
+        4 * case['n'] * alignment_loss(h).item(), rel=1e-6
+    )

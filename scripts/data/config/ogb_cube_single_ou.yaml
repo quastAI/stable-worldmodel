@@ -139,8 +139,25 @@ style:
   # content's degree-2 Hermite terms (0.90 > 0.81 > ... > 0 at rho=0.9) and the
   # top-n eigenspace is exactly the content block.
   #
-  # Setting this false makes both views share one draw, so x = g(z) is
-  # deterministic -- the theory's literal setting -- but style then has the
-  # same rho as content and nothing in the objective prefers cube position over
-  # light colour. Use it as a control arm, not as a default.
+  # Setting this false does NOT recover the theory's setting -- it is strictly
+  # worse. A shared draw is *perfectly* correlated across the pair, so
+  # rho_style = 1, above content's 0.90: alignment is then minimised exactly by
+  # encoding style and ignoring content, since the two views agree on style by
+  # construction. Only meaningful together with a profile that pins style
+  # (every non-content latent 'excluded'); that combination is the literal
+  # x = g(z). This flag on its own is degenerate.
   resample_within_pair: true
+
+  # Smallest L-infinity gap allowed between cube.color and
+  # background.floor_rgb. Both are uniform on [0,1]^3 and drawn independently,
+  # so without a floor the cube occasionally renders the same colour as the
+  # floor behind it and disappears -- an undeclared occlusion, and a genuine
+  # injectivity failure: two different cube positions then produce the same
+  # image. At 0.2 about 5% of draws are redrawn, which removes the tail without
+  # reshaping the style distribution much. 0.0 disables it.
+  #
+  # Legal only because BOTH axes are style here: two style axes may be made
+  # dependent on each other, but rejecting on a *content* coordinate would
+  # truncate its marginal. Under `task_content`, where cube.color is content,
+  # the collector disables this and says so.
+  min_contrast: 0.2

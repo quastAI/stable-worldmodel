@@ -128,12 +128,34 @@ def run(cfg: DictConfig):
     # of the encoder, not of the distribution being scored.
     h_style_a = h_style_b = None
     if cfg.get('style_dataset'):
-        style_set = swm.data.load_dataset(
-            cfg.style_dataset,
-            num_steps=2,
-            frameskip=1,
-            keys_to_load=['pixels', 'latent/z'],
-        )
+        # Armed by default, so a missing probe must degrade rather than abort:
+        # the rest of the suite is still worth recording, and
+        # `has_style_probe` marks the row as one whose `delta` could not be
+        # split. Only an *absent* dataset is tolerated -- a corrupt one still
+        # raises.
+        try:
+            style_set = swm.data.load_dataset(
+                cfg.style_dataset,
+                num_steps=2,
+                frameskip=1,
+                keys_to_load=['pixels', 'latent/z'],
+            )
+        except (OSError, ValueError) as error:
+            logging.warning(
+                f'style probe {cfg.style_dataset} could not be loaded '
+                f'({error}). Continuing without it: sigma_sq is unavailable, '
+                'so `delta` cannot be split into nonlinearity and style '
+                'leakage and the reported bound will attribute all of it to '
+                'nonlinearity. Collect it with\n'
+                '  python scripts/data/collect_cube_single_ou.py \\\n'
+                f'      dataset_name={cfg.style_dataset} \\\n'
+                '      program_constants.rho=0.99999999 num_pairs=20000'
+            )
+            style_set = None
+    else:
+        style_set = None
+
+    if style_set is not None:
         style_set.transform = transform
         z_s, h_style_a, z_s_next, h_style_b = embed_dataset(
             model, style_set, int(cfg.max_samples), device

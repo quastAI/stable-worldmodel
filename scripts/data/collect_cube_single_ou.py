@@ -176,12 +176,14 @@ def run(cfg: DictConfig):
     )
 
     resample_style = bool(cfg.style.resample_within_pair)
+    min_contrast = float(cfg.style.get('min_contrast', 0.0) or 0.0)
     if not resample_style:
         logging.warning(
             'style.resample_within_pair=false: both views of a pair share one '
-            'style draw, so x = g(z) is deterministic (the theory\'s literal '
-            'setting) -- but style is then exactly as slow as content and the '
-            'objective can no longer tell them apart. Control arm only.'
+            'style draw, so rho_style = 1 -- ABOVE content\'s rho. Alignment is '
+            'then minimised by encoding style and ignoring content entirely. '
+            'This is only meaningful with a profile that also pins style; on '
+            'its own it is a degenerate configuration.'
         )
 
     manifest = ident_collect.build_manifest(
@@ -193,6 +195,7 @@ def run(cfg: DictConfig):
         base_seed,
         profile_name,
         resample_style_within_pair=resample_style,
+        min_contrast=min_contrast,
         extra={
             'shard': shard,
             'num_shards': num_shards,
@@ -222,6 +225,7 @@ def run(cfg: DictConfig):
                 seed=base_seed + 7,
                 camera=cfg.env.camera,
                 resample_style_within_pair=resample_style,
+                min_contrast=min_contrast,
             ),
         )
 

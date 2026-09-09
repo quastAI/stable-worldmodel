@@ -22,8 +22,22 @@ rollout_dataset: ogbench/cube_single_predictor.lance
 # against ~2.0 for a real step at rho=0.9. So the two views of each pair share
 # their content for all practical purposes and differ only in style.
 # Vacuous under `all_content` (no continuous style left); null skips it.
-# e.g. ogbench/cube_single_ou_style_${profile}.lance
-style_dataset: null
+#
+# ARMED BY DEFAULT. It is not optional instrumentation: with style redrawn per
+# view, `epsilon` cannot distinguish "recovered the latent" from "filled the
+# output direction with style noise" -- both give epsilon ~ 0. sigma_sq is the
+# only quantity that separates them, and it also enters the alignment floor as
+# 2*rho*sigma_sq and the alignment gap as delta = delta_content + 2*rho*sigma_sq,
+# so without it the reported bound attributes style leakage to nonlinearity.
+#
+# Collect it before running the suite:
+#   python scripts/data/collect_cube_single_ou.py \
+#       dataset_name=ogbench/cube_single_ou_style_${latents.profile}.lance \
+#       program_constants.rho=0.99999999 num_pairs=20000
+#
+# Set to null only to deliberately record a row without it; `has_style_probe`
+# in the scatter says which rows have it.
+style_dataset: ogbench/cube_single_ou_style_${profile}.lance
 
 cache_dir: null
 max_samples: 20000

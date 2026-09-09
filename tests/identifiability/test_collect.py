@@ -183,13 +183,13 @@ def test_excluded_axes_are_pinned_to_a_recorded_constant(env):
 
 
 def test_style_may_be_shared_across_a_pair(env):
-    """``resample_within_pair=False`` makes ``x = g(z)`` deterministic.
+    """``resample_within_pair=False`` shares one style draw across a pair.
 
-    The control arm: with one style draw per pair the two views differ only by
-    the OU step, which is the theory's literal setting. It is not the default
-    because style then carries the same autocorrelation as content, so the
-    transition operator no longer ranks appearance below content and nothing in
-    the objective prefers cube position over light colour.
+    Only meaningful together with a profile that pins style: a shared draw is
+    perfectly correlated across the pair, so rho_style = 1, *above* content's
+    rho, and alignment is then minimised by encoding style and ignoring content
+    entirely. This test pins the mechanics of the flag, not a recommendation to
+    use it alone.
     """
     registry, sampler = make(env, profile='physical_content')
 
@@ -348,3 +348,66 @@ def test_dataset_round_trips_through_the_stock_loader(env, tmp_path):
     pixels = np.asarray(sample['pixels'])
     assert pixels.shape[0] == 2, pixels.shape
     assert np.asarray(sample['latent/z']).shape == (2, registry.n)
+
+
+def test_contrast_floor_removes_the_invisible_cube_tail(env):
+    """cube.color and floor_rgb collide often enough to matter.
+
+    Both are uniform on [0,1]^3 and drawn independently, so without a floor the
+    cube sometimes renders the same colour as the floor behind it and vanishes
+    -- and two different cube positions then produce the same image, which is a
+    genuine injectivity failure rather than merely a hard example.
+    """
+    registry, _ = make(env, profile='physical_content')
+    rng = np.random.default_rng(0)
+
+    unconstrained = np.array([
+        ident._contrast(ident.sample_style(env, registry, rng, 0.0)[0])
+        for _ in range(600)
+    ])
+    assert (unconstrained < 0.2).mean() > 0.01, 'tail should be non-trivial'
+
+    floored = np.array([
+        ident._contrast(ident.sample_style(env, registry, rng, 0.2)[0])
+        for _ in range(600)
+    ])
+    assert floored.min() >= 0.2
+    # The floor removes a tail; it must not reshape the bulk.
+    assert abs(floored.mean() - unconstrained.mean()) < 0.1
+
+
+def test_contrast_floor_is_refused_when_cube_color_is_content(env):
+    """Rejecting on a *content* coordinate would truncate its marginal.
+
+    Two style axes may be made mutually dependent freely -- nothing asks style
+    to be internally independent. But under `task_content` cube.color is
+    content, and the same rejection would either truncate a coordinate that is
+    supposed to be Gaussian (a V5 violation) or make style a function of
+    content. Both are worse than the collision, so the floor must switch off.
+    """
+    assert ident.contrast_is_legal(
+        build_registry(env).resolve(PROFILES['physical_content'])
+    )
+    assert not ident.contrast_is_legal(
+        build_registry(env).resolve(PROFILES['task_content'])
+    )
+
+    # And the collector honours that rather than applying it anyway.
+    registry, sampler = make(env, profile='task_content')
+    manifest = ident.build_manifest(
+        env, registry, sampler, make_violation('none', 0.0), 4, 0,
+        'task_content', min_contrast=0.2,
+    )
+    assert manifest['contrast_floor_applies'] is False
+    assert manifest['min_contrast'] == 0.0
+
+
+def test_manifest_records_the_contrast_floor_in_force(env):
+    """A knob that reshapes the style distribution cannot be unrecorded."""
+    registry, sampler = make(env, profile='physical_content')
+    manifest = ident.build_manifest(
+        env, registry, sampler, make_violation('none', 0.0), 4, 0,
+        'physical_content', min_contrast=0.2,
+    )
+    assert manifest['contrast_floor_applies'] is True
+    assert manifest['min_contrast'] == pytest.approx(0.2)

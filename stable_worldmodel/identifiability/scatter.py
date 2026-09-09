@@ -128,7 +128,16 @@ def build_row(
         'predicted_error': metrics.get('predicted_error'),
         'epsilon': metrics.get('epsilon'),
         'delta': metrics.get('delta'),
+        # `delta` is the raw gap; under a stochastic g it decomposes as
+        # delta_content + 2*rho*sigma_sq, and only delta_content is the
+        # nonlinear energy D bounds. Both are recorded so a row can be
+        # re-attributed later without re-running the encoder.
+        'delta_content': metrics.get('delta_content'),
+        'delta_style': metrics.get('delta_style'),
         'D': metrics.get('D'),
+        # A bound above n says nothing -- predicting h = 0 already achieves n.
+        'bound_vacuous': metrics.get('bound_vacuous'),
+        'bound_headroom': metrics.get('bound_headroom'),
         'spectral_gap': metrics.get('spectral_gap'),
         'recovery_in_gap_units': metrics.get('recovery_in_gap_units'),
         # --- the decoy annotation ---
@@ -143,10 +152,23 @@ def build_row(
         'hermite2_excess': metrics.get('hermite2_excess'),
         'sigreg_z': metrics.get('sigreg_z'),
         'style_sensitivity': metrics.get('style_sensitivity'),
+        # The absolute style variance, in the units the loss floor is written
+        # in. `style_sensitivity` is the scale-free ratio -- right for
+        # comparing runs, but it cannot be substituted into the floor.
+        'sigma_sq': metrics.get('sigma_sq'),
+        'sigma_sq_per_dim': metrics.get('sigma_sq_per_dim'),
+        # Where the alignment loss could have bottomed out. With style redrawn
+        # per view the floor is 2(1-rho)n + 2*rho*sigma_sq, not Thm 1's
+        # 2(1-rho)n, so comparing an observed loss against the latter reads a
+        # style-invariant encoder as if it had failed.
+        'align_floor': metrics.get('align_floor'),
+        'align_floor_deterministic': metrics.get('align_floor_deterministic'),
+        'align_floor_style_term': metrics.get('align_floor_style_term'),
         # Distinguishes "measured, and the encoder is invariant" from
         # "there was no style to resample" (all_content) and from "no probe was
         # supplied" (null). Without it a vacuous zero reads as a perfect score.
         'style_vacuous': metrics.get('style_vacuous'),
+        'has_style_probe': metrics.get('has_style_probe'),
         # --- configuration that cannot be recovered later ---
         'rho_per_dim': rho.tolist(),
         'rho_mean': float(np.mean(rho)),

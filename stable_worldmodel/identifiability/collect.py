@@ -63,28 +63,107 @@ def variation_shape(env, dotted):
     return tuple(np.asarray(space.low).shape) or (1,)
 
 
-def sample_style(env, registry, rng):
+#: Axes whose collision makes the cube undetectable. Both must be **style**
+#: for the contrast floor to apply -- see :func:`contrast_is_legal`.
+CONTRAST_PAIR = ('cube.color', 'background.floor_rgb')
+
+#: Attempts before the contrast floor gives up on a draw and accepts it. A 0.2
+#: L-infinity floor rejects about 5% of draws, so exhausting this is a sign the
+#: bounds have changed, not bad luck.
+MAX_CONTRAST_ROUNDS = 32
+
+
+def contrast_is_legal(registry):
+    """Whether a cube/floor contrast floor can be applied without breaking a
+    stronger assumption.
+
+    Rejecting draws where the cube's colour is close to the floor's removes the
+    tail where the cube is invisible -- a genuine failure of injectivity, since
+    two different cube positions then render the same image. It is safe only
+    while **both** axes are ``style``:
+
+    * Two style axes may be made dependent on each other freely. Nothing asks
+      style to be internally independent; the assumption that matters is that
+      style is independent of *content*, and a predicate reading only style
+      preserves that.
+    * If ``cube.color`` is **content** (``task_content``), the same rejection
+      either truncates the content marginal -- a V5 support violation, on a
+      coordinate that is supposed to be Gaussian -- or, if applied to the floor
+      alone given the cube's colour, makes style a function of content and
+      breaks the one independence assumption the theory rests on. Both are
+      worse than the collision, so the floor is skipped and the caller warned.
+
+    Returns:
+        bool: True when both axes of :data:`CONTRAST_PAIR` are style.
+    """
+    style_names = {latent.name for latent in registry.style}
+    return all(name in style_names for name in CONTRAST_PAIR)
+
+
+def _contrast(payload):
+    """L-infinity distance between the cube's colour and the floor's."""
+    cube = np.asarray(payload['cube.color'], dtype=np.float64).reshape(-1)
+    floor = np.asarray(
+        payload['background.floor_rgb'], dtype=np.float64
+    ).reshape(-1)
+    channels = min(cube.size, floor.size)
+    return float(np.abs(cube[:channels] - floor[:channels]).max())
+
+
+def sample_style(env, registry, rng, min_contrast=0.0):
     """Draw one independent value for every ``style`` latent.
 
     Style is resampled **within** a pair -- the two views of a positive pair
     get different draws. That is what the alignment term is asked to discard,
     and what the style-invariance metric later measures.
 
+    Args:
+        env: The environment, for its variation space.
+        registry: A resolved registry.
+        rng: A ``numpy.random.Generator``.
+        min_contrast: Smallest L-infinity distance allowed between
+            ``cube.color`` and ``background.floor_rgb``. Both are drawn
+            uniformly on ``[0, 1]^3`` and independently, so without a floor the
+            cube occasionally renders the same colour as what is behind it and
+            vanishes -- an occlusion nobody declared and nothing records. At
+            ``0.2`` roughly 5% of draws are redrawn, which removes the tail
+            without meaningfully reshaping the style distribution. ``0.0``
+            disables it. Applied only when :func:`contrast_is_legal`.
+
+            The floor is a proxy, not a guarantee: ``background.floor_rgb`` is
+            modulated by whichever of the 8 ``floor_material`` textures is
+            active, so the rendered background is not exactly this colour.
+
     Returns:
         tuple: ``(variation_values, flat)`` -- the payload for
         ``render_content`` and a flat vector for the ``latent/style`` column.
     """
-    payload = {}
-    flat = []
+    axes = []
     for latent in registry.style:
         if not latent.channel.startswith('variation:'):
             continue
         axis = latent.channel.split(':', 1)[1]
-        space = swm_utils.get_in(env.variation_space, axis.split('.'))
-        space.seed(int(rng.integers(0, 2**31 - 1)))
-        value = space.sample()
-        payload[axis] = value
-        flat.append(np.asarray(value, dtype=np.float64).reshape(-1))
+        axes.append(
+            (axis, swm_utils.get_in(env.variation_space, axis.split('.')))
+        )
+
+    check = (
+        min_contrast > 0.0
+        and all(name in dict(axes) for name in CONTRAST_PAIR)
+    )
+
+    for _ in range(MAX_CONTRAST_ROUNDS):
+        payload = {}
+        for axis, space in axes:
+            space.seed(int(rng.integers(0, 2**31 - 1)))
+            payload[axis] = space.sample()
+        if not check or _contrast(payload) >= min_contrast:
+            break
+
+    flat = [
+        np.asarray(payload[axis], dtype=np.float64).reshape(-1)
+        for axis, _ in axes
+    ]
     return payload, (
         np.concatenate(flat) if flat else np.zeros(0, dtype=np.float64)
     )
@@ -219,6 +298,7 @@ def collect_pairs(
     camera='front_pixels',
     log_every=2000,
     resample_style_within_pair=True,
+    min_contrast=0.0,
 ):
     """Generate encoder-dataset episodes, one two-step episode per pair.
 
@@ -234,6 +314,9 @@ def collect_pairs(
         seed: Seed for the style stream, kept separate from the sampler's own.
         camera: Camera to record.
         log_every: Progress cadence, in pairs.
+        min_contrast: Cube/floor contrast floor, passed to
+            :func:`sample_style`. Disabled with a warning under any profile
+            where ``cube.color`` is content.
         resample_style_within_pair: Whether the two views of a pair get
             *independent* style draws (the default) or share one.
 
@@ -247,12 +330,20 @@ def collect_pairs(
             touching style), so the top-``n`` eigenspace is exactly the content
             block and slowness alone selects it.
 
-            Sharing one draw per pair sets style's autocorrelation to the same
-            ``rho`` as content, which collapses that ordering: appearance
-            becomes exactly as slow as physics and nothing in the objective
-            prefers cube position over light colour. Set ``False`` only to
-            recover the theory's literal setting -- a deterministic ``x =
-            g(z)`` -- as a control arm.
+            Sharing one draw per pair does **not** recover the theory's
+            setting -- it is strictly worse than the default. A shared draw is
+            *perfectly* correlated across the pair, so ``rho_style = 1``, not
+            ``rho``: every function of style sits at eigenvalue 1, strictly
+            above content's 0.90. Alignment is then minimised *exactly* by
+            encoding style and ignoring content, because the two views agree on
+            style by construction. With ~40 dims of style variation to draw
+            ``n`` independent functions from, the encoder can reach alignment 0
+            while satisfying SIGReg and representing no content at all.
+
+            So this flag is only meaningful *together with* a profile that
+            pins style -- one where every non-content latent is ``excluded``.
+            That pair of settings is the theory's literal ``x = g(z)``; this
+            flag alone is a degenerate configuration.
 
     Yields:
         dict: One episode, two steps deep.
@@ -275,6 +366,18 @@ def collect_pairs(
     # every frame of every shard. See `excluded_payload`.
     pinned = excluded_payload(env, registry)
 
+    # Skipped rather than silently misapplied when `cube.color` is content:
+    # rejecting on a content coordinate truncates its marginal.
+    if min_contrast > 0.0 and not contrast_is_legal(registry):
+        logging.warning(
+            f'min_contrast={min_contrast} requested but '
+            f'{CONTRAST_PAIR[0]} is not style under this profile, so the '
+            'cube/floor contrast floor is DISABLED. Rejecting on a content '
+            'coordinate would truncate its marginal (a V5 violation) or make '
+            'style depend on content; both are worse than the collision.'
+        )
+        min_contrast = 0.0
+
     written = 0
     while written < num_pairs:
         size = min(batch, num_pairs - written)
@@ -291,7 +394,7 @@ def collect_pairs(
             shared_style = (
                 None
                 if resample_style_within_pair
-                else sample_style(env, registry, rng)
+                else sample_style(env, registry, rng, min_contrast)
             )
             for view, (zz, values) in enumerate(
                 ((z, values_a), (z_next, values_b))
@@ -300,7 +403,7 @@ def collect_pairs(
                     env, registry, values, k
                 )
                 style, style_flat = (
-                    sample_style(env, registry, rng)
+                    sample_style(env, registry, rng, min_contrast)
                     if shared_style is None
                     else shared_style
                 )
@@ -416,6 +519,7 @@ def build_manifest(
     profile_name,
     extra=None,
     resample_style_within_pair=True,
+    min_contrast=0.0,
 ):
     """Everything needed to tell this dataset apart from any other.
 
@@ -455,6 +559,15 @@ def build_manifest(
         # operator's spectrum. Flipping it changes which latents the objective
         # can distinguish at all, so it is part of the dataset's identity.
         'resample_style_within_pair': bool(resample_style_within_pair),
+        # The cube/floor contrast floor actually in force. Recorded because it
+        # reshapes the style distribution, and because it is silently disabled
+        # under profiles where `cube.color` is content.
+        'min_contrast': float(
+            min_contrast if contrast_is_legal(registry) else 0.0
+        ),
+        'contrast_floor_applies': bool(
+            min_contrast > 0.0 and contrast_is_legal(registry)
+        ),
         # The value every excluded axis was actually held at. Recorded because
         # "excluded" is a claim about a constant, and an unrecorded constant
         # that silently differed per shard is exactly the bug this replaced.
