@@ -39,7 +39,11 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
-from lightning.pytorch.callbacks import Callback, LearningRateMonitor
+from lightning.pytorch.callbacks import (
+    Callback,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 from stable_pretraining import data as dt
@@ -97,6 +101,62 @@ class SaveCkptCallback(Callback):
             config=self.cfg,
             filename=f'weights_epoch_{epoch}.pt',
         )
+
+
+class RecordCkptDirCallback(Callback):
+    """Record where Lightning's checkpoints actually landed.
+
+    ``spt.Manager`` runs in cache_dir mode unconditionally -- a ``cache_dir`` is
+    mandatory, ``None`` raises -- and ``_configure_cache_dir_checkpointing``
+    rewrites the ``dirpath`` of **every** ``ModelCheckpoint`` to
+    ``$SPT_CACHE_DIR/runs/<date>/<time>/<run_id>/checkpoints/``. So the path
+    cannot be set; it can only be discovered, and the ``<date>/<time>/<run_id>``
+    part is not knowable before the run starts.
+
+    This resolves it at ``on_train_start`` -- once Manager has done its rewrite
+    but before the first checkpoint is written -- and drops a
+    ``lightning_ckpt_dir.txt`` plus a ``lightning`` symlink next to the run's
+    ``config.yaml``. Doing it at train start rather than after ``fit`` returns is
+    the point: a run that dies at epoch 6 is exactly the run whose checkpoint
+    directory you need to find, and that is the run whose ``fit`` never returns.
+    """
+
+    def __init__(self, run_dir):
+        super().__init__()
+        self.run_dir = Path(run_dir)
+
+    def on_train_start(self, trainer, pl_module):
+        super().on_train_start(trainer, pl_module)
+        if not trainer.is_global_zero:
+            return
+        directories = sorted(
+            {
+                str(cb.dirpath)
+                for cb in trainer.callbacks
+                if isinstance(cb, ModelCheckpoint) and cb.dirpath
+            }
+        )
+        if not directories:
+            print('no ModelCheckpoint is configured; no trainer state is saved.')
+            return
+        if len(directories) > 1:
+            print(f'WARNING: checkpoints are split across {directories}')
+
+        target = Path(directories[0])
+        (self.run_dir / 'lightning_ckpt_dir.txt').write_text(f'{target}\n')
+
+        link = self.run_dir / 'lightning'
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            # Not fatal: the .txt above is the authoritative record, and some
+            # network volumes refuse symlinks.
+            print(f'could not link {link} -> {target}: {error}')
+
+        print(f'lightning checkpoints -> {target}')
+        print(f'  recorded at {self.run_dir / "lightning_ckpt_dir.txt"}')
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -293,6 +353,25 @@ def run(cfg):
             run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1
         )
     ]
+    if cfg.checkpoint.keep_every_epoch:
+        # `filename` must not be 'last': Manager appends its own requeue saver
+        # under that exact name, and two callbacks writing one filename in one
+        # directory race. `save_top_k=-1` is what makes each epoch *stay*;
+        # without it Lightning keeps one file and overwrites it.
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=str(run_dir / 'lightning'),  # redirected by Manager
+                filename='epoch{epoch:03d}',
+                auto_insert_metric_name=False,
+                every_n_epochs=1,
+                save_top_k=-1,
+                save_last=False,
+                save_on_train_epoch_end=True,
+                enable_version_counter=False,
+            )
+        )
+    callbacks.append(RecordCkptDirCallback(run_dir))
+
     if logger is not None:
         # The schedule is the one thing here that has already failed silently:
         # `interval: 'epoch'` against a step-counted `max_steps` held the whole

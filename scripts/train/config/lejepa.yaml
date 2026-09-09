@@ -79,6 +79,34 @@ trainer:
   precision: 32
   gradient_clip_val: 1.0
 
+# Lightning trainer-state checkpoints -- weights *plus* optimizer, scheduler and
+# RNG, which is what a killed pod resumes from. Distinct from the
+# `weights_epoch_N.pt` that `SaveCkptCallback` writes: those are weights only and
+# are what the metric suite scores.
+#
+# The DIRECTORY is deliberately absent, because it cannot be set from here.
+# `spt.Manager` always runs in cache_dir mode (a cache_dir is mandatory --
+# passing None raises) and `_configure_cache_dir_checkpointing` redirects every
+# ModelCheckpoint's `dirpath` into
+# `$SPT_CACHE_DIR/runs/<date>/<time>/<run_id>/checkpoints/`. What IS settable is
+# the cache root, via `SPT_CACHE_DIR`. The resolved directory is written to
+# `checkpoints/${subdir}/lightning_ckpt_dir.txt` (plus a `lightning` symlink
+# beside it) at train start, so it is knowable while the run is still going
+# rather than only afterwards.
+checkpoint:
+  # One retained `epochNNN.ckpt` per epoch instead of only a rolling `last.ckpt`.
+  #
+  # Resume works either way: Manager's requeue saver writes `last.ckpt` every
+  # epoch regardless (`spt.set(requeue_checkpoint=False)` turns that off). This
+  # decides whether you can go back to a *specific* epoch -- which for a
+  # single-seed run whose whole output is a 10-point trend is worth the disk:
+  # ~34 MB/epoch for `paper_cnn` (2.86M params x fp32 x ~3 for AdamW state),
+  # ~270 MB/epoch for `vit_small`.
+  #
+  # NOTE: Lightning counts epochs from 0 and `SaveCkptCallback` counts from 1,
+  # so `epoch004.ckpt` is the trainer state that produced `weights_epoch_5.pt`.
+  keep_every_epoch: true
+
 loader:
   batch_size: 256
   num_workers: ${num_workers}
