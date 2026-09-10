@@ -64,7 +64,10 @@ program_constants:
   seed_budget: 5
 
 trainer:
-  max_epochs: 100      # V8 shortens this; severity 0 is the full schedule
+  # V8 shortens this; severity 0 is the full schedule. Only a *budget* knob now
+  # that `schedule.warmup_steps` is absolute -- see the schedule block below for
+  # what it used to also move.
+  max_epochs: 100
   # SIGReg is a *batch* statistic scaled by the batch size and is never
   # gathered across ranks (`wm/loss.py`: "only support single-gpu"). On two
   # devices you would silently get two statistics over half the batch each,
@@ -122,6 +125,46 @@ optimizer:
   # 5e-5/1e-3 (LeWM). Interpolated so switching `encoder=` switches these too.
   lr: ${encoder_lr}
   weight_decay: ${encoder_weight_decay}
+
+# The LR schedule, made explicit because both of its ends used to ride on
+# `trainer.max_epochs` -- which is the V8 severity knob, so V8 was moving
+# budget, warmup length AND anneal rate at once and could isolate none of them.
+#
+# Measured on the s3072 10-epoch run, read back out of its `epoch009.ckpt`:
+# warmup_steps=70 (1% of 7030), eta_min=0.0, and `_last_lr` at the final step
+# exactly 0.0. Epochs 1-4 carried 70% of the run's total LR; epochs 8-10 carried
+# 4.3% between them, so the last three points of that 10-point trend were three
+# near-duplicate checkpoints, not three observations.
+schedule:
+  # ABSOLUTE, not `int(0.01 * total_steps)`. At 703 steps/epoch the old rule
+  # gave the 10-epoch run 70 warmup steps and a 100-epoch run 703 -- a 10x
+  # difference in ramp aggressiveness attributable purely to the budget knob.
+  # 700 is the 100-epoch schedule's own value, kept as the fixed reference.
+  warmup_steps: 700
+
+  # `constant` -- warmup, then flat forever. The EXPLORATION shape, and the
+  # default here, because it is the only one under which killing a run is free
+  # and the epoch trend is an honest learning curve:
+  #
+  #   * every checkpoint is comparable to every other, so a plateau means the
+  #     model stopped learning rather than the LR having decayed out from under
+  #     it. The s3072 run cannot distinguish those: recovery went flat at epoch
+  #     4 while the mean LR over epochs 4-6 was itself halving (2.21e-3 ->
+  #     1.29e-3).
+  #   * killing at epoch N forfeits nothing, whereas killing a cosine at N
+  #     hands you a checkpoint frozen at high LR that never got its anneal
+  #     (a 100-epoch cosine stopped at 30 sits at 79% of peak).
+  #
+  # `cosine` -- warmup, then anneal to zero at `max_steps`. The HEADLINE shape:
+  # run it once, to completion, at whatever budget exploration settled on.
+  # Do not early-stop it.
+  #
+  # Implementation note: `constant` is expressed as `eta_min = base_lr`, which
+  # cancels the cosine term rather than adding a second scheduler class. That
+  # makes it silently reversible to a real cosine if the kwarg is ever dropped
+  # in transit, so `VerifyScheduleCallback` reads the realised scheduler back at
+  # train start and raises instead of trusting the dict.
+  shape: constant
 
 model:
   _target_: stable_worldmodel.wm.lejepa.LeJEPA

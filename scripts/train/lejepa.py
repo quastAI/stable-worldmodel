@@ -159,6 +159,67 @@ class RecordCkptDirCallback(Callback):
         print(f'  recorded at {self.run_dir / "lightning_ckpt_dir.txt"}')
 
 
+class VerifyScheduleCallback(Callback):
+    """Raise at train start if the realised LR schedule is not the configured one.
+
+    The schedule is the one thing in this script that has already failed
+    silently: ``interval: 'epoch'`` against a step-counted ``max_steps`` held
+    the whole first epoch at lr exactly 0, capped the peak at 14% of the
+    configured value, and nothing logged it.
+
+    ``schedule.shape: constant`` opens a second door to the same failure. It is
+    expressed as ``eta_min == base_lr`` -- an ordinary constructor kwarg -- so a
+    wrapper that quietly drops unknown scheduler kwargs would hand back a real
+    cosine annealing to zero, and the run would look entirely healthy for 100
+    epochs before its trend turned out to be an artefact of the LR. Nothing in
+    the repo currently passes an extra scheduler kwarg, so the pass-through is
+    unproven; this reads the constructed scheduler back and asserts instead.
+
+    Args:
+        expected: Scheduler attributes to check, by name.
+    """
+
+    def __init__(self, expected):
+        super().__init__()
+        self.expected = dict(expected)
+
+    def on_train_start(self, trainer, pl_module):
+        super().on_train_start(trainer, pl_module)
+        if not trainer.is_global_zero:
+            return
+
+        configs = trainer.lr_scheduler_configs
+        if not configs:
+            raise RuntimeError(
+                'no LR scheduler was configured; the schedule block in '
+                'lejepa.yaml is not reaching the optimizer'
+            )
+
+        for config in configs:
+            if config.interval != 'step':
+                raise RuntimeError(
+                    f'scheduler interval is {config.interval!r}, not '
+                    "'step' -- max_steps is counted in optimizer steps, so on "
+                    "'epoch' the counter only ever reaches max_epochs"
+                )
+            scheduler = config.scheduler
+            for key, want in self.expected.items():
+                got = getattr(scheduler, key, None)
+                if got is None:
+                    raise RuntimeError(
+                        f'scheduler has no attribute {key!r} -- the kwarg did '
+                        'not reach LinearWarmupCosineAnnealingLR'
+                    )
+                if abs(float(got) - float(want)) > 1e-12:
+                    raise RuntimeError(
+                        f'scheduler.{key} is {got!r}, expected {want!r} -- the '
+                        'kwarg was dropped or overridden in transit'
+                    )
+
+        realised = {k: getattr(configs[0].scheduler, k) for k in self.expected}
+        print(f'LR schedule verified (interval=step): {realised}')
+
+
 def lejepa_forward(self, batch, stage, cfg):
     """The passive objective over the two views of an OU pair.
 
@@ -300,14 +361,38 @@ def run(cfg):
     world_model = hydra.utils.instantiate(cfg.model)
 
     total_steps = cfg.trainer.max_epochs * len(train)
+
+    # Warmup is an ABSOLUTE step count, not `int(0.01 * total_steps)`. As a
+    # fraction it rode on `trainer.max_epochs`, which is the V8 severity knob:
+    # at 703 steps/epoch the 10-epoch s3072 run got 70 warmup steps where a
+    # 100-epoch run gets 703, so V8 moved budget, ramp and anneal together.
+    warmup_steps = max(1, min(int(cfg.schedule.warmup_steps), total_steps - 1))
+
+    base_lr = float(cfg.optimizer.lr)
+    if cfg.schedule.shape == 'constant':
+        # LinearWarmupCosineAnnealingLR interpolates
+        #   eta_min + (base_lr - eta_min) * (1 + cos(pi * progress)) / 2,
+        # so eta_min == base_lr zeroes the cosine term and the lr is flat after
+        # warmup. Cheaper than a second scheduler class, and verified at train
+        # start rather than assumed -- see VerifyScheduleCallback.
+        eta_min = base_lr
+    elif cfg.schedule.shape == 'cosine':
+        eta_min = 0.0
+    else:
+        raise ValueError(
+            f'schedule.shape must be "constant" or "cosine", '
+            f'got {cfg.schedule.shape!r}'
+        )
+
     optimizers = {
         'model_opt': {
             'modules': 'model',
             'optimizer': dict(cfg.optimizer),
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
-                'warmup_steps': max(1, int(0.01 * total_steps)),
+                'warmup_steps': warmup_steps,
                 'max_steps': total_steps,
+                'eta_min': eta_min,
             },
             # 'step', NOT 'epoch'. `total_steps` is counted in optimizer steps
             # (max_epochs * len(train)), so on 'epoch' the scheduler advances
@@ -371,6 +456,15 @@ def run(cfg):
             )
         )
     callbacks.append(RecordCkptDirCallback(run_dir))
+    callbacks.append(
+        VerifyScheduleCallback(
+            {
+                'warmup_steps': warmup_steps,
+                'max_steps': total_steps,
+                'eta_min': eta_min,
+            }
+        )
+    )
 
     if logger is not None:
         # The schedule is the one thing here that has already failed silently:
