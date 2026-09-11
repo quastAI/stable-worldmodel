@@ -1,25 +1,23 @@
 """LeJEPA: a passive, action-free encoder trained on designed OU pairs.
 
-Deliberate differences from :class:`~stable_worldmodel.wm.lewm.lewm.LeWM`, all
-of them load-bearing:
+Three properties, all load-bearing, and all of them departures from every other
+``wm/*`` in this repo:
 
-**No ``action_encoder``, no ``predictor``, no ``act_emb``.**
+**No ``action_encoder`` and no ``act_emb``.**
     Encoder training is passive. The whole point of the study is that the
     encoder sees *designed* latent pairs and never an action, so that whatever
     it identifies is attributable to the data's distributional structure and
     not to a prediction task. Every existing ``wm/*`` in this repo is
     action-conditioned; this is the first that is not.
 
-**``LeJEPA`` does not satisfy the ``Dynamics`` protocol, and must not.**
-    It has ``encode`` but no ``rollout``. That is not an omission to be filled
-    in later -- a passive encoder has no dynamics. The stage-D model that
-    wraps a frozen ``LeJEPA`` and adds a predictor is a separate class,
-    :class:`~stable_worldmodel.wm.lejepa.module.FrozenEncoderWM`, so "the
-    encoder is frozen before any predictor is trained" is enforced by the type
-    rather than by discipline.
+**``LeJEPA`` has ``encode`` and no ``rollout``, deliberately.**
+    A passive encoder has no dynamics, so it does not satisfy the ``Dynamics``
+    protocol and must not pretend to. Nothing here consumes actions.
 
-**The head outputs exactly ``n``**, read off the latent registry, so ``m = n``.
-    V7a (``m = n - k``) and V7b (``m = n + k``) are one config field.
+**The head outputs exactly ``n``**, read off the latent registry, so ``m = n``
+    by construction rather than by a config that could drift from the data.
+    ``model.head.output_dim`` overrides it, which is how a deliberate
+    ``m < n`` run is expressed.
 
 The objective, per the reference ``engine.py``::
 

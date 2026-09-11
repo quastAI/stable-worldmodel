@@ -25,12 +25,9 @@ disjoint block of sampler seeds, and writes its own ``*_shard{i}`` dataset for
 Usage::
 
     python scripts/data/collect_cube_single_ou.py num_pairs=200000
-    python scripts/data/collect_cube_single_ou.py latents.profile=task_content
-    python scripts/data/collect_cube_single_ou.py violation.name=v4 violation.severity=0.32
     python scripts/data/collect_cube_single_ou.py num_pairs=200000 shard=0 num_shards=8
 
-`dataset_name` interpolates `latents.profile`, so profiles cannot overwrite one
-another. The style-invariance probe is this same collector with the content
+`dataset_name` interpolates `latents.profile`. The style-invariance probe is this same collector with the content
 held fixed -- rho pushed to 1, so the pair's two views differ only in style::
 
     python scripts/data/collect_cube_single_ou.py \
@@ -56,7 +53,6 @@ if 'MUJOCO_GL' not in os.environ:
         os.environ.setdefault('PYOPENGL_PLATFORM', 'osmesa')
 
 import hydra  # noqa: E402
-import numpy as np  # noqa: E402
 from loguru import logger as logging  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
@@ -70,9 +66,6 @@ from stable_worldmodel.identifiability.latents import (  # noqa: E402
     build_registry,
 )
 from stable_worldmodel.identifiability.ou import OUSampler  # noqa: E402
-from stable_worldmodel.identifiability.violations import (  # noqa: E402
-    make_violation,
-)
 
 
 @hydra.main(
@@ -134,34 +127,9 @@ def run(cfg: DictConfig):
     registry = registry.resolve(PROFILES[profile_name])
     logging.info(f'latent profile "{profile_name}":\n{registry.summary()}')
 
-    # --------------------------------------------------------- violation
-    violation = make_violation(
-        str(cfg.violation.name), severity=float(cfg.violation.severity)
-    )
-    if violation.site != 'sampler':
-        logging.warning(
-            f'violation {violation.key} binds at the {violation.site}, not at '
-            'the sampler -- this dataset is the unviolated one, and the knob '
-            'is applied later.'
-        )
-
-    rho_bar = float(cfg.program_constants.rho)
-    sampler_kwargs = {
-        'rho': rho_bar,
-        'dist': cfg.ou.dist,
-        'alpha': cfg.ou.alpha,
-        'noise_coupling': float(cfg.ou.noise_coupling),
-        'cross_corr': float(cfg.ou.cross_corr),
-    }
-    sampler_kwargs.update(violation.sampler_kwargs(registry.n, rho_bar))
-    sampler = OUSampler(n=registry.n, seed=base_seed, **sampler_kwargs)
-
-    isotropy = sampler.describe()['isotropy']
-    logging.info(
-        f'rho mean {np.mean(sampler.rho):.4f}; isotropy criterion '
-        f'{"satisfied" if isotropy["satisfied"] else "VIOLATED"} '
-        f'(margin {isotropy["margin"]:+.5f})'
-    )
+    rho = float(cfg.program_constants.rho)
+    sampler = OUSampler(n=registry.n, rho=rho, seed=base_seed)
+    logging.info(f'OU sampler: n = {registry.n}, rho = {rho} (isotropic)')
 
     # ------------------------------------------------------------- write
     dataset_name = str(cfg.dataset_name)
@@ -180,7 +148,7 @@ def run(cfg: DictConfig):
     if not resample_style:
         logging.warning(
             'style.resample_within_pair=false: both views of a pair share one '
-            'style draw, so rho_style = 1 -- ABOVE content\'s rho. Alignment is '
+            "style draw, so rho_style = 1 -- ABOVE content's rho. Alignment is "
             'then minimised by encoding style and ignoring content entirely. '
             'This is only meaningful with a profile that also pins style; on '
             'its own it is a degenerate configuration.'
@@ -190,7 +158,6 @@ def run(cfg: DictConfig):
         env,
         registry,
         sampler,
-        violation,
         pairs,
         base_seed,
         profile_name,

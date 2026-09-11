@@ -87,7 +87,7 @@ def contrast_is_legal(registry):
       style is independent of *content*, and a predicate reading only style
       preserves that.
     * If ``cube.color`` is **content** (``task_content``), the same rejection
-      either truncates the content marginal -- a V5 support violation, on a
+      either truncates the content marginal -- a support truncation, on a
       coordinate that is supposed to be Gaussian -- or, if applied to the floor
       alone given the cube's colour, makes style a function of content and
       breaks the one independence assumption the theory rests on. Both are
@@ -147,9 +147,8 @@ def sample_style(env, registry, rng, min_contrast=0.0):
             (axis, swm_utils.get_in(env.variation_space, axis.split('.')))
         )
 
-    check = (
-        min_contrast > 0.0
-        and all(name in dict(axes) for name in CONTRAST_PAIR)
+    check = min_contrast > 0.0 and all(
+        name in dict(axes) for name in CONTRAST_PAIR
     )
 
     for _ in range(MAX_CONTRAST_ROUNDS):
@@ -257,11 +256,11 @@ def content_payload(env, registry, values, index):
                 # overwrite just the rows this latent owns; reshaping the flat
                 # row across the whole axis would scatter it into the wrong
                 # lights.
-                space = swm_utils.get_in(
-                    env.variation_space, axis.split('.')
-                )
+                space = swm_utils.get_in(env.variation_space, axis.split('.'))
                 full = np.array(
-                    space.value if space.value is not None else space.init_value,
+                    space.value
+                    if space.value is not None
+                    else space.init_value,
                     dtype=np.float64,
                 ).reshape(shape)
                 full[list(latent.axis_rows)] = row.reshape(
@@ -373,7 +372,7 @@ def collect_pairs(
             f'min_contrast={min_contrast} requested but '
             f'{CONTRAST_PAIR[0]} is not style under this profile, so the '
             'cube/floor contrast floor is DISABLED. Rejecting on a content '
-            'coordinate would truncate its marginal (a V5 violation) or make '
+            'coordinate would truncate its marginal, or make '
             'style depend on content; both are worse than the collision.'
         )
         min_contrast = 0.0
@@ -381,7 +380,7 @@ def collect_pairs(
     written = 0
     while written < num_pairs:
         size = min(batch, num_pairs - written)
-        z, z_next, meta = sampler.sample_pairs(size)
+        z, z_next = sampler.sample_pairs(size)
 
         values_a, clip_a = registry.to_physical(z)
         values_b, clip_b = registry.to_physical(z_next)
@@ -399,9 +398,7 @@ def collect_pairs(
             for view, (zz, values) in enumerate(
                 ((z, values_a), (z_next, values_b))
             ):
-                physical, variation = content_payload(
-                    env, registry, values, k
-                )
+                physical, variation = content_payload(env, registry, values, k)
                 style, style_flat = (
                     sample_style(env, registry, rng, min_contrast)
                     if shared_style is None
@@ -437,15 +434,10 @@ def collect_pairs(
                 for key, value in row.items():
                     steps.setdefault(key, []).append(value)
 
-            steps['ou/rho_per_dim'] = [
-                meta['rho'][k].astype(np.float32),
-                meta['rho'][k].astype(np.float32),
-            ]
-
             yield {
                 **steps,
                 EPISODE_DATA_KEY: {
-                    'pair_index': int(meta['index'][k]),
+                    'pair_index': written + k,
                     'num_cubes': int(n_cubes),
                 },
             }
@@ -513,7 +505,6 @@ def build_manifest(
     env,
     registry,
     sampler,
-    violation,
     num_pairs,
     seed,
     profile_name,
@@ -539,14 +530,13 @@ def build_manifest(
         },
         'latents': registry.describe(),
         'ou': sampler.describe(),
-        'violation': violation.describe(),
         'num_pairs': int(num_pairs),
         'seed': int(seed),
         'profile': profile_name,
-        # The appearance randomisation range, recorded so the predictor
-        # dataset can assert it matches. Appearance outside the encoder's
-        # training range is not covered by the alignment loss and leaks
-        # straight into the embedding.
+        # The appearance randomisation range. Recorded because appearance
+        # outside the encoder's training range is not covered by the alignment
+        # loss and leaks straight into the embedding, so any later dataset
+        # scored against this encoder has to be checked against it.
         'style_range': {
             latent.name: {
                 'low': latent.low.tolist(),
@@ -629,28 +619,56 @@ def load_manifest(dataset_name, cache_dir=None):
         return json.load(handle)
 
 
-def audit_dataset(registry, sampler, z_recorded, z_next_recorded):
+def audit_dataset(
+    registry, sampler, z_recorded, z_next_recorded, readback=None
+):
     """Post-hoc check that the dataset carries the process it claims to.
 
-    The plan's phase-3 gate. Comparing the *recorded* marginal and
-    autocorrelation against what the manifest declares is the only way to
-    catch a pipeline that quietly altered the process -- through clipping,
-    rejection, or a reshape that scrambled a coordinate.
+    Two checks, and they answer different questions. Reading them as one is
+    how a pipeline bug survives collection.
+
+    **Storage round-trip** (always). The recorded ``latent/z`` column is the
+    sampler's own draw, so comparing its marginal and lag-1 correlation against
+    the declared ``rho`` cannot detect anything the *environment* did -- it
+    compares the sampler with itself. What it does catch is real but narrow: a
+    reshape that scrambled a coordinate, a shard written with the wrong width,
+    a column that lost its pairing with ``step_idx``. Expect agreement to
+    sampling error, and treat a clean result as "storage is intact", not as
+    "the frames match the labels".
+
+    **Render round-trip** (when ``readback`` is given). This is the check that
+    actually bears on recovery. ``collect_pairs`` *commands* a physical state
+    and records the pre-clip ``z`` that asked for it, so any gap between the
+    commanded state and the one the simulator ended up in -- a clipped
+    coordinate, an IK solve that did not converge, a coupled joint that did not
+    track its driver -- puts the label out of step with the pixels and caps
+    recovery for a reason no encoder can fix. Pass the recorded
+    ``privileged/*`` / ``proprio/*`` columns as physical values and this
+    reports the residual per latent, in z-space units so it is comparable
+    across coordinates.
+
+    A latent with no physical readback cannot appear here. Under
+    ``physical_content`` that is exactly ``cube.size``, whose presence in the
+    render no recorded column can confirm.
 
     Args:
         registry: The resolved registry.
         sampler: The sampler that produced the data.
-        z_recorded: ``(B, n)`` first views.
+        z_recorded: ``(B, n)`` first views, from ``latent/z``.
         z_next_recorded: ``(B, n)`` second views.
+        readback: Optional mapping from latent name to ``(B, dim)`` *physical*
+            values read back out of the recorded columns.
 
     Returns:
-        dict: Declared-versus-achieved report.
+        dict: The declared-versus-achieved report. ``render`` is present only
+        when ``readback`` was supplied, and carries ``max_abs_z_error`` per
+        latent plus the overall worst, ``render_max_abs_z_error``.
     """
     achieved = sampler.empirical_rho(z_recorded, z_next_recorded)
-    declared = np.broadcast_to(sampler.rho, (registry.n,))
-    return {
+    declared = np.full(registry.n, sampler.rho)
+    report = {
         'n': registry.n,
-        'rho_declared': declared.tolist(),
+        'rho_declared': sampler.rho,
         'rho_achieved': achieved.tolist(),
         'rho_max_abs_error': float(np.abs(achieved - declared).max()),
         'marginal_mean': z_recorded.mean(axis=0).tolist(),
@@ -659,6 +677,36 @@ def audit_dataset(registry, sampler, z_recorded, z_next_recorded):
             np.abs(z_recorded.var(axis=0) - 1.0).max()
         ),
     }
+
+    if readback:
+        offsets = registry.slices()
+        commanded = registry.to_z(
+            {
+                latent.name: z_recorded[:, offsets[latent.name]]
+                for latent in registry.content
+            }
+        )
+        observed = registry.to_z(readback, missing='nan')
+        per_latent = {}
+        for latent in registry.content:
+            if latent.name not in readback:
+                continue
+            index = offsets[latent.name]
+            gap = np.abs(commanded[:, index] - observed[:, index])
+            per_latent[latent.name] = float(gap.max())
+        report['render'] = {
+            'max_abs_z_error': per_latent,
+            'unreadable': [
+                latent.name
+                for latent in registry.content
+                if latent.name not in readback
+            ],
+        }
+        report['render_max_abs_z_error'] = (
+            max(per_latent.values()) if per_latent else None
+        )
+
+    return report
 
 
 __all__ = [

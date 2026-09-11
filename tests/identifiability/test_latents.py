@@ -21,14 +21,40 @@ from stable_worldmodel.envs.ogbench.lejepa_cube_env import (  # noqa: E402
     LeJEPACubeEnv,
 )
 from stable_worldmodel.identifiability.latents import (  # noqa: E402
-    ALL_CONTENT_PROFILE,
-    ARM_C_CONTENT_PROFILE,
     PHYSICAL_CONTENT_PROFILE,
     PROFILES,
-    TASK_CONTENT_PROFILE,
     LatentRegistry,
     build_registry,
 )
+
+
+# Role dicts declared *here*, not shipped by the library. The study ships one
+# profile; these exist only to exercise properties that must hold for any
+# assignment of roles -- that the slices tile `z`, that every consumer agrees
+# on the order, that `describe` separates two different z's. Keeping them local
+# means the library's profile list stays the list of profiles anyone runs.
+ALL_CONTENT = {
+    '*': 'content',
+    'camera.angle_delta': 'excluded',
+    'background.floor_material': 'style',
+    'background.wall_material': 'style',
+    '?digit.value': 'style',
+    '?marker.value': 'style',
+}
+
+#: `physical_content` minus `cube.size`: every content latent has a
+#: `privileged/*` or `proprio/*` readback, so a simulator round-trip can be
+#: checked coordinate by coordinate.
+READABLE_ONLY = {
+    '*': 'style',
+    'camera.angle_delta': 'excluded',
+    'cube.pos_xy': 'content',
+    'cube.pos_z': 'content',
+    'cube.yaw': 'content',
+    'effector.pos': 'content',
+    'effector.yaw': 'content',
+    'gripper.opening': 'content',
+}
 
 
 @pytest.fixture(scope='module')
@@ -56,18 +82,6 @@ def registry(env):
 # ------------------------------------------------------------------ profiles
 
 
-def test_task_content_profile_has_thirteen_dims(registry):
-    """The shared-channel arm's ``n``, as a gate.
-
-    ``n`` is 9 physical + 1 for ``cube.size`` + 3 for ``cube.color`` = 13 at
-    ``n_cubes = 1``. If the registry drifts, every number reported under this
-    profile silently refers to a different problem.
-    """
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
-    assert resolved.n == 13, resolved.summary()
-    assert {latent.kind for latent in resolved.content} == {'physical', 'appearance'}
-
-
 def test_physical_content_is_ten_dims_with_cube_size(registry):
     """The stage-A exit-criterion profile: 9 physical DOFs + ``cube.size``.
 
@@ -84,41 +98,6 @@ def test_physical_content_is_ten_dims_with_cube_size(registry):
     assert 'cube.size' in {latent.name for latent in resolved.content}
 
 
-def test_arm_c_content_is_nine_readable_physical_dims(registry):
-    """Arm C's readback constraint, as a gate.
-
-    Arm C rebuilds ``z`` from ``env.compute_ob_info()``, which carries only
-    ``privileged/*`` and ``proprio/*`` keys -- so a content latent whose
-    readback is a ``variation.*`` axis makes its collector silently gather
-    nothing rather than fail. This profile is what keeps that from regressing.
-    """
-    resolved = registry.resolve(ARM_C_CONTENT_PROFILE)
-    assert resolved.n == 9, resolved.summary()
-    assert {latent.kind for latent in resolved.content} == {'physical'}
-    assert all(
-        latent.readback.startswith(('privileged/', 'proprio/'))
-        for latent in resolved.content
-    ), resolved.summary()
-
-
-def test_physical_content_would_fail_arm_c_readback_gate(registry):
-    """Why ``arm_c_content`` has to exist, asserted rather than noted.
-
-    ``cube.size`` reads back from ``variation.cube.size``, which is not in
-    ``compute_ob_info()``. So ``physical_content`` deliberately no longer
-    satisfies arm C's gate, and pointing arm C at it would collect zero
-    trajectories without raising. If this test ever fails, the two profiles can
-    be reconsidered -- until then they cannot be merged.
-    """
-    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
-    unreadable = [
-        latent.name
-        for latent in resolved.content
-        if not (latent.readback or '').startswith(('privileged/', 'proprio/'))
-    ]
-    assert unreadable == ['cube.size'], resolved.summary()
-
-
 def test_camera_angle_is_excluded_from_every_shipped_profile(registry):
     """Camera DR is off, and stays off by construction.
 
@@ -131,33 +110,9 @@ def test_camera_angle_is_excluded_from_every_shipped_profile(registry):
     for name, profile in PROFILES.items():
         resolved = registry.resolve(profile)
         excluded = {latent.name for latent in resolved.by_role('excluded')}
-        assert 'camera.angle_delta' in excluded, f'{name}: {resolved.summary()}'
-
-
-def test_task_content_leaves_style_to_discard(registry):
-    """The profile that actually exercises the alignment loss must have style."""
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
-    assert len(resolved.style) > 0
-
-
-def test_all_content_leaves_no_continuous_style(registry):
-    """The plan's SS3.5 consequence, asserted rather than assumed.
-
-    Under ``all_content`` every content-capable latent is content, so
-    within-pair style resampling is empty and the style-invariance metric is
-    vacuous. That is coherent with the theory but means this profile does not
-    test the discard behaviour at all -- which is exactly why both profiles
-    are run.
-    """
-    resolved = registry.resolve(ALL_CONTENT_PROFILE)
-    continuous_style = [
-        latent for latent in resolved.style if latent.kind != 'discrete'
-    ]
-    assert continuous_style == [], (
-        f'all_content still has continuous style latents: '
-        f'{[latent.name for latent in continuous_style]}'
-    )
-    assert resolved.n > registry.resolve(TASK_CONTENT_PROFILE).n
+        assert 'camera.angle_delta' in excluded, (
+            f'{name}: {resolved.summary()}'
+        )
 
 
 def test_profile_rejects_an_unknown_latent(registry):
@@ -191,7 +146,7 @@ def test_profile_rejects_promoting_an_incapable_latent(registry):
 
 def test_resolve_does_not_mutate_the_original(registry):
     before = dict(registry.roles)
-    registry.resolve(TASK_CONTENT_PROFILE)
+    registry.resolve(PHYSICAL_CONTENT_PROFILE)
     assert registry.roles == before
 
 
@@ -200,7 +155,7 @@ def test_resolve_does_not_mutate_the_original(registry):
 
 def test_z_to_physical_round_trips(registry):
     """The affine must be exactly invertible inside the bounds."""
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     rng = np.random.default_rng(0)
     # Inside +-sigma_span, so nothing clips.
     z = rng.uniform(-2.5, 2.5, (64, resolved.n))
@@ -212,7 +167,7 @@ def test_z_to_physical_round_trips(registry):
 
 def test_z_to_physical_respects_declared_bounds(registry):
     """Values must land inside what the environment will accept."""
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     rng = np.random.default_rng(1)
     z = rng.standard_normal((4096, resolved.n)) * 3.0
 
@@ -229,7 +184,7 @@ def test_clipping_is_reported_not_hidden(registry):
     At sigma_span = 3 roughly 0.27% of Gaussian draws land outside the bounds,
     so the clip is not free -- and an unreported clip is an undeclared V5.
     """
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     rng = np.random.default_rng(2)
 
     _, none = resolved.to_physical(rng.uniform(-1, 1, (2048, resolved.n)))
@@ -241,7 +196,7 @@ def test_clipping_is_reported_not_hidden(registry):
 
 def test_sigma_span_puts_the_bounds_at_three_sigma(registry):
     """The declared convention, checked rather than trusted."""
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     at_three = np.full((1, resolved.n), resolved.sigma_span)
     values, clipped = resolved.to_physical(at_three)
     assert clipped == 0.0
@@ -256,7 +211,7 @@ def test_sigma_span_puts_the_bounds_at_three_sigma(registry):
 
 def test_slices_tile_z_exactly(registry):
     """``z`` is the concatenation of the content latents, with no gaps."""
-    resolved = registry.resolve(ALL_CONTENT_PROFILE)
+    resolved = registry.resolve(ALL_CONTENT)
     slices = resolved.slices()
     covered = np.zeros(resolved.n, dtype=int)
     for latent in resolved.content:
@@ -266,9 +221,10 @@ def test_slices_tile_z_exactly(registry):
 
 def test_slice_order_follows_registry_order(registry):
     """Every consumer walks the registry in order; they must all agree."""
-    resolved = registry.resolve(ALL_CONTENT_PROFILE)
-    starts = [resolved.slices()[latent.name].start
-              for latent in resolved.content]
+    resolved = registry.resolve(ALL_CONTENT)
+    starts = [
+        resolved.slices()[latent.name].start for latent in resolved.content
+    ]
     assert starts == sorted(starts)
 
 
@@ -282,7 +238,7 @@ def test_read_info_recovers_the_physical_latents(env, registry):
     or a coupled joint did not track its driver -- which is exactly when the
     difference matters.
     """
-    resolved = registry.resolve(TASK_CONTENT_PROFILE)
+    resolved = registry.resolve(PHYSICAL_CONTENT_PROFILE)
     rng = np.random.default_rng(3)
     z = rng.uniform(-2.0, 2.0, (1, resolved.n))
     values, _ = resolved.to_physical(z)
@@ -320,13 +276,13 @@ def test_readback_z_matches_requested_z(env, registry):
 
     On ``arm_c_content``, not ``task_content`` or ``physical_content``: this is
     a *readback* loop, and it closes only for latents the simulator reports
-    back through ``content_info()``. ``task_content``'s ``cube.color`` and
-    ``physical_content``'s ``cube.size`` are variation axes with no
-    ``privileged/*`` entry, so neither has a place in a round-trip that goes
-    through the simulator at all -- the same constraint that gives arm C its
-    own profile.
+    back through ``content_info()``. ``cube.size`` is excluded from the role
+    dict used here because it is a variation axis with no ``privileged/*``
+    entry, so it has no place in a round-trip that goes through the simulator
+    at all -- and under the shipped profile that makes it the one content
+    latent whose presence in the render no recorded column can confirm.
     """
-    resolved = registry.resolve(ARM_C_CONTENT_PROFILE)
+    resolved = registry.resolve(READABLE_ONLY)
     rng = np.random.default_rng(4)
     z = rng.uniform(-2.0, 2.0, (1, resolved.n))
     values, _ = resolved.to_physical(z)
@@ -357,8 +313,8 @@ def test_readback_z_matches_requested_z(env, registry):
 
 def test_describe_distinguishes_profiles(registry):
     """A dataset must not be mistakable for a differently-configured one."""
-    a = registry.resolve(TASK_CONTENT_PROFILE).describe()
-    b = registry.resolve(ALL_CONTENT_PROFILE).describe()
+    a = registry.resolve(PHYSICAL_CONTENT_PROFILE).describe()
+    b = registry.resolve(ALL_CONTENT).describe()
     assert a != b
     assert a['n'] != b['n']
 
@@ -373,7 +329,8 @@ def test_every_latent_records_why_its_bounds_are_what_they_are(registry):
 def test_gripper_bounds_come_from_the_measured_linkage(env, registry):
     """The registry must not re-declare what the environment measured."""
     latent = next(
-        latent for latent in registry.latents
+        latent
+        for latent in registry.latents
         if latent.name == 'gripper.opening'
     )
     lo, hi = env.gripper_opening_bounds

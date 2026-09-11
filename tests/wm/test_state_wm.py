@@ -20,7 +20,7 @@ pytest.importorskip('ogbench')
 pytest.importorskip('mujoco')
 
 from stable_worldmodel.protocols import Dynamics  # noqa: E402
-from stable_worldmodel.wm.lejepa.module import Embedder, Predictor  # noqa: E402
+from stable_worldmodel.wm.lewm.module import Embedder, Predictor  # noqa: E402
 from stable_worldmodel.wm.state import OracleWM, StateWM  # noqa: E402
 
 
