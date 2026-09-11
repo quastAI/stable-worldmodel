@@ -184,7 +184,7 @@ class StateWM(nn.Module):
         """Roll candidates forward in whitened state space.
 
         Identical in structure to
-        :meth:`~stable_worldmodel.wm.lejepa.module.FrozenEncoderWM.rollout` --
+        :meth:`~stable_worldmodel.wm.lewm.lewm.LeWM.rollout` --
         the planner, the solvers and ``GoalMSE`` are held fixed across arms, so
         the rollout semantics must be too.
         """

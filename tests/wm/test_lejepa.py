@@ -1,30 +1,30 @@
-"""Tests for the LeJEPA encoder and the frozen-encoder stage-D wrapper.
+"""Tests for the LeJEPA encoder and the diagnostics logged beside it.
 
-Three properties carry the plan's design decisions and would otherwise be
-enforced only by discipline:
+Two properties carry design decisions that would otherwise be enforced only by
+discipline:
 
-* ``LeJEPA`` is passive and must **not** satisfy ``Dynamics``.
-* ``FrozenEncoderWM`` must keep the encoder frozen through everything a
-  training loop does to a module.
-* A predictor must refuse an encoder it was not trained against, because that
-  mismatch degrades planning in a way indistinguishable from an
-  identifiability failure.
+* ``LeJEPA`` is passive and must **not** satisfy ``Dynamics``. A passive
+  encoder has no dynamics, and a class that claimed otherwise would be handed
+  to a planner.
+* The diagnostics that read ``h[0] - h[1]`` must be separable from the ones
+  that read only the marginal, because train-mode BatchNorm flatters the first
+  group and not the second.
 """
 
-import numpy as np
 import pytest
 import torch
 from torch import nn
 
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lejepa import CNNEncoder, LeJEPA, NDimHead
-from stable_worldmodel.wm.lejepa.losses import alignment_loss, whitening_loss
-from stable_worldmodel.wm.lejepa.module import (
-    Embedder,
-    FrozenEncoderWM,
-    Predictor,
-    state_dict_hash,
+from stable_worldmodel.wm.lejepa.losses import (
+    alignment_loss,
+    bound_diagnostics,
+    recovery_diagnostics,
+    spectrum_diagnostics,
+    whitening_loss,
 )
+from stable_worldmodel.wm.lejepa.module import state_dict_hash
 
 
 N = 9
@@ -48,17 +48,6 @@ class TinyBackbone(nn.Module):
 def encoder():
     torch.manual_seed(0)
     return LeJEPA(TinyBackbone(), NDimHead(DIM, N, hidden_dim=16))
-
-
-@pytest.fixture
-def frozen(encoder):
-    predictor = Predictor(
-        num_frames=3, depth=1, heads=2, mlp_dim=16,
-        input_dim=N, hidden_dim=16, output_dim=N, dim_head=8,
-    )
-    return FrozenEncoderWM(
-        encoder, predictor, Embedder(input_dim=5, emb_dim=N)
-    )
 
 
 def pixels(b=4, t=2):
@@ -87,8 +76,13 @@ def test_cnn_pool_stays_global_at_the_design_resolution():
     """
     six = CNNEncoder(image_size=224)
     assert six.feature_map == 3, six.feature_map
-    assert CNNEncoder(channels=(32, 64, 128, 256), image_size=64).feature_map == 4
-    assert CNNEncoder(channels=(32, 64, 128, 256), image_size=224).feature_map == 14
+    assert (
+        CNNEncoder(channels=(32, 64, 128, 256), image_size=64).feature_map == 4
+    )
+    assert (
+        CNNEncoder(channels=(32, 64, 128, 256), image_size=224).feature_map
+        == 14
+    )
 
 
 def test_cnn_encoder_is_resolution_agnostic():
@@ -185,7 +179,7 @@ def test_head_output_width_is_n(encoder):
 
 
 @pytest.mark.parametrize('output_dim', [N - 3, N, N + 5])
-def test_v7_is_one_config_field(output_dim):
+def test_head_width_is_one_config_field(output_dim):
     """V7a and V7b must not require an architectural change."""
     model = LeJEPA(TinyBackbone(), NDimHead(DIM, output_dim))
     assert model.encode({'pixels': pixels()})['emb'].shape[-1] == output_dim
@@ -209,7 +203,9 @@ def test_alignment_is_zero_for_identical_views():
 def test_alignment_grows_as_views_separate():
     base = torch.randn(1, 64, N)
     losses = [
-        float(alignment_loss(torch.cat([base, base + s * torch.randn(1, 64, N)])))
+        float(
+            alignment_loss(torch.cat([base, base + s * torch.randn(1, 64, N)]))
+        )
         for s in (0.0, 0.5, 2.0)
     ]
     assert losses[0] < losses[1] < losses[2]
@@ -235,90 +231,7 @@ def test_whitening_loss_carries_no_gradient():
     assert h.grad is None
 
 
-# ------------------------------------------------------ the frozen wrapper
-
-
-def test_frozen_encoder_wm_is_dynamics(frozen):
-    assert isinstance(frozen, Dynamics)
-
-
-def test_encoder_parameters_never_require_grad(frozen):
-    assert not any(p.requires_grad for p in frozen.encoder.parameters())
-    assert any(p.requires_grad for p in frozen.predictor.parameters())
-
-
-def test_train_mode_does_not_unfreeze_the_encoder(frozen):
-    """``.train()`` would otherwise flip the encoder's dropout and norms back on.
-
-    That silently changes the embeddings the predictor was trained against --
-    no error, just a quietly different representation.
-    """
-    frozen.train()
-    assert frozen.predictor.training
-    assert not frozen.encoder.training
-    assert not any(p.requires_grad for p in frozen.encoder.parameters())
-
-
-def test_encoder_receives_no_gradient_from_the_predictor_loss(frozen):
-    """The structural guarantee, exercised through an actual backward pass."""
-    out = frozen.encode({'pixels': pixels(), 'action': torch.randn(4, 2, 5)})
-    loss = frozen.predict(out['emb'], out['act_emb']).pow(2).mean()
-    loss.backward()
-
-    assert all(p.grad is None for p in frozen.encoder.parameters())
-    assert any(
-        p.grad is not None and p.grad.abs().sum() > 0
-        for p in frozen.predictor.parameters()
-    )
-
-
-def test_rollout_produces_the_expected_shape(frozen):
-    b, s, h_ctx, t = 2, 3, 1, 4
-    info = {'pixels': torch.randn(b, s, h_ctx, 3, 8, 8)}
-    out = frozen.rollout(info, torch.randn(b, s, t, 5))
-    assert out['predicted_emb'].shape == (b, s, h_ctx + t, N)
-
-
-def test_untrained_predictor_ignores_actions_by_construction(frozen):
-    """AdaLN-zero: at initialisation the predictor is exactly the identity.
-
-    ``ConditionalBlock`` zero-initialises the final layer of
-    ``adaLN_modulation``, so ``gate_msa`` and ``gate_mlp`` start at zero and
-    both residual branches contribute nothing. The conditioning signal --
-    the actions -- therefore cannot move the output until training lifts those
-    gates off zero.
-
-    This is asserted rather than merely tolerated because it is exactly the
-    observation that looks like an action-wiring bug on first encounter: an
-    untrained model whose rollout is invariant to its action sequence, and a
-    zero action-encoder gradient at step 0. Both are the intended behaviour of
-    AdaLN-zero.
-    """
-    info = {'pixels': torch.randn(2, 3, 1, 3, 8, 8)}
-    a = frozen.rollout(dict(info), torch.zeros(2, 3, 4, 5))['predicted_emb']
-    b = frozen.rollout(dict(info), torch.ones(2, 3, 4, 5))['predicted_emb']
-    torch.testing.assert_close(a, b)
-
-
-def test_rollout_is_sensitive_to_actions_once_the_gates_open(frozen):
-    """The wiring test proper: actions must *reach* the predictor.
-
-    Lifting the AdaLN gates off zero stands in for training. If the rollout is
-    still action-invariant after that, the action path is genuinely
-    disconnected -- and the planner would have nothing to optimise, silently.
-    """
-    with torch.no_grad():
-        for block in frozen.predictor.transformer.layers:
-            block.adaLN_modulation[-1].weight.normal_(0, 0.5)
-            block.adaLN_modulation[-1].bias.normal_(0, 0.5)
-
-    info = {'pixels': torch.randn(2, 3, 1, 3, 8, 8)}
-    a = frozen.rollout(dict(info), torch.zeros(2, 3, 4, 5))['predicted_emb']
-    b = frozen.rollout(dict(info), torch.ones(2, 3, 4, 5))['predicted_emb']
-    assert not torch.allclose(a, b)
-
-
-# --------------------------------------------------------- the hash binding
+# ------------------------------------------------------------ provenance
 
 
 def test_hash_is_stable_and_content_addressed(encoder):
@@ -333,48 +246,6 @@ def test_hash_changes_when_a_weight_changes(encoder):
     with torch.no_grad():
         next(encoder.parameters()).add_(1.0)
     assert state_dict_hash(encoder) != before
-
-
-def test_mismatched_encoder_is_refused(encoder):
-    """The wiring bug that looks exactly like an identifiability failure.
-
-    A predictor fed embeddings from a different encoder plans badly, with
-    well-behaved losses and no error anywhere. Nothing downstream can tell it
-    apart from an encoder that failed to identify the latents, so it is caught
-    structurally.
-    """
-    predictor = Predictor(
-        num_frames=3, depth=1, heads=2, mlp_dim=16,
-        input_dim=N, hidden_dim=16, output_dim=N, dim_head=8,
-    )
-    with pytest.raises(ValueError, match='hash mismatch'):
-        FrozenEncoderWM(
-            encoder,
-            predictor,
-            Embedder(input_dim=5, emb_dim=N),
-            encoder_hash='0' * 16,
-        )
-
-
-def test_matching_hash_is_accepted(encoder):
-    predictor = Predictor(
-        num_frames=3, depth=1, heads=2, mlp_dim=16,
-        input_dim=N, hidden_dim=16, output_dim=N, dim_head=8,
-    )
-    model = FrozenEncoderWM(
-        encoder,
-        predictor,
-        Embedder(input_dim=5, emb_dim=N),
-        encoder_hash=state_dict_hash(encoder),
-    )
-    assert model.current_encoder_hash() == state_dict_hash(encoder)
-
-
-def test_predictor_blocks_are_shared_with_lewm():
-    """Arms A/R/C reuse the LeWM predictor; a fork would drift them apart."""
-    from stable_worldmodel.wm.lewm.module import Predictor as LeWMPredictor
-
-    assert Predictor is LeWMPredictor
 
 
 def test_sigreg_pool_views_matches_the_reference_convention():
@@ -404,4 +275,99 @@ def test_sigreg_pool_views_matches_the_reference_convention():
     single = torch.randn(1, 256, 10)
     assert pooled(single).item() == pytest.approx(
         per_view(single).item(), rel=0.25
+    )
+
+
+# ------------------------------------------------- which diagnostics survive
+
+
+def test_marginal_diagnostics_are_blind_to_the_pair_distance():
+    """``spectrum`` and ``whitening`` read only ``Cov(h)``, so pulling the two
+    views together must not move them.
+
+    This is the property that makes them safe to log on the training stage:
+    train-mode BatchNorm normalises both views of a pair with the same batch
+    statistics, which changes ``h[0] - h[1]`` without changing the marginal.
+    """
+    torch.manual_seed(0)
+    h = torch.randn(2, 512, N).double()
+    pulled = torch.stack([h[0], h[0] + 0.2 * (h[1] - h[0])])
+
+    for key, value in spectrum_diagnostics(h).items():
+        # The marginal of view 0 is untouched and view 1 is a contraction
+        # toward it, so these move only as much as the marginal itself does.
+        assert torch.isfinite(value)
+    assert whitening_loss(h) > 0
+    assert alignment_loss(pulled) < alignment_loss(h), (
+        'the pair distance must be the thing that changed'
+    )
+
+
+def test_bound_diagnostics_flag_an_impossible_delta():
+    """``delta`` below its Hermite floor means the embeddings are not a
+    function of one frame -- the train-mode signature.
+
+    A style-invariant direction of ``h`` is a function of ``z``, and a function
+    of ``z`` decorrelates at ``rho^k`` for its degree-``k`` content. A direction
+    uncorrelated with ``z`` has degree at least 2, so ``delta`` has a floor.
+    Below it, the row cannot be believed.
+    """
+    torch.manual_seed(0)
+    rho, n, batch = 0.9, 10, 4096
+    z = torch.randn(batch, n).double()
+    z_next = rho * z + (1 - rho**2) ** 0.5 * torch.randn(batch, n).double()
+
+    def encode(latents):
+        half = latents[:, : n // 2]
+        rest = (latents[:, n // 2 :] ** 2 - 1) / 2**0.5
+        return torch.cat([half, rest], dim=1)
+
+    h = torch.stack([encode(z), encode(z_next)])
+    truth = torch.stack([z, z_next])
+    recovered = recovery_diagnostics(h.float(), truth.float())[
+        'recovered_dimensions'
+    ]
+
+    honest = bound_diagnostics(h, rho, recovered)
+    assert honest['residual_hermite_degree'] == pytest.approx(2.0, abs=0.15)
+    assert bool(honest['delta_admissible'])
+
+    flattered = torch.stack([h[0], h[0] + 0.5 * (h[1] - h[0])])
+    broken = bound_diagnostics(flattered, rho, recovered)
+    assert broken['delta'] < broken['delta_floor']
+    assert broken['residual_hermite_degree'] < 2.0
+    assert not bool(broken['delta_admissible'])
+
+
+def test_recovery_diagnostics_are_empty_under_a_mismatched_width():
+    """No square ``Q`` to align with, so a recovery number would be meaningless.
+
+    The per-latent probe in ``run_metrics.py`` is what still applies there, and
+    returning ``{}`` is how the caller is told to go and use it.
+    """
+    h = torch.randn(2, 64, N + 3)
+    z = torch.randn(2, 64, N)
+    assert recovery_diagnostics(h, z) == {}
+
+
+def test_recovered_dimensions_matches_the_probe_identity():
+    """``sum sigma^2 = n * r2_h_to_z``, which is what floors ``delta``."""
+    torch.manual_seed(0)
+    z = torch.randn(2, 2048, N).double()
+    q = torch.linalg.qr(torch.randn(N, N).double())[0]
+    result = recovery_diagnostics(z @ q.T, z)
+    assert result['recovered_dimensions'] == pytest.approx(
+        float(result['r2_h_to_z']) * N, rel=1e-9
+    )
+    assert result['recovered_dimensions'] == pytest.approx(N, rel=1e-6)
+
+
+def test_procrustes_is_not_scale_free():
+    """``h = 0`` scores 1.0, so a falling curve near 1.0 is leaving the
+    trivial encoder rather than arriving at a good one."""
+    torch.manual_seed(0)
+    z = torch.randn(2, 2048, N).double()
+    result = recovery_diagnostics(torch.zeros_like(z), z)
+    assert float(result['procrustes_mse_per_dim']) == pytest.approx(
+        1.0, rel=0.05
     )

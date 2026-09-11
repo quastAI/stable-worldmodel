@@ -2,33 +2,31 @@
 
 ``scripts/train/lewm.py`` with three changes and nothing else:
 
-1. :func:`lejepa_forward` replaces the LeWM forward. No predictor, no action
-   encoder, no next-step target -- the objective is
+1. :func:`lejepa_forward` replaces the LeWM forward. No action encoder and no
+   next-step target -- the objective is
    ``lambda * SIGReg(h) + (1 - lambda) * alignment(h)`` over the two views of
    an OU pair.
 2. ``model.head.output_dim`` is set from the dataset's own ``latent/z`` width,
    so ``m = n`` is enforced by the data rather than by a config that could
    drift from it.
-3. ``whitening_loss``, :func:`alignment_diagnostics`,
-   :func:`spectrum_diagnostics` and :func:`recovery_diagnostics` are logged
-   every step and **never optimised**. ``alignment_diagnostics`` reports ``L``,
-   ``delta``, ``epsilon`` and the bound they combine into, in the paper's
-   units, which the raw losses are not in -- it is why
-   ``program_constants.rho`` is read here at all. ``recovery_diagnostics``
+3. ``whitening_loss``, :func:`spectrum_diagnostics`,
+   :func:`recovery_diagnostics` and :func:`bound_diagnostics` are logged and
+   **never optimised**. ``bound_diagnostics`` reports ``L``, ``delta``,
+   ``epsilon`` and the bound they combine into, in the paper's units, which
+   the raw losses are not in -- it is why ``program_constants.rho`` is read
+   here at all, and it is logged on the **validation stage only** because
+   train-mode BatchNorm flatters ``h[0] - h[1]``. ``recovery_diagnostics``
    scores ``h`` against the recorded ``latent/z``, which the loader has always
    loaded and the forward never read; it is a label, so it stays out of the
    objective.
 
-Optimiser, schedule, checkpointing and the ``SaveCkptCallback`` are inherited
-unchanged, so encoder capacity and training budget stay comparable to the LeWM
-baseline.
-
 Usage::
 
-    python scripts/train/lejepa.py                                  # physical_content
-    python scripts/train/lejepa.py profile=task_content              # + cube.color
-    python scripts/train/lejepa.py model.head.output_dim=7           # V7a
-    python scripts/train/lejepa.py trainer.max_epochs=20             # V8
+    python scripts/train/lejepa.py
+    python scripts/train/lejepa.py trainer.max_epochs=25
+    python scripts/train/lejepa.py program_constants.lambda=1.0e-2
+    # a deliberate narrow head: ask for fewer dimensions than the data declares
+    python scripts/train/lejepa.py model.head.output_dim=5
 """
 
 import os
@@ -50,8 +48,8 @@ from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
 from stable_worldmodel.wm.lejepa.losses import (
-    alignment_diagnostics,
     alignment_loss,
+    bound_diagnostics,
     recovery_diagnostics,
     spectrum_diagnostics,
     whitening_loss,
@@ -73,10 +71,9 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
 class SaveCkptCallback(Callback):
     """Save a checkpoint after each epoch through ``save_pretrained``.
 
-    Also records the encoder's parameter hash alongside the weights. The
-    predictor trained in ``lejepa_predictor.py`` stores that hash and refuses
-    to plan against a different encoder -- see
-    :class:`~stable_worldmodel.wm.lejepa.module.FrozenEncoderWM`.
+    Also records the encoder's parameter hash alongside the weights, so a
+    results row can be tied back to exact parameters after the file has been
+    moved or copied -- ``seed`` alone does not make a run reproducible.
     """
 
     def __init__(self, run_name, cfg, epoch_interval: int = 1):
@@ -137,7 +134,9 @@ class RecordCkptDirCallback(Callback):
             }
         )
         if not directories:
-            print('no ModelCheckpoint is configured; no trainer state is saved.')
+            print(
+                'no ModelCheckpoint is configured; no trainer state is saved.'
+            )
             return
         if len(directories) > 1:
             print(f'WARNING: checkpoints are split across {directories}')
@@ -225,15 +224,27 @@ def lejepa_forward(self, batch, stage, cfg):
 
     ``batch['pixels']`` is ``(B, 2, C, H, W)`` -- the two frames the collector
     wrote as a two-step episode. There is no action, no context/target split
-    and no next-step prediction: every departure from the LeWM forward is one
-    of those three, and each is deliberate.
+    and no next-step prediction.
+
+    **Which diagnostics are logged on which stage, and why it matters.** The
+    encoder is BatchNorm-heavy and :meth:`LeJEPA.encode` folds the view axis
+    into the batch, so in train mode ``h`` is a function of the whole batch
+    rather than of one frame. Quantities that read only the marginal second
+    moment of ``h`` agree across modes and are logged on both stages.
+    Quantities that read ``h[0] - h[1]`` do not: on a real 25-epoch run
+    ``delta`` measured 0.13 in train mode against 2.69 in eval mode on the
+    same weights -- below its own theoretical floor, i.e. impossible -- so the
+    whole ``bound/`` group is **validation-only**. Logging it on both stages is
+    how a bound reading gets quoted from the wrong one.
     """
     lambd = cfg.program_constants['lambda']
+    rho = float(cfg.program_constants['rho'])
+    validating = stage != 'fit'
 
     output = self.model.encode(batch)
     emb = output['emb']  # (B, V, n)
 
-    # SIGReg and both LeJEPA losses take (V, B, n).
+    # SIGReg and the alignment term take (V, B, n).
     h = emb.transpose(0, 1)
 
     output['sigreg_loss'] = self.sigreg(h)
@@ -242,45 +253,41 @@ def lejepa_forward(self, batch, stage, cfg):
         lambd * output['sigreg_loss'] + (1.0 - lambd) * output['align_loss']
     )
 
-    # Logged, never optimised: this is the metric `epsilon`, and V8 only means
-    # something if it is independent of the objective being minimised.
+    # Logged, never optimised: this is the metric `epsilon`, and it is only an
+    # honest measurement while it is independent of the objective. Mode-safe.
     output['whitening_metric'] = whitening_loss(h)
 
-    # The bound's own quantities, in the bound's own units -- `align_loss` and
-    # `whitening_metric` are a per-element mean and a per-element mean-square,
-    # neither of which is comparable to the paper's `L` or `epsilon`. `delta` is
-    # the one App. H.8 finds binding, and nothing computed it before.
-    diagnostics = alignment_diagnostics(
-        h, float(cfg.program_constants['rho'])
-    )
-    output.update(
-        {f'bound/{k}': v for k, v in diagnostics.items()}
-    )
-
-    # Partial collapse is invisible in `epsilon`, which is an aggregate: a
-    # single dead direction out of n moves it less than ordinary early-training
-    # noise does. The smallest eigenvalue of Cov(h) and the participation ratio
-    # do not average it away.
+    # Partial collapse is invisible in `epsilon`, which is an aggregate: one
+    # dead direction out of n moves it less than ordinary early-training noise
+    # does. The smallest eigenvalue and the participation ratio do not average
+    # it away. Mode-safe, so logged on both stages.
     output.update(
         {f'spectrum/{k}': v for k, v in spectrum_diagnostics(h).items()}
     )
 
-    # The criterion metric itself, live. `latent/z` is already in every batch
-    # -- the data config loads it and the forward has simply never read it --
-    # so this costs a handful of n x n decompositions and answers "is it
-    # recovering the latents", which no loss curve does. Never optimised: z is
-    # a label, and a label in the objective would make this supervised
-    # regression rather than an identifiability claim.
+    # The criterion metric, live. `latent/z` is already in every batch -- the
+    # data config loads it and the forward simply never reads it for the
+    # objective -- so this costs a handful of n x n decompositions and answers
+    # "is it recovering the latents", which no loss curve does. Never
+    # optimised: z is a label, and a label in the objective would make this
+    # supervised regression rather than an identifiability claim.
     latents = batch.get('latent/z')
+    recovery = {}
     if latents is not None:
-        output.update(
-            {
-                f'recovery/{k}': v
-                for k, v in recovery_diagnostics(
-                    h, latents.transpose(0, 1).to(h.dtype)
-                ).items()
-            }
+        recovery = recovery_diagnostics(h, latents.transpose(0, 1).to(h.dtype))
+        output.update({f'recovery/{k}': v for k, v in recovery.items()})
+
+    # Validation only -- see the docstring. `recovered_dimensions` is passed so
+    # `delta_floor` is logged as its own key: both it and `delta` average
+    # correctly over an epoch, so the admissibility comparison can be made on
+    # the epoch means. The per-batch boolean is deliberately not logged, since
+    # at 256 pairs it false-alarms on honest batches.
+    if validating:
+        diagnostics = bound_diagnostics(
+            h, rho, recovery.get('recovered_dimensions')
         )
+        diagnostics.pop('delta_admissible', None)
+        output.update({f'bound/{k}': v for k, v in diagnostics.items()})
 
     # Which term is actually being minimised. `align_loss` flattening while
     # `sigreg_loss` still falls is the signature of lambda being too high, and
@@ -333,8 +340,11 @@ def run(cfg):
             cfg.model.head.output_dim = n
     if cfg.model.head.output_dim != n:
         print(
-            f'V7 dimension misspecification active: head outputs '
-            f'{cfg.model.head.output_dim}, dataset declares n = {n}.'
+            f'narrow/wide head active: it outputs '
+            f"{cfg.model.head.output_dim} against the dataset's n = {n}. "
+            'recovery_diagnostics returns nothing under m != n (there is no '
+            'square Q to align with); the per-latent probe in run_metrics.py '
+            'is the metric that still applies.'
         )
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
@@ -363,9 +373,9 @@ def run(cfg):
     total_steps = cfg.trainer.max_epochs * len(train)
 
     # Warmup is an ABSOLUTE step count, not `int(0.01 * total_steps)`. As a
-    # fraction it rode on `trainer.max_epochs`, which is the V8 severity knob:
-    # at 703 steps/epoch the 10-epoch s3072 run got 70 warmup steps where a
-    # 100-epoch run gets 703, so V8 moved budget, ramp and anneal together.
+    # fraction it rode on `trainer.max_epochs`, so changing the budget also
+    # changed the ramp: at 703 steps/epoch a 10-epoch run got 70 warmup steps
+    # where a 100-epoch run got 703, and no two budgets were comparable.
     warmup_steps = max(1, min(int(cfg.schedule.warmup_steps), total_steps - 1))
 
     base_lr = float(cfg.optimizer.lr)
@@ -487,8 +497,9 @@ def run(cfg):
     )
     manager()
 
-    # The predictor stage binds itself to this exact encoder, so the hash has
-    # to be discoverable from the encoder run rather than recomputed by hand.
+    # Every results row records this, so a reported number can be traced back
+    # to exact parameters after the `.pt` has been moved or copied. `seed` does
+    # not make a run reproducible, so the contents are the only identifier.
     encoder_hash = state_dict_hash(world_model)
     with open(run_dir / 'encoder_hash.txt', 'w') as handle:
         handle.write(encoder_hash)

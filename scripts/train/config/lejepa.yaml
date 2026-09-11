@@ -10,15 +10,13 @@ defaults:
   - data: ogb_cube_single_ou
 
 # Which latent profile's dataset to train on. `physical_content` (n=10) is the
-# stage-A exit criterion: the 9 physical DOFs plus cube.size. `task_content`
-# (n=13) additionally puts cube.color in z, which is entangled with the
-# lighting that stays style -- a deliberate, separately-reported arm, not the
-# default. `arm_c_content` (n=9) drops cube.size for the consumers that need a
-# privileged/proprio readback for every content latent.
+# only shipped one: the 9 physical DOFs plus cube.size. It must match the
+# profile the dataset was collected under -- it is interpolated into the
+# dataset name, so a disagreement looks for a dataset that was never written.
 #
-# camera.angle_delta is excluded in every profile, so no camera DR reaches the
-# encoder. See identifiability/latents.py for why cube.size is content and the
-# camera is pinned -- both share a rendering channel with a content latent.
+# camera.angle_delta is excluded and pinned, so no camera randomisation reaches
+# the encoder. See identifiability/latents.py for why cube.size is content and
+# the camera is pinned -- both share a rendering channel with a content latent.
 profile: physical_content
 
 output_model_name: lejepa
@@ -33,9 +31,11 @@ train_split: 0.9
 seed: 3072
 img_size: 224
 
-# Frozen before Env 1 and copied verbatim into every result row by the metric
-# writer. A run that deviates from these is a first-class event in the scatter,
-# not a footnote -- which is only enforceable if they live in one place.
+# Frozen, and copied verbatim into every results row by the metric writer. A
+# run that deviates is a visible event rather than a footnote -- which is only
+# enforceable if they live in one place. Keep `rho` equal to the collector's;
+# `run_metrics.py` reads the dataset manifest's `rho` in preference to this, so
+# a disagreement shows up as a manifest/row mismatch rather than silently.
 program_constants:
   rho: 0.9          # mid-range of Fig. 6's best region, clear of the rho=0.99 collapse
 
@@ -60,19 +60,21 @@ program_constants:
   #         trainer.max_epochs=10 subdir=lam_$l
   #   done
   # If `fit/align_loss` stops falling, SIGReg is dominating: drop to 1e-2.
+  # Read `fit/align_loss` against its floor, `(1 - rho) * trace_cov / (2 n)`,
+  # NOT against zero -- and read it in `validate/`, since train-mode BatchNorm
+  # flatters anything computed from the two views' difference.
   lambda: 5.0e-2
-  seed_budget: 5
 
 trainer:
-  # V8 shortens this; severity 0 is the full schedule. Only a *budget* knob now
-  # that `schedule.warmup_steps` is absolute -- see the schedule block below for
-  # what it used to also move.
+  # A pure budget knob now that `schedule.warmup_steps` is absolute -- see the
+  # schedule block below for what it used to also move.
   max_epochs: 100
   # SIGReg is a *batch* statistic scaled by the batch size and is never
   # gathered across ranks (`wm/loss.py`: "only support single-gpu"). On two
   # devices you would silently get two statistics over half the batch each,
   # which changes the effective lambda and moves the run off the calibrated
-  # (lambda, rho) region. Pinned rather than `auto`.
+  # (lambda, rho) region. It would also halve the batch every train-time
+  # BatchNorm normalises over. Pinned rather than `auto`.
   devices: 1
   accelerator: gpu
   # NOT bf16. SIGReg's inner term is `(cos_mean - phi)^2`, a difference of two
@@ -127,19 +129,25 @@ optimizer:
   weight_decay: ${encoder_weight_decay}
 
 # The LR schedule, made explicit because both of its ends used to ride on
-# `trainer.max_epochs` -- which is the V8 severity knob, so V8 was moving
-# budget, warmup length AND anneal rate at once and could isolate none of them.
+# `trainer.max_epochs`, so changing the budget moved the budget, the warmup
+# length AND the anneal rate at once and none of the three could be isolated.
 #
 # Measured on the s3072 10-epoch run, read back out of its `epoch009.ckpt`:
 # warmup_steps=70 (1% of 7030), eta_min=0.0, and `_last_lr` at the final step
 # exactly 0.0. Epochs 1-4 carried 70% of the run's total LR; epochs 8-10 carried
 # 4.3% between them, so the last three points of that 10-point trend were three
 # near-duplicate checkpoints, not three observations.
+#
+# One consequence of `constant` that is NOT free, and is the reason
+# run_metrics.py refreshes BatchNorm statistics by default: the weights never
+# stop moving, so BatchNorm's ~10-batch running statistics are permanently
+# stale relative to them and never converge. A cosine anneal to zero hides
+# this by letting the weights settle; this shape cannot.
 schedule:
   # ABSOLUTE, not `int(0.01 * total_steps)`. At 703 steps/epoch the old rule
-  # gave the 10-epoch run 70 warmup steps and a 100-epoch run 703 -- a 10x
-  # difference in ramp aggressiveness attributable purely to the budget knob.
-  # 700 is the 100-epoch schedule's own value, kept as the fixed reference.
+  # gave a 10-epoch run 70 warmup steps and a 100-epoch run 703 -- a 10x
+  # difference in ramp aggressiveness attributable purely to the budget, so no
+  # two budgets were comparable. 700 is kept as the fixed reference.
   warmup_steps: 700
 
   # `constant` -- warmup, then flat forever. The EXPLORATION shape, and the
@@ -173,7 +181,11 @@ model:
     _target_: stable_worldmodel.wm.lejepa.NDimHead
     input_dim: ${embed_dim}
     # null => take n from the dataset's own `latent/z` width, so m = n by
-    # construction. Set explicitly for V7a (n - k) or V7b (n + k).
+    # construction and the head can never silently disagree with the ground
+    # truth the metrics score against. Set it explicitly to ask for a narrower
+    # head on purpose; `recovery_diagnostics` then returns nothing (no square Q
+    # to align with) and the per-latent probe in run_metrics.py is what still
+    # applies.
     output_dim: null
     # Shape follows the encoder: bare `Linear(256, n)` for the paper CNN, whose
     # projection already ends in BatchNorm1d + GELU; LayerNorm + a 2048 hidden

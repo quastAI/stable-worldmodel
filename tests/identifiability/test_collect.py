@@ -29,9 +29,6 @@ from stable_worldmodel.identifiability.latents import (  # noqa: E402
     build_registry,
 )
 from stable_worldmodel.identifiability.ou import OUSampler  # noqa: E402
-from stable_worldmodel.identifiability.violations import (  # noqa: E402
-    make_violation,
-)
 
 
 IMAGE = 64
@@ -54,7 +51,7 @@ def env():
     e.close()
 
 
-def make(env, profile='task_content', **sampler_kwargs):
+def make(env, profile='physical_content', **sampler_kwargs):
     registry = build_registry(env).resolve(PROFILES[profile])
     kwargs = {'rho': 0.9, **sampler_kwargs}
     sampler = OUSampler(n=registry.n, seed=0, **kwargs)
@@ -67,7 +64,9 @@ def make(env, profile='task_content', **sampler_kwargs):
 def test_a_pair_is_a_two_step_episode(env):
     """Two steps is what makes the stock loader yield a positive pair."""
     registry, sampler = make(env)
-    episodes = list(ident.collect_pairs(env, registry, sampler, 3, log_every=0))
+    episodes = list(
+        ident.collect_pairs(env, registry, sampler, 3, log_every=0)
+    )
     assert len(episodes) == 3
 
     for episode in episodes:
@@ -100,23 +99,11 @@ def test_the_two_views_differ(env):
 
 def test_style_is_resampled_within_a_pair(env):
     """The alignment term can only discard style that actually varies."""
-    registry, sampler = make(env, profile='task_content')
+    registry, sampler = make(env)
     episode = next(ident.collect_pairs(env, registry, sampler, 1, log_every=0))
     style_a, style_b = episode['latent/style']
     assert style_a.size > 0
     assert not np.allclose(style_a, style_b)
-
-
-def test_all_content_has_no_continuous_style_to_resample(env):
-    """The plan's SS3.5 consequence, visible in the recorded columns."""
-    registry, sampler = make(env, profile='all_content')
-    episode = next(ident.collect_pairs(env, registry, sampler, 1, log_every=0))
-    style_a, style_b = episode['latent/style']
-    # Only the discrete latents remain style, and they are integer-coded.
-    assert style_a.size == len(
-        [latent for latent in registry.style
-         if latent.channel.startswith('variation:')]
-    )
 
 
 def test_qvel_is_zero_in_every_frame(env):
@@ -173,10 +160,16 @@ def test_excluded_axes_are_pinned_to_a_recorded_constant(env):
     # Independent of the reset draw: re-randomise everything, and the pin holds.
     env.reset(seed=12345, options={'variation': ['all']})
     again = ident.excluded_payload(env, registry)
-    assert np.allclose(again['camera.angle_delta'], pinned['camera.angle_delta'])
+    assert np.allclose(
+        again['camera.angle_delta'], pinned['camera.angle_delta']
+    )
 
     manifest = ident.build_manifest(
-        env, registry, sampler, make_violation('none', 0.0), 4, 0,
+        env,
+        registry,
+        sampler,
+        4,
+        0,
         'physical_content',
     )
     assert 'camera.angle_delta' in manifest['excluded_pinned']
@@ -195,7 +188,11 @@ def test_style_may_be_shared_across_a_pair(env):
 
     shared = list(
         ident.collect_pairs(
-            env, registry, sampler, 6, log_every=0,
+            env,
+            registry,
+            sampler,
+            6,
+            log_every=0,
             resample_style_within_pair=False,
         )
     )
@@ -207,26 +204,34 @@ def test_style_may_be_shared_across_a_pair(env):
         ident.collect_pairs(env, registry, sampler, 6, log_every=0)
     )
     assert any(
-        not np.allclose(*episode['latent/style'])
-        for episode in independent
+        not np.allclose(*episode['latent/style']) for episode in independent
     ), 'default must redraw style per view'
 
 
 def test_readback_recovers_the_latents_that_were_written(env):
     """Simulator ground truth must track the requested z, not drift from it.
 
-    On ``arm_c_content``: the drift this guards against -- a clipped value, an
-    unconverged IK solve, a coupled joint that did not track its driver -- is a
-    property of latents written into ``qpos``. Appearance axes like
-    ``task_content``'s ``cube.color`` and ``physical_content``'s ``cube.size``
-    are direct ``geom.rgba`` / ``geom_size`` writes with nothing in between, so
-    there is no divergence to detect, and neither has a ``privileged/*`` column
-    in the recorded row to read back from either.
+    The drift this guards against -- a clipped value, an unconverged IK solve,
+    a coupled joint that did not track its driver -- is a property of the
+    latents written into ``qpos``, and it matters because ``latent/z`` records
+    what was *asked for*: any gap puts the label out of step with the pixels
+    and caps recovery for a reason no encoder can fix.
+
+    ``cube.size`` is skipped, and it is the one latent that cannot be checked
+    this way: it is a direct ``model.geom_size`` write with nothing in between
+    to diverge, and it has no ``privileged/*`` column to read back from. Its
+    presence in the *render* is therefore unverifiable from a recorded row,
+    which is worth remembering when it scores near zero.
     """
-    registry, sampler = make(env, profile='arm_c_content')
+    registry, sampler = make(env)
     episodes = list(
         ident.collect_pairs(env, registry, sampler, 120, log_every=0)
     )
+
+    offsets = registry.slices()
+    readable = [
+        latent for latent in registry.content if latent.name != 'cube.size'
+    ]
 
     requested, observed = [], []
     for episode in episodes:
@@ -237,9 +242,17 @@ def test_readback_recovers_the_latents_that_were_written(env):
                 if isinstance(values, list)
             }
             values = registry.read_info(info, num_cubes=1)
+            assert 'cube.size' not in values, (
+                'cube.size gained a physical readback; this test skips it '
+                'precisely because it has none'
+            )
             observed.append(
                 registry.to_z(
-                    {n: values[n].reshape(1, -1) for n in registry.slices()}
+                    {
+                        latent.name: values[latent.name].reshape(1, -1)
+                        for latent in readable
+                    },
+                    missing='nan',
                 )[0]
             )
             requested.append(episode['latent/z'][view])
@@ -247,33 +260,13 @@ def test_readback_recovers_the_latents_that_were_written(env):
     requested = np.stack(requested)
     observed = np.stack(observed)
     # Per-coordinate correlation, which is what the recovery metrics consume.
-    for j in range(registry.n):
-        corr = np.corrcoef(requested[:, j], observed[:, j])[0, 1]
-        assert corr > 0.99, (
-            f'coordinate {j} readback correlates only {corr:.4f} with what '
-            'was written'
-        )
-
-
-# -------------------------------------------------------------- violations
-
-
-def test_a_violation_changes_a_measurable_dataset_statistic(env):
-    """Two severities must produce datasets that are actually different."""
-    registry, _ = make(env)
-    stats = {}
-    for severity in (0.0, 1.0):
-        violation = make_violation('v1', severity=severity)
-        kwargs = {'rho': 0.9}
-        kwargs.update(violation.sampler_kwargs(registry.n, 0.9))
-        sampler = OUSampler(n=registry.n, seed=1, **kwargs)
-        episodes = list(
-            ident.collect_pairs(env, registry, sampler, 900, log_every=0)
-        )
-        z = np.stack([ep['latent/z'][0] for ep in episodes]).ravel()
-        stats[severity] = float((z**4).mean() / (z**2).mean() ** 2)
-
-    assert stats[1.0] > 1.5 * stats[0.0], stats
+    for latent in readable:
+        for j in range(offsets[latent.name].start, offsets[latent.name].stop):
+            corr = np.corrcoef(requested[:, j], observed[:, j])[0, 1]
+            assert corr > 0.99, (
+                f'{latent.name} coordinate {j} reads back at correlation '
+                f'{corr:.4f} against what was written'
+            )
 
 
 # --------------------------------------------------------------- manifest
@@ -282,13 +275,9 @@ def test_a_violation_changes_a_measurable_dataset_statistic(env):
 def test_manifest_distinguishes_configurations(env):
     """A dataset must never be mistakable for a differently-configured one."""
     registry, sampler = make(env)
-    a = ident.build_manifest(
-        env, registry, sampler, make_violation('none'), 10, 0, 'task_content'
-    )
-    other = OUSampler(n=registry.n, rho=0.9, dist='laplace', seed=0)
-    b = ident.build_manifest(
-        env, registry, other, make_violation('none'), 10, 0, 'task_content'
-    )
+    a = ident.build_manifest(env, registry, sampler, 10, 0, 'physical_content')
+    other = OUSampler(n=registry.n, rho=0.8, seed=0)
+    b = ident.build_manifest(env, registry, other, 10, 0, 'physical_content')
     assert a['config_hash'] != b['config_hash']
 
 
@@ -300,7 +289,7 @@ def test_manifest_records_the_style_range(env):
     """
     registry, sampler = make(env)
     manifest = ident.build_manifest(
-        env, registry, sampler, make_violation('none'), 10, 0, 'task_content'
+        env, registry, sampler, 10, 0, 'physical_content'
     )
     assert manifest['style_range']
     for spec in manifest['style_range'].values():
@@ -309,7 +298,7 @@ def test_manifest_records_the_style_range(env):
 
 def test_config_hash_is_stable(env):
     registry, sampler = make(env)
-    args = (env, registry, sampler, make_violation('none'), 10, 0, 'task_content')
+    args = (env, registry, sampler, 10, 0, 'physical_content')
     assert (
         ident.build_manifest(*args)['config_hash']
         == ident.build_manifest(*args)['config_hash']
@@ -361,53 +350,36 @@ def test_contrast_floor_removes_the_invisible_cube_tail(env):
     registry, _ = make(env, profile='physical_content')
     rng = np.random.default_rng(0)
 
-    unconstrained = np.array([
-        ident._contrast(ident.sample_style(env, registry, rng, 0.0)[0])
-        for _ in range(600)
-    ])
+    unconstrained = np.array(
+        [
+            ident._contrast(ident.sample_style(env, registry, rng, 0.0)[0])
+            for _ in range(600)
+        ]
+    )
     assert (unconstrained < 0.2).mean() > 0.01, 'tail should be non-trivial'
 
-    floored = np.array([
-        ident._contrast(ident.sample_style(env, registry, rng, 0.2)[0])
-        for _ in range(600)
-    ])
+    floored = np.array(
+        [
+            ident._contrast(ident.sample_style(env, registry, rng, 0.2)[0])
+            for _ in range(600)
+        ]
+    )
     assert floored.min() >= 0.2
     # The floor removes a tail; it must not reshape the bulk.
     assert abs(floored.mean() - unconstrained.mean()) < 0.1
-
-
-def test_contrast_floor_is_refused_when_cube_color_is_content(env):
-    """Rejecting on a *content* coordinate would truncate its marginal.
-
-    Two style axes may be made mutually dependent freely -- nothing asks style
-    to be internally independent. But under `task_content` cube.color is
-    content, and the same rejection would either truncate a coordinate that is
-    supposed to be Gaussian (a V5 violation) or make style a function of
-    content. Both are worse than the collision, so the floor must switch off.
-    """
-    assert ident.contrast_is_legal(
-        build_registry(env).resolve(PROFILES['physical_content'])
-    )
-    assert not ident.contrast_is_legal(
-        build_registry(env).resolve(PROFILES['task_content'])
-    )
-
-    # And the collector honours that rather than applying it anyway.
-    registry, sampler = make(env, profile='task_content')
-    manifest = ident.build_manifest(
-        env, registry, sampler, make_violation('none', 0.0), 4, 0,
-        'task_content', min_contrast=0.2,
-    )
-    assert manifest['contrast_floor_applies'] is False
-    assert manifest['min_contrast'] == 0.0
 
 
 def test_manifest_records_the_contrast_floor_in_force(env):
     """A knob that reshapes the style distribution cannot be unrecorded."""
     registry, sampler = make(env, profile='physical_content')
     manifest = ident.build_manifest(
-        env, registry, sampler, make_violation('none', 0.0), 4, 0,
-        'physical_content', min_contrast=0.2,
+        env,
+        registry,
+        sampler,
+        4,
+        0,
+        'physical_content',
+        min_contrast=0.2,
     )
     assert manifest['contrast_floor_applies'] is True
     assert manifest['min_contrast'] == pytest.approx(0.2)

@@ -1,32 +1,44 @@
-"""Identifiability tooling for the LeJEPA Env-1 study.
+"""Identifiability measurement for the LeJEPA encoder study.
 
-Four pieces, deliberately separable:
+Four modules, one per concern:
 
 ``latents``
-    The registry -- what ``z`` is, and the affine between z-space and physical
-    units. Everything else reads its notion of ``n`` from here.
+    The registry: what ``z`` *is*, and the affine map between z-space and
+    physical units. The single place that decides what coordinate 7 means.
 ``ou``
-    The sampler that produces positive pairs, with violations V1-V5 and V9 as
-    knobs.
-``violations``
-    Those knobs as named, severity-laddered configurations, plus the ones that
-    live at the environment and the training config instead.
+    The sampler that draws ``(z, z')`` positive pairs from a stationary,
+    isotropic, Gaussian OU process.
+``collect``
+    Drives the environment to render those pairs into a dataset, and audits
+    the result against what the manifest declares.
 ``metrics``
-    The frozen metric suite. Versioned separately from the training code, per
-    the plan: a metric that moves mid-programme silently invalidates every
-    earlier row of the scatter.
-``scatter``
-    The append-only result table, written from the first run onward because
-    several of its columns cannot be reconstructed after the fact.
+    The frozen suite: does ``h`` recover ``z``, and is the answer usable.
+``results``
+    Append-only per-checkpoint results rows.
 """
 
-from .latents import *  # noqa: F403
-from .ou import *  # noqa: F403
-from .violations import *  # noqa: F403
+from . import collect, latents, metrics, ou, results  # noqa: F401
+from .latents import PROFILES, Latent, LatentRegistry, build_registry
+from .metrics import compute_all
+from .ou import SIGMA_SPAN, OUSampler, spectral_gap
+from .results import append_row, build_row, load_rows
 
-# `metrics` and `collect` are exposed as submodules rather than star-imported.
-# `metrics` is versioned separately and its names (`r2`, `compute_all`) are
-# generic enough that flattening them into the package namespace would invite
-# an accidental shadow; `collect` is a script-facing helper, not part of the
-# library surface.
-from . import collect, metrics, scatter  # noqa: F401
+
+__all__ = [
+    'PROFILES',
+    'SIGMA_SPAN',
+    'Latent',
+    'LatentRegistry',
+    'OUSampler',
+    'append_row',
+    'build_registry',
+    'build_row',
+    'collect',
+    'compute_all',
+    'latents',
+    'load_rows',
+    'metrics',
+    'ou',
+    'results',
+    'spectral_gap',
+]

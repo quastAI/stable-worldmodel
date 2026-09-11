@@ -31,32 +31,19 @@ rendering channel with a content latent must not be style**, because style
 demands exact invariance along a direction the content itself depends on. The
 per-latent measurements behind that are recorded with the profiles below.
 
-The shipped profiles
----------------------
+The profile
+-----------
 ``physical_content``
-    The stage-A exit-criterion profile. The 9 physical DOFs plus
-    ``cube.size``, so ``n = 10`` at one cube.
-``task_content``
-    ``physical_content`` plus ``cube.color``, so ``n = 13`` at one cube. Those
-    3 colour dims share a rendering channel with the lighting that stays style
-    -- the image constrains albedo x illumination, not the factors -- so they
-    measure the cost of a shared channel rather than clean recovery. A
-    separately-reported arm, not the default.
-``arm_c_content``
-    ``physical_content`` minus ``cube.size``, so ``n = 9``. Exists for arm C,
-    which rebuilds ``z`` from ``env.compute_ob_info()`` and so can only carry
-    latents with a ``privileged/*`` / ``proprio/*`` readback -- and which runs
-    under frozen appearance, where ``cube.size`` would have no variance to
-    recover anyway. Also the ``n`` that ``violations.py`` and
-    ``run_v4_calibration.py`` were calibrated against.
-``all_content``
-    Every content-capable latent is content, so ``n`` is large and there is no
-    continuous style left. Run as a scaling datapoint, not as a candidate
-    encoder: with no style resampled within a pair the transition operator no
-    longer separates content from appearance (every latent is equally slow), and
-    the photometric block is jointly non-identifiable from a single frame, which
-    puts it in the ``m > n_effective`` regime the theory declines to cover. The
-    style-invariance metric is vacuous under it.
+    The only shipped profile. The 9 physical DOFs plus ``cube.size``, so
+    ``n = 10`` at one cube. Everything else with a rendering channel is
+    ``style`` and is resampled independently within a pair;
+    ``camera.angle_delta`` is ``excluded`` and pinned.
+
+    The profiles that used to sit beside this one -- ``task_content`` (with
+    ``cube.color`` promoted), ``arm_c_content`` (physical readbacks only) and
+    ``all_content`` -- served comparisons between experimental arms that no
+    longer exist. Re-adding one is a dict of roles plus a line in
+    :data:`PROFILES`, which is the point of keeping the mechanism.
 """
 
 from dataclasses import dataclass, field
@@ -169,8 +156,6 @@ def _box(low, high, dim):
 def build_registry(
     env,
     yaw_half_arc=DEFAULT_YAW_HALF_ARC,
-    include_roll_pitch=False,
-    include_discrete=False,
     pos_z_max=0.15,
 ):
     """Enumerate the latents of a configured :class:`LeJEPACubeEnv`.
@@ -191,12 +176,6 @@ def build_registry(
             depends on. Widening this past ``pi/4`` reintroduces the 4-fold
             ambiguity and requires ``marker_enabled=True`` to stay
             identifiable at all.
-        include_roll_pitch: Whether to enumerate cube roll/pitch. Off under
-            the yaw-only decision; the sampler's tangent-space branch is
-            written but unused.
-        include_discrete: Whether the discrete latents enter ``z``. They are
-            renderable, hence content-capable, but have no Gaussian marginal
-            and are therefore a structural V1. Off by default.
         pos_z_max: Upper bound on cube height. Above the table by design:
             lifted and interpenetrating cubes are deliberately allowed, so
             that the induced V5 baseline is zero by construction in stage A.
@@ -214,13 +193,15 @@ def build_registry(
             'cube.pos_xy',
             2 * n_cubes,
             'physical',
-            *_box(np.tile(obj_lo, n_cubes), np.tile(obj_hi, n_cubes), 2 * n_cubes),
+            *_box(
+                np.tile(obj_lo, n_cubes), np.tile(obj_hi, n_cubes), 2 * n_cubes
+            ),
             channel='state',
             readback='privileged/block_{i}_pos',
             slice_=slice(0, 2),
             default_role='content',
             content_capable=True,
-            notes='Bounded by the environment\'s own object sampling bounds.',
+            notes="Bounded by the environment's own object sampling bounds.",
         )
     )
     latents.append(
@@ -257,23 +238,6 @@ def build_registry(
             f'between the arc extremes); no marker required.',
         )
     )
-    if include_roll_pitch:
-        latents.append(
-            Latent(
-                'cube.roll_pitch',
-                2 * n_cubes,
-                'physical',
-                *_box(-0.3, 0.3, 2 * n_cubes),
-                channel='state',
-                readback='privileged/block_{i}_quat',
-                slice_=slice(0, 4),
-                default_role='content',
-                content_capable=True,
-                notes='Off under the yaw-only decision. Enabling this '
-                'switches the sampler to its tangent-space branch.',
-            )
-        )
-
     arm_lo, arm_hi = env._arm_sampling_bounds
     latents.append(
         Latent(
@@ -286,7 +250,7 @@ def build_registry(
             slice_=slice(0, 3),
             default_role='content',
             content_capable=True,
-            notes='Reached by IK; round-trips to the solver\'s tolerance.',
+            notes="Reached by IK; round-trips to the solver's tolerance.",
         )
     )
     latents.append(
@@ -303,7 +267,7 @@ def build_registry(
             notes='Needs LeJEPACubeEnv.agent.ee_start_yaw; the stock env draws '
             'this from its own RNG. Restricted to [-pi/2, pi/2]: the jaws are '
             'symmetric under a pi rotation about the approach axis, so this '
-            'is one fundamental domain of the jaws\' 2-fold symmetry -- the '
+            "is one fundamental domain of the jaws' 2-fold symmetry -- the "
             'same quotient argument as cube.yaw.',
         )
     )
@@ -319,7 +283,7 @@ def build_registry(
             slice_=slice(0, 1),
             default_role='content',
             content_capable=True,
-            notes=f'Bounds are the linkage\'s *measured* achievable range '
+            notes=f"Bounds are the linkage's *measured* achievable range "
             f'[{grip_lo:.4f}, {grip_hi:.4f}], not [0, 1]: the actuator cannot '
             f'reach either joint limit, and sampling outside the achievable '
             f'band would put point masses at the endpoints.',
@@ -337,7 +301,11 @@ def build_registry(
             name,
             dim,
             'appearance',
-            *_box(np.asarray(axis.low).reshape(-1), np.asarray(axis.high).reshape(-1), dim),
+            *_box(
+                np.asarray(axis.low).reshape(-1),
+                np.asarray(axis.high).reshape(-1),
+                dim,
+            ),
             channel=f'variation:{axis_path}',
             readback=readback,
             slice_=slice(0, dim),
@@ -347,36 +315,70 @@ def build_registry(
         )
 
     latents += [
-        var_latent('cube.color', 'cube.color', 3 * n_cubes,
-                   'variation.cube.color',
-                   'Applied by a direct geom.rgba write.'),
-        var_latent('cube.size', 'cube.size', n_cubes, 'variation.cube.size',
-                   'Written post-compilation to model.geom_size. Mass and '
-                   'inertia go stale, which is sound only because the encoder '
-                   'path never steps physics.'),
-        var_latent('agent.color', 'agent.color', 3, 'variation.agent.color',
-                   'Post-compilation write to model.mat_rgba; renders '
-                   'bit-identically to the recompiled model.'),
-        var_latent('camera.angle_delta', 'camera.angle_delta', 2,
-                   'variation.camera.angle_delta',
-                   'Post-compilation write to model.cam_quat; renders '
-                   'bit-identically. Also the V6 occlusion knob.'),
-        var_latent('light.direction', 'light.direction', 6,
-                   'privileged/light_dir'),
-        var_latent('light.diffuse', 'light.diffuse', 6,
-                   'variation.light.diffuse'),
-        var_latent('light.ambient', 'light.ambient', 6,
-                   'variation.light.ambient'),
-        var_latent('light.specular', 'light.specular', 6,
-                   'variation.light.specular'),
-        var_latent('light.headlight_diffuse', 'light.headlight_diffuse', 3,
-                   'variation.light.headlight_diffuse'),
-        var_latent('background.floor_rgb', 'background.floor_rgb', 3,
-                   'privileged/floor_rgb',
-                   'Supersedes the inherited floor.color, which is pinned '
-                   'because it would force an MJCF recompile per frame.'),
-        var_latent('background.wall_rgb', 'background.wall_rgb', 3,
-                   'privileged/wall_rgb'),
+        var_latent(
+            'cube.color',
+            'cube.color',
+            3 * n_cubes,
+            'variation.cube.color',
+            'Applied by a direct geom.rgba write.',
+        ),
+        var_latent(
+            'cube.size',
+            'cube.size',
+            n_cubes,
+            'variation.cube.size',
+            'Written post-compilation to model.geom_size. Mass and '
+            'inertia go stale, which is sound only because the encoder '
+            'path never steps physics.',
+        ),
+        var_latent(
+            'agent.color',
+            'agent.color',
+            3,
+            'variation.agent.color',
+            'Post-compilation write to model.mat_rgba; renders '
+            'bit-identically to the recompiled model.',
+        ),
+        var_latent(
+            'camera.angle_delta',
+            'camera.angle_delta',
+            2,
+            'variation.camera.angle_delta',
+            'Post-compilation write to model.cam_quat; renders '
+            'bit-identically. Also the V6 occlusion knob.',
+        ),
+        var_latent(
+            'light.direction', 'light.direction', 6, 'privileged/light_dir'
+        ),
+        var_latent(
+            'light.diffuse', 'light.diffuse', 6, 'variation.light.diffuse'
+        ),
+        var_latent(
+            'light.ambient', 'light.ambient', 6, 'variation.light.ambient'
+        ),
+        var_latent(
+            'light.specular', 'light.specular', 6, 'variation.light.specular'
+        ),
+        var_latent(
+            'light.headlight_diffuse',
+            'light.headlight_diffuse',
+            3,
+            'variation.light.headlight_diffuse',
+        ),
+        var_latent(
+            'background.floor_rgb',
+            'background.floor_rgb',
+            3,
+            'privileged/floor_rgb',
+            'Supersedes the inherited floor.color, which is pinned '
+            'because it would force an MJCF recompile per frame.',
+        ),
+        var_latent(
+            'background.wall_rgb',
+            'background.wall_rgb',
+            3,
+            'privileged/wall_rgb',
+        ),
     ]
 
     # Floor digit distractors, only when the environment actually has them.
@@ -388,12 +390,24 @@ def build_registry(
     # `var_latent` would raise on the lookup.
     if env._num_digits > 0:
         latents += [
-            var_latent('digit.size', 'digit.size', env._num_digits,
-                       'privileged/digit_0_size'),
-            var_latent('digit.position', 'digit.position',
-                       2 * env._num_digits, 'privileged/digit_0_pos'),
-            var_latent('digit.yaw', 'digit.yaw', env._num_digits,
-                       'variation.digit.yaw'),
+            var_latent(
+                'digit.size',
+                'digit.size',
+                env._num_digits,
+                'privileged/digit_0_size',
+            ),
+            var_latent(
+                'digit.position',
+                'digit.position',
+                2 * env._num_digits,
+                'privileged/digit_0_pos',
+            ),
+            var_latent(
+                'digit.yaw',
+                'digit.yaw',
+                env._num_digits,
+                'variation.digit.yaw',
+            ),
         ]
 
     # `light.position` -- only the rows that actually reach a pixel. The
@@ -406,8 +420,12 @@ def build_registry(
         if row not in env._directional_light_rows
     ]
     if positioned:
-        low = np.asarray(space['light']['position'].low)[positioned].reshape(-1)
-        high = np.asarray(space['light']['position'].high)[positioned].reshape(-1)
+        low = np.asarray(space['light']['position'].low)[positioned].reshape(
+            -1
+        )
+        high = np.asarray(space['light']['position'].high)[positioned].reshape(
+            -1
+        )
         latents.append(
             Latent(
                 'light.position',
@@ -427,12 +445,23 @@ def build_registry(
         )
 
     # ---------------------------------------------------------- discrete
-    discrete_role = 'content' if include_discrete else 'style'
+    # Discrete latents are always style: they are renderable, and so
+    # content-capable, but a categorical has no Gaussian marginal and the OU
+    # sampler draws one.
+    discrete_role = 'style'
     discrete_specs = [
-        ('background.floor_material', 'background.floor_material',
-         env._num_bg_materials, 'privileged/floor_material'),
-        ('background.wall_material', 'background.wall_material',
-         env._num_bg_materials, 'privileged/wall_material'),
+        (
+            'background.floor_material',
+            'background.floor_material',
+            env._num_bg_materials,
+            'privileged/floor_material',
+        ),
+        (
+            'background.wall_material',
+            'background.wall_material',
+            env._num_bg_materials,
+            'privileged/wall_material',
+        ),
     ]
     if env._num_digits > 0:
         discrete_specs.append(
@@ -441,7 +470,10 @@ def build_registry(
     for name, axis_path, card, readback in discrete_specs:
         latents.append(
             Latent(
-                name, 1, 'discrete', *_box(0, card - 1, 1),
+                name,
+                1,
+                'discrete',
+                *_box(0, card - 1, 1),
                 channel=f'variation:{axis_path}',
                 readback=readback,
                 slice_=slice(0, 1),
@@ -455,13 +487,16 @@ def build_registry(
     if getattr(env, '_marker_enabled', False):
         latents.append(
             Latent(
-                'marker.value', 1, 'discrete', *_box(0, 9, 1),
+                'marker.value',
+                1,
+                'discrete',
+                *_box(0, 9, 1),
                 channel='variation:marker.value',
                 readback='privileged/marker_0_value',
                 slice_=slice(0, 1),
                 default_role=discrete_role,
                 content_capable=True,
-                notes='The yaw marker\'s digit. Structural V1, as above.',
+                notes="The yaw marker's digit. Structural V1, as above.",
             )
         )
 
@@ -552,9 +587,7 @@ class LatentRegistry:
 
         roles = {}
         for latent in self.latents:
-            role = profile.get(
-                latent.name, fallback or latent.default_role
-            )
+            role = profile.get(latent.name, fallback or latent.default_role)
             if role not in ('content', 'style', 'excluded'):
                 raise ValueError(
                     f'{latent.name}: role must be content, style or excluded; '
@@ -634,7 +667,10 @@ class LatentRegistry:
         total = 0
         for latent in latents:
             chunk = z[:, offsets[latent.name]]
-            raw = latent.center() + (latent.half_span() / self.sigma_span) * chunk
+            raw = (
+                latent.center()
+                + (latent.half_span() / self.sigma_span) * chunk
+            )
             bounded = np.clip(raw, latent.low, latent.high)
             clipped += int((raw != bounded).sum())
             total += bounded.size
@@ -642,17 +678,47 @@ class LatentRegistry:
 
         return values, (clipped / total if total else 0.0)
 
-    def to_z(self, values):
+    def to_z(self, values, missing='raise'):
         """Invert :meth:`to_physical`, for reading ground truth back.
 
         Args:
-            values: Map from latent name to ``(B, dim)`` physical values.
+            values: Map from latent name to ``(B, dim)`` physical values. It
+                may cover only some content latents -- see ``missing``.
+            missing: What to do about a content latent absent from ``values``.
+                ``'raise'`` (the default) refuses, because a silently-zeroed
+                coordinate would be scored as a recovered one. ``'nan'`` fills
+                its columns with NaN, which is what a caller comparing only the
+                readable coordinates wants: under the shipped profile
+                ``cube.size`` has no ``privileged/*`` / ``proprio/*`` readback,
+                so any round-trip through the simulator is necessarily partial.
 
         Returns:
             ndarray: ``(B, n)`` in z-space, content latents in registry order.
+
+        Raises:
+            KeyError: On a missing latent when ``missing='raise'``.
         """
+        if missing not in ('raise', 'nan'):
+            raise ValueError(
+                f"missing must be 'raise' or 'nan'; got {missing!r}."
+            )
+
+        rows = max(
+            (np.atleast_2d(np.asarray(v)).shape[0] for v in values.values()),
+            default=1,
+        )
         columns = []
         for latent in self.content:
+            if latent.name not in values:
+                if missing == 'raise':
+                    raise KeyError(
+                        f'{latent.name} is a content latent but was not '
+                        f'supplied. Pass missing="nan" to read back only the '
+                        'coordinates you have; filling it silently would '
+                        'score an absent coordinate as a recovered one.'
+                    )
+                columns.append(np.full((rows, latent.dim), np.nan))
+                continue
             physical = np.atleast_2d(
                 np.asarray(values[latent.name], dtype=np.float64)
             )
@@ -777,34 +843,17 @@ class LatentRegistry:
 # `identifiability.collect.excluded_payload`, not merely left unwritten -- see
 # that function for why "unwritten" was a shard-dependent nuisance.
 
-# n = 13 at n_cubes = 1: 9 physical DOFs + cube.color (3) + cube.size (1).
-# `cube.color` is content here, not style: the cube's own colour is treated as
-# task-relevant. Its 3 dims share a rendering channel with the lighting that
-# stays style (the image constrains albedo x illumination, not the factors), so
-# they measure the cost of a shared channel rather than clean recovery.
-TASK_CONTENT_PROFILE = {
-    '*': 'style',
-    'camera.angle_delta': 'excluded',
-    'cube.pos_xy': 'content',
-    'cube.pos_z': 'content',
-    'cube.yaw': 'content',
-    'cube.color': 'content',
-    'cube.size': 'content',
-    'effector.pos': 'content',
-    'effector.yaw': 'content',
-    'gripper.opening': 'content',
-}
-
-# The stage-A exit-criterion profile. n = 10 at n_cubes = 1: the 9 physical
-# DOFs plus `cube.size`.
+# The study's profile. n = 10 at n_cubes = 1: the 9 physical DOFs plus
+# `cube.size`.
 #
 # `cube.size` has no `privileged/*` / `proprio/*` readback -- it reads back from
 # `variation.cube.size` -- so it is scored from the recorded `latent/z` column,
-# exactly as `cube.color` is under `task_content`. That is sound here because it
+# from the recorded column alone. That is sound because it
 # is a direct post-compilation `model.geom_size` write with nothing in between
 # to clip or decouple, so there is no readback divergence for a physical
-# readback to detect. Consumers that need a readback for *every* content latent
-# want `arm_c_content` below instead.
+# readback to detect -- and it is the one latent whose presence in the *render*
+# no recorded column can confirm, which is worth knowing when it scores near
+# zero.
 PHYSICAL_CONTENT_PROFILE = {
     '*': 'style',
     'camera.angle_delta': 'excluded',
@@ -817,61 +866,15 @@ PHYSICAL_CONTENT_PROFILE = {
     'gripper.opening': 'content',
 }
 
-# Arm C rebuilds ``z`` from ``env.compute_ob_info()`` rather than from a
-# recorded ``latent/z`` column, and that dict carries only ``privileged/*`` and
-# ``proprio/*`` keys -- no ``variation.*`` axes. Every content latent here must
-# therefore have a *physical* readback, which is why this is a separate profile
-# rather than an override of `physical_content`: promoting an appearance latent
-# into it does not fail loudly, the collector's "every content latent readable"
-# gate silently rejects every frame and the run ends in "no usable trajectories
-# were collected".
-#
-# So this is `physical_content` minus `cube.size`. Arm C also runs under
-# `freeze_appearance: true`, so `cube.size` would be constant along its
-# trajectories and carry no variance to recover even if it could be read back.
-#
-# n = 9 at n_cubes = 1 -- the physical-only subtotal, and what `violations.py` /
-# `run_v4_calibration.py` were calibrated against.
-ARM_C_CONTENT_PROFILE = {
-    '*': 'style',
-    'camera.angle_delta': 'excluded',
-    'cube.pos_xy': 'content',
-    'cube.pos_z': 'content',
-    'cube.yaw': 'content',
-    'effector.pos': 'content',
-    'effector.yaw': 'content',
-    'gripper.opening': 'content',
-}
-
-# Discrete latents stay style even under all_content: they are renderable and
-# so content-capable, but have no Gaussian marginal at all -- a structural V1.
-# `digit.value` and `marker.value` are marked conditional ("?") because they
-# exist only when floor digits / the yaw marker are enabled, and both default
-# off in `LeJEPACubeEnv`.
-ALL_CONTENT_PROFILE = {
-    '*': 'content',
-    'camera.angle_delta': 'excluded',
-    'background.floor_material': 'style',
-    'background.wall_material': 'style',
-    '?digit.value': 'style',
-    '?marker.value': 'style',
-}
-
-PROFILES = {
-    'task_content': TASK_CONTENT_PROFILE,
-    'physical_content': PHYSICAL_CONTENT_PROFILE,
-    'arm_c_content': ARM_C_CONTENT_PROFILE,
-    'all_content': ALL_CONTENT_PROFILE,
-}
+#: Every shipped role assignment, by name. One entry: the study trains one
+#: encoder on one profile.
+PROFILES = {'physical_content': PHYSICAL_CONTENT_PROFILE}
 
 
 __all__ = [
-    'ALL_CONTENT_PROFILE',
-    'ARM_C_CONTENT_PROFILE',
     'NOT_CONTENT_CAPABLE',
     'PHYSICAL_CONTENT_PROFILE',
     'PROFILES',
-    'TASK_CONTENT_PROFILE',
     'Latent',
     'LatentRegistry',
     'build_registry',

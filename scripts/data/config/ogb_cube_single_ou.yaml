@@ -1,17 +1,17 @@
-# Encoder dataset for the LeJEPA identifiability study (Env 1, stage A).
+# Encoder dataset for the LeJEPA identifiability study.
 #
 # Every decision the research plan leaves open is a knob here, not a constant
-# in the code. The three blocks that matter are `program_constants` (frozen
-# before Env 1 and copied verbatim into every result row), `latents` (which
-# decides what z is, and therefore n), and `violation`.
+# in the code. Two blocks matter: `program_constants` (frozen, and copied
+# verbatim into every results row) and `latents` (which decides what z is, and
+# therefore n).
 
 defaults:
   - _self_
 
-# The profile is in the name on purpose. `physical_content` and
-# `task_content` are two different z's, so they are two different datasets;
-# sharing one filename would mean whichever ran last silently became "the"
-# encoder set, with only the manifest's config_hash to tell afterwards.
+# The profile is in the name on purpose: a different profile is a different z
+# and therefore a different dataset, and sharing one filename would mean
+# whichever ran last silently became "the" encoder set, with only the
+# manifest's config_hash to tell afterwards.
 #
 # Style probe for the style-invariance metric -- same collector, content held
 # fixed (see `program_constants.rho` below):
@@ -29,13 +29,16 @@ seed: 3072
 shard: 0
 num_shards: 1
 
-# Frozen before Env 1. Any run that deviates from these is flagged as a
-# first-class event in the scatter, so they live here rather than being passed
-# around per-script.
+# Frozen, and copied verbatim into every results row, so a run that deviates is
+# a visible event rather than a footnote.
+#
+# `lambda` is recorded here but NOT used by collection -- it is the encoder's
+# knob. Keep it equal to `lejepa.yaml`'s `program_constants.lambda` (5.0e-2);
+# they were 3.0e-3 and 5.0e-2 respectively for a while, and the stale value
+# landed in every row.
 program_constants:
   rho: 0.9          # mid-range of Fig. 6's best region, clear of the rho=0.99 collapse
-  lambda: 3.0e-3    # in [1e-3, 1e-2] per Fig. 6
-  seed_budget: 5
+  lambda: 5.0e-2    # App. H.11's best pixel setting at rho=0.9
 
 env:
   env_type: single
@@ -62,74 +65,41 @@ env:
     scale: 0.85
 
 latents:
-  # MUST match the `profile` every downstream config defaults to
-  # (lejepa.yaml, lejepa_predictor.yaml, metrics.yaml,
-  # ogb_cube_single_predictor.yaml). They interpolate it into the dataset name,
-  # so a disagreement here does not warn -- it just makes training look for a
-  # dataset collection never wrote.
+  # MUST match `profile` in lejepa.yaml and metrics.yaml. They interpolate it
+  # into the dataset name, so a disagreement here does not warn -- it just
+  # makes training look for a dataset collection never wrote.
   #
-  # 'physical_content' (n=10) is the stage-A exit-criterion profile: the 9
-  # physical DOFs plus cube.size. cube.size is content, not style, because it
-  # shares the apparent-footprint cue with cube.pos_z and dominates it -- as
-  # style it would demand a size-invariant height estimate from shading alone;
-  # as content it only has to span the subspace the two generate. See
+  # `physical_content` (n=10) is the only shipped profile: the 9 physical DOFs
+  # plus cube.size. cube.size is content, not style, because it shares the
+  # apparent-footprint cue with cube.pos_z and dominates it -- as style it
+  # would demand a size-invariant height estimate from shading alone; as
+  # content it only has to span the subspace the two generate. See
   # identifiability/latents.py for the measurements.
   #
-  # 'task_content' (n=13) additionally puts cube.color in z. Its 3 colour dims
-  # are entangled with the lighting that stays style -- the image constrains
-  # albedo x illumination, not the factors -- so they measure the cost of a
-  # shared rendering channel rather than clean recovery. A reported arm, not
-  # the default.
-  #
-  # 'arm_c_content' (n=9) is physical_content minus cube.size, for arm C, which
-  # needs a privileged/proprio readback for every content latent. It is also
-  # the n that violations.py / run_v4_calibration.py calibrate against.
-  #
-  # camera.angle_delta is 'excluded' in every profile: at +-10 deg it moves the
+  # camera.angle_delta is `excluded` and pinned: at +-10 deg it moves the
   # cube's image centroid 32-36 px, more than cube.pos_xy's x component moves
-  # across its entire range (24-31 px), so it was a nuisance larger than the
-  # signal. Pinned rather than promoted to content because eval holds the
-  # camera fixed.
-  #
-  # 'all_content' (n=54) leaves no continuous style at all, so the
-  # style-invariance metric is vacuous under it -- run as a scaling datapoint.
-  # Note its photometric block (ambient/diffuse/headlight/albedo) is jointly
-  # non-identifiable, so its recovery floor is set by the renderer, not the
-  # encoder.
+  # across its entire range (24-31 px), so it is a nuisance larger than the
+  # signal -- and eval holds the camera fixed anyway.
   profile: physical_content
 
   # One fundamental domain of the cube's C4 yaw symmetry (pi/4, less a 5%
   # margin so the arc's two endpoints -- which are the SAME configuration --
-  # cannot both collect clipped mass). Yaw is then identifiable from the
-  # silhouette alone, and the coordinate is a coordinate on the quotient
-  # rather than on the raw circle. Widening past pi/4 requires marker.enabled.
+  # cannot both collect clipped mass), making the coordinate one on the
+  # quotient rather than on the raw circle. Widening past pi/4 requires
+  # marker.enabled.
+  #
+  # Be careful reading a yaw-recovery number off this. Pixel separability is
+  # NOT monotone in angular error: measured at 224x224 on an unmarked cube,
+  # rms is 3.79 at 21 deg, 4.36 at 43 deg and 1.17 at 86 deg, because 90 deg
+  # *is* the identification. The arc is 85.5 deg wide, so its two endpoints are
+  # the LEAST separable pair in it, and yaw's observable signal is weakest
+  # exactly where the coordinate says the error is largest.
   yaw_half_arc: 0.7461282552275249
 
-  # Off under the yaw-only decision. The sampler's tangent-space branch is
-  # written and tested but unused.
-  include_roll_pitch: false
-
-  # Discrete latents are renderable and hence content-capable, but have no
-  # Gaussian marginal -- a structural V1. Off by default; when on, the
-  # monotone-recovery metric is reported instead of the linear one.
-  include_discrete: false
-
-  # Above the table on purpose. Lifted, table-clipped and interpenetrating
-  # cubes are all allowed, which is what makes the induced V5 baseline zero by
-  # construction in stage A.
+  # Above the table on purpose: lifted, table-clipped and interpenetrating
+  # cubes are all allowed, so no occlusion or support effect is smuggled in
+  # through the height range.
   pos_z_max: 0.15
-
-# Sampler knobs not driven by `violation`. A violation's own kwargs override
-# whatever is set here, so the two cannot silently disagree.
-ou:
-  dist: gaussian
-  alpha: null
-  noise_coupling: 0.0
-  cross_corr: 0.0
-
-violation:
-  name: none
-  severity: 0.0
 
 style:
   # Style latents are resampled *within* a pair -- the two views get
@@ -158,6 +128,6 @@ style:
   #
   # Legal only because BOTH axes are style here: two style axes may be made
   # dependent on each other, but rejecting on a *content* coordinate would
-  # truncate its marginal. Under `task_content`, where cube.color is content,
-  # the collector disables this and says so.
+  # truncate its marginal. The collector checks and disables itself, loudly,
+  # under any profile where cube.color is content.
   min_contrast: 0.2

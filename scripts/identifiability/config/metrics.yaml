@@ -1,59 +1,59 @@
-# Scoring a checkpoint with the frozen metric suite.
+# Scoring an encoder checkpoint with the frozen metric suite.
 
 defaults:
   - _self_
 
 checkpoint: ???
-arm: A
 
-# BOTH are required for a complete row. The encoder trains on OU-set states and
-# the planner only ever sees rollouts; the gap between them is a measurement,
-# not a nuisance to be asserted away.
 profile: physical_content
 ou_dataset: ogbench/cube_single_ou_${profile}.lance
-rollout_dataset: ogbench/cube_single_predictor.lance
 
-# Same-content/different-style probe, for the style-invariance metric: the
-# term the alignment loss is supposed to discard, and the only thing that
-# distinguishes `task_content` from Thm 1's setting. Collect it with the OU
-# collector at `program_constants.rho=0.99999999`: the sampler rejects rho=1
-# outright (the paper's rho lies strictly in (0, 1)), and at 1-1e-8 the
-# residual content drift is ~7e-4 in z units -- sub-pixel once rendered,
-# against ~2.0 for a real step at rho=0.9. So the two views of each pair share
-# their content for all practical purposes and differ only in style.
-# Vacuous under `all_content` (no continuous style left); null skips it.
+# Same-content/different-style probe, for the style-invariance metric: the term
+# the alignment loss is supposed to discard. Collect it with the OU collector at
+# `program_constants.rho=0.99999999` -- the sampler rejects rho=1 outright (the
+# paper's rho lies strictly in (0, 1)), and at 1-1e-8 the residual content drift
+# is ~7e-4 in z units, sub-pixel once rendered, against ~2.0 for a real step at
+# rho=0.9. So the two views share their content for all practical purposes and
+# differ only in style.
 #
-# ARMED BY DEFAULT. It is not optional instrumentation: with style redrawn per
-# view, `epsilon` cannot distinguish "recovered the latent" from "filled the
-# output direction with style noise" -- both give epsilon ~ 0. sigma_sq is the
-# only quantity that separates them, and it also enters the alignment floor as
-# 2*rho*sigma_sq and the alignment gap as delta = delta_content + 2*rho*sigma_sq,
-# so without it the reported bound attributes style leakage to nonlinearity.
+# ARMED BY DEFAULT, and it is not optional instrumentation. With style redrawn
+# per view, `epsilon` cannot tell "recovered the latent" from "filled the output
+# direction with style noise" -- both give epsilon ~ 0. `sigma_sq` is the only
+# quantity that separates them, and it also enters the alignment floor as
+# 2*rho*sigma_sq and the gap as delta = delta_content + 2*rho*sigma_sq, so
+# without it the reported bound charges style leakage to nonlinearity.
 #
-# Collect it before running the suite:
 #   python scripts/data/collect_cube_single_ou.py \
-#       dataset_name=ogbench/cube_single_ou_style_${latents.profile}.lance \
+#       dataset_name=ogbench/cube_single_ou_style_${profile}.lance \
 #       program_constants.rho=0.99999999 num_pairs=20000
 #
 # Set to null only to deliberately record a row without it; `has_style_probe`
-# in the scatter says which rows have it.
+# says which rows have one.
 style_dataset: ogbench/cube_single_ou_style_${profile}.lance
+
+# Refresh BatchNorm running statistics over the eval set before scoring, with
+# the weights frozen. ON by default: the default `momentum=0.1` is a ~10-batch
+# window, and under a constant learning rate the weights never settle, so the
+# statistics a checkpoint carries are both noisy and stale -- and eval mode is
+# how every reported number is computed. `bn_recalibrated` is recorded per row,
+# so turn this off only to measure the size of the effect, and expect the two
+# rows to differ.
+recalibrate_batchnorm: true
 
 cache_dir: null
 max_samples: 20000
 seed: 3072
 device: cuda
 
-# Success rates from `scripts/plan/eval_wm.py`, supplying both y-axes.
-success_rate: null
-success_rate_oracle: null
-success_rate_state: null
+# Append-only, written from the first run onward: `config_hash`, the `rho` the
+# metrics were computed against and the encoder hash cannot be reconstructed
+# after the fact. A re-score appends; the reader takes the last row per
+# (checkpoint, dataset).
+results_path: outputs/lejepa_results.jsonl
 
-# Append-only, written from the first run onward: several of its columns
-# cannot be reconstructed after the fact.
-scatter_path: outputs/lejepa_scatter.jsonl
-
+# Copied verbatim into every row, so a run that deviates is a visible event.
+# `lambda` MUST match what the encoder was trained at -- it is recorded, not
+# used, and a mismatch makes two rows silently incomparable.
 program_constants:
   rho: 0.9
-  lambda: 3.0e-3
-  seed_budget: 5
+  lambda: 5.0e-2

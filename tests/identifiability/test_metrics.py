@@ -1,600 +1,510 @@
 """Tests for the frozen metric suite.
 
-The plan (SS7.1) demands two adversarial tests be written **before** any real
-encoder run, because both failure modes are invisible on real data: a suite
-that rejects correct encoders looks like an encoder problem, and a decoy metric
-that silently tracks the criterion looks like corroboration. They come first
-here for the same reason.
+Organised around the three things the suite has to get right, because each
+failed in a way that cost real time:
+
+**The identities.** ``procrustes_mse_per_dim`` and the probe R^2 are two
+summaries of one canonical spectrum, and the bound's ``D`` has a floor that is
+a plain function of them. Those relations are asserted, not trusted: they are
+what lets a pair of reported numbers be inverted into "how many directions did
+it actually find", and a silent drift in either would make every historical row
+uninterpretable.
+
+**The admissibility gate.** ``delta`` below its Hermite floor is impossible for
+any style-invariant encoder, so a row reporting it was measured on embeddings
+that are not a function of one frame. This is the check that caught a 20x
+discrepancy between train-mode and eval-mode diagnostics, and it has to fire on
+that case and stay quiet on honest ones.
+
+**The probes.** The linear/non-linear pair only means something if the
+non-linear rung is neither weaker than linear (it was, as a random-feature
+ridge) nor able to manufacture signal that is not there (it did, at -0.24 R^2,
+before best-epoch selection).
 """
 
 import numpy as np
 import pytest
 
-# The new bound-decomposition tests reach for several functions at once, so the
-# module is imported alongside the flat names the older tests use.
 from stable_worldmodel.identifiability import metrics
 from stable_worldmodel.identifiability.metrics import (
-    METRIC_SUITE_VERSION,
+    DEAD_LATENT_R2,
+    alignment_floor,
     alignment_gap,
-    bidirectional_r2,
+    bound_reach,
+    canonical_correlations,
     compute_all,
-    hermite2_substitution,
-    in_gap_units,
-    mcc_unaligned,
-    monotone_recovery,
+    delta_admissibility,
+    observability_ceiling,
     orthogonality_gap,
     predicted_error,
     probe_accessibility,
-    probe_divergence,
     procrustes_recovery,
-    sigreg_z_score,
+    r2,
+    spectrum,
+    split_alignment_gap,
     style_invariance,
-    whitening_error,
+    style_variance,
 )
 
 
-B = 4000
-N = 8
+N = 10
+RHO = 0.9
+SAMPLES = 20000
+
+
+def he2(x):
+    """Second Hermite function, normalised to unit variance."""
+    return (x**2 - 1.0) / np.sqrt(2.0)
 
 
 @pytest.fixture
-def rng():
-    return np.random.default_rng(0)
-
-
-def random_orthogonal(n, rng):
-    q, r = np.linalg.qr(rng.standard_normal((n, n)))
-    return q * np.sign(np.diag(r))
-
-
-# ====================================================================
-#  The two tests the plan demands first
-# ====================================================================
-
-
-def test_orthogonal_map_scores_at_floor_and_need_not_score_on_mcc(rng):
-    """Adversarial test 1: the suite must not reject a correct encoder.
-
-    Theory predicts identification **up to an orthogonal transform**, so
-    ``h = Qz`` for a random ``Q`` in ``O(n)`` is a *perfect* result. Procrustes
-    recovery must therefore sit at floor -- and unaligned MCC must **not** be
-    required to, because greedy matching admits permutations but not rotations
-    and would penalise exactly this solution.
-
-    An exit criterion built on MCC would reject correct encoders. This test is
-    the guard against writing one.
-    """
-    z = rng.standard_normal((B, N))
-    q = random_orthogonal(N, rng)
-    h = z @ q.T
-
-    recovery = procrustes_recovery(z, h)
-    assert recovery['procrustes_mse_per_dim'] < 1e-12, recovery
-
-    gap = orthogonality_gap(z, h)
-    assert gap['orth_err_normalized'] < 1e-9
-    assert gap['cond'] == pytest.approx(1.0, abs=1e-6)
-
-    # ...and MCC is free to be poor. Asserting it *is* poor for a generic
-    # rotation is what makes the point rather than merely allowing it.
-    mcc = mcc_unaligned(z, h)
-    assert mcc['mcc_unaligned'] < 0.95
-    assert 'never a gate' in mcc['mcc_note']
-
-
-def test_wide_embedding_is_probeable_while_failing_recovery(rng):
-    """Adversarial test 2: the decoy must decouple from the criterion.
-
-    With ``m >> n`` on restricted-support ``z``, a random wide embedding
-    retains the latents linearly -- a probe reads them out easily -- while
-    being nowhere near an orthogonal image of ``z``. If probe accessibility
-    tracked recovery here, it would corroborate rather than contrast, and
-    SS2.5's whole argument would be untestable.
-    """
-    n, m = 4, 96
-    z = rng.uniform(-1.0, 1.0, (B, n))  # restricted support
-    projection = rng.standard_normal((m, n))
-    h = z @ projection.T + 0.01 * rng.standard_normal((B, m))
-
-    probe = probe_accessibility(h, z)
-    assert probe['probe_linear_r2'] > 0.95, probe
-
-    gap = orthogonality_gap(z, h)
-    assert gap['orth_err_normalized'] > 0.5, gap
-
-    assert probe_divergence(
-        probe['probe_linear_r2'], gap['orth_err_normalized']
-    ) > 0.2
-
-
-# ====================================================================
-#  Recovery
-# ====================================================================
-
-
-def test_procrustes_is_invariant_to_rotation_of_h(rng):
-    """A rotated embedding is the same result, so the score must not move."""
-    z = rng.standard_normal((B, N))
-    h = z @ random_orthogonal(N, rng).T + 0.1 * rng.standard_normal((B, N))
-
-    base = procrustes_recovery(z, h)['procrustes_mse_per_dim']
-    rotated = procrustes_recovery(
-        z, h @ random_orthogonal(N, rng).T
-    )['procrustes_mse_per_dim']
-    assert rotated == pytest.approx(base, rel=1e-6)
-
-
-def test_procrustes_degrades_with_noise(rng):
-    z = rng.standard_normal((B, N))
-    q = random_orthogonal(N, rng)
-    errors = [
-        procrustes_recovery(z, z @ q.T + noise * rng.standard_normal((B, N)))[
-            'procrustes_mse_per_dim'
-        ]
-        for noise in (0.0, 0.1, 0.5, 1.0)
-    ]
-    assert all(a < b for a, b in zip(errors, errors[1:]))
-
-
-def test_per_dim_normalisation_makes_widths_comparable(rng):
-    """Without it, a wider profile looks worse for no reason but its width."""
-    per_dim = []
-    for n in (4, 16, 64):
-        z = rng.standard_normal((B, n))
-        h = z @ random_orthogonal(n, rng).T + 0.3 * rng.standard_normal((B, n))
-        per_dim.append(
-            procrustes_recovery(z, h)['procrustes_mse_per_dim']
-        )
-    assert max(per_dim) / min(per_dim) < 1.3, per_dim
-
-
-def test_condition_number_catches_what_the_frobenius_gap_misses(rng):
-    """A well-fitting but ill-conditioned map still ruins planning.
-
-    A near-singular direction means the planner's cost is nearly flat along a
-    latent that physically matters. ``cond`` must flag that.
-    """
-    z = rng.standard_normal((B, N))
-    scale = np.ones(N)
-    scale[0] = 1e-3
-    h = z * scale
-
-    gap = orthogonality_gap(z, h)
-    assert gap['cond'] > 100, gap
-
-
-# ====================================================================
-#  Diagnostics
-# ====================================================================
-
-
-def test_bidirectional_r2_separates_the_two_directions(rng):
-    """``h`` can contain ``z`` without being a linear image of it."""
-    z = rng.standard_normal((B, 1))
-    h = np.column_stack([z[:, 0] ** 2 - 1.0, rng.standard_normal(B)])
-
-    scores = bidirectional_r2(z, h)
-    assert scores['r2_z_to_h'] < 0.2
-    assert scores['r2_h_to_z'] < 0.2
-
-    linear = bidirectional_r2(z, np.column_stack([z[:, 0], z[:, 0] * 2]))
-    assert linear['r2_z_to_h'] > 0.99
-
-
-def test_hermite2_detects_the_v4_substitution(rng):
-    """The predicted V4 failure: ``He2`` of a latent in place of the latent."""
-    z = rng.standard_normal((B, 3))
-    substituted = np.column_stack(
-        [z[:, 0] ** 2 - 1.0, z[:, 1], z[:, 2]]
-    )
-    faithful = z.copy()
-
-    bad = hermite2_substitution(z, substituted, slow_index=0)
-    good = hermite2_substitution(z, faithful, slow_index=0)
-    assert bad['hermite2_excess'] > good['hermite2_excess']
-    assert bad['hermite2_r2'] > 0.3
-
-
-def test_hermite2_picks_the_slowest_latent_from_rho(rng):
-    z = rng.standard_normal((B, 3))
-    result = hermite2_substitution(z, z, rho=[0.95, 0.6, 0.9])
-    assert result['hermite2_slow_index'] == 1
-
-
-def test_monotone_recovery_forgives_a_monotone_warp(rng):
-    """Env 1's latents are not i.i.d. and some have no Gaussian marginal."""
-    z = rng.standard_normal((B, 3))
-    warped = np.sign(z) * np.abs(z) ** 1.7
-
-    linear = procrustes_recovery(z, warped)['procrustes_mse_per_dim']
-    monotone = monotone_recovery(z, warped)['monotone_mse_per_dim']
-    assert monotone < linear
-
-
-@pytest.mark.parametrize('mode', ['per_latent', 'shared'])
-def test_monotone_recovery_reports_both_modes(mode, rng):
-    z = rng.standard_normal((500, 3))
-    result = monotone_recovery(z, z, mode=mode)
-    assert result['monotone_mode'] == mode
-    assert np.isfinite(result['monotone_mse_per_dim'])
-
-
-# ====================================================================
-#  The bound
-# ====================================================================
-
-
-def test_whitening_error_is_zero_for_whitened_data(rng):
-    z = rng.standard_normal((40_000, 6))
-    z = (z - z.mean(0)) / z.std(0)
-    assert whitening_error(z) < 0.15
-
-
-def test_alignment_gap_is_zero_for_an_exact_ou_step(rng):
-    """A faithful embedding of the OU process has no *excess* pair distance."""
-    rho = 0.9
-    z = rng.standard_normal((40_000, 6))
-    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((40_000, 6))
-
-    assert alignment_gap(z, z_next, rho) < 0.4
-
-
-def test_alignment_gap_is_clamped_at_zero(rng):
-    """A negative delta would produce a negative D and an unreadable bound."""
-    z = rng.standard_normal((200, 4))
-    assert alignment_gap(z, z, 0.9) >= 0.0
-
-
-def test_predicted_error_flags_anisotropy(rng):
-    """A single number standing in for a spread must say so."""
-    iso = predicted_error(0.1, 0.05, 0.9)
-    aniso = predicted_error(0.1, 0.05, [0.8, 0.95])
-    assert iso['anisotropic'] is False
-    assert aniso['anisotropic'] is True
-    assert aniso['spectral_gap'] == pytest.approx(2 * 0.875 * 0.125)
-
-
-def test_predicted_error_grows_with_both_terms():
-    base = predicted_error(0.1, 0.05, 0.9)['predicted_error']
-    assert predicted_error(0.3, 0.05, 0.9)['predicted_error'] > base
-    assert predicted_error(0.1, 0.20, 0.9)['predicted_error'] > base
-
-
-def test_gap_units_make_costs_comparable_across_rho():
-    """Same cost, different rho, different gap -- the point of the unit."""
-    assert in_gap_units(0.18, 0.9) == pytest.approx(1.0)
-    assert in_gap_units(0.5, 0.5) == pytest.approx(1.0)
-
-
-# ====================================================================
-#  SIGReg audit
-# ====================================================================
-
-
-def test_sigreg_z_score_is_near_zero_for_gaussian_data(rng):
-    """The floor must be recomputed at *our* sample size, not assumed."""
-    result = sigreg_z_score(rng.standard_normal((5000, 6)), seed=0)
-    assert abs(result['sigreg_z']) < 4.0, result
-
-
-def test_sigreg_z_score_flags_a_non_gaussian_marginal(rng):
-    gaussian = sigreg_z_score(rng.standard_normal((5000, 6)), seed=0)
-    uniform = sigreg_z_score(rng.uniform(-1.7, 1.7, (5000, 6)), seed=0)
-    assert uniform['sigreg_z'] > gaussian['sigreg_z'] + 3.0
-
-
-# ====================================================================
-#  Style
-# ====================================================================
-
-
-def test_style_invariance_is_zero_for_an_invariant_encoder(rng):
-    h = rng.standard_normal((500, 8))
-    result = style_invariance(h, h.copy())
-    assert result['style_sensitivity'] == pytest.approx(0.0)
-    assert result['style_vacuous'] is True
-
-
-def test_style_invariance_grows_with_sensitivity(rng):
-    h = rng.standard_normal((2000, 8))
-    weak = style_invariance(h, h + 0.01 * rng.standard_normal((2000, 8)))
-    strong = style_invariance(h, h + 1.0 * rng.standard_normal((2000, 8)))
-    assert strong['style_sensitivity'] > 10 * weak['style_sensitivity']
-
-
-# ====================================================================
-#  Suite-level contracts
-# ====================================================================
-
-
-def test_compute_all_returns_finite_metrics(rng):
-    rho = 0.9
-    z = rng.standard_normal((2000, 6))
-    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((2000, 6))
-    q = random_orthogonal(6, rng)
-
-    out = compute_all(z, z @ q.T, z_next, z_next @ q.T, rho=rho)
-    for key, value in out.items():
-        if isinstance(value, float):
-            assert np.isfinite(value), f'{key} is {value}'
-
-
-def test_compute_all_records_the_suite_version(rng):
-    """A metric that moves mid-programme must at least become visible."""
-    z = rng.standard_normal((500, 4))
-    out = compute_all(z, z, rho=0.9)
-    assert out['metric_suite_version'] == METRIC_SUITE_VERSION
-
-
-def test_perfect_recovery_beats_a_random_encoder(rng):
-    """The end-to-end sanity check: the criterion orders the obvious cases."""
-    z = rng.standard_normal((2000, 6))
-    good = compute_all(z, z @ random_orthogonal(6, rng).T, rho=0.9)
-    bad = compute_all(z, rng.standard_normal((2000, 6)), rho=0.9)
-
-    assert good['procrustes_mse_per_dim'] < bad['procrustes_mse_per_dim']
-    assert good['orth_err_normalized'] < bad['orth_err_normalized']
-    assert good['r2_h_to_z'] > bad['r2_h_to_z']
-
-
-# --------------------------------------------------- style variance and delta
-
-
-def _linear_encoder_with_style(n=8, batch=20000, rho=0.9, style_sd=0.2, seed=0):
-    """An encoder that is *exactly* linear, plus style noise of known variance.
-
-    Everything below is checked against this, because it is the case where the
-    right answer is known: `delta_content` must be zero no matter how much
-    style leaks, since `phi` has no nonlinearity at all.
-    """
-    rng = np.random.default_rng(seed)
-    q, _ = np.linalg.qr(rng.standard_normal((n, n)))
-    z = rng.standard_normal((batch, n))
-    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((batch, n))
-
-    def noise():
-        return style_sd * rng.standard_normal((batch, n))
-
-    return {
-        'n': n,
-        'rho': rho,
-        'sigma_sq': n * style_sd**2,
-        'h': z @ q.T + noise(),
-        'h_next': z_next @ q.T + noise(),
-        'style_a': z @ q.T + noise(),
-        'style_b': z @ q.T + noise(),
-    }
-
-
-def test_style_variance_recovers_the_injected_variance():
-    """sigma^2 = E||xi||^2, from a probe whose two views share content."""
-    case = _linear_encoder_with_style()
-    out = metrics.style_variance(case['style_a'], case['style_b'])
-    assert out['sigma_sq'] == pytest.approx(case['sigma_sq'], rel=0.05)
-    assert out['sigma_sq_per_dim'] == pytest.approx(
-        case['sigma_sq'] / case['n'], rel=0.05
-    )
-
-
-def test_alignment_floor_rises_with_style():
-    """The floor is 2(1-rho)n + 2*rho*sigma^2, not Thm 1's 2(1-rho)n.
-
-    Comparing an observed loss against the deterministic floor reads a
-    style-invariant encoder as if it had failed to align.
-    """
-    case = _linear_encoder_with_style()
-    out = metrics.alignment_floor(case['n'], case['rho'], case['sigma_sq'])
-
-    deterministic = 2 * (1 - case['rho']) * case['n']
-    assert out['align_floor_deterministic'] == pytest.approx(deterministic)
-    assert out['align_floor_style_term'] == pytest.approx(
-        2 * case['rho'] * case['sigma_sq']
-    )
-    assert out['align_floor'] > out['align_floor_deterministic']
-
-    # Zero style recovers the theorem's floor exactly.
-    assert metrics.alignment_floor(case['n'], case['rho'], 0.0)[
-        'align_floor'
-    ] == pytest.approx(deterministic)
-
-
-def test_delta_splits_style_leakage_out_of_nonlinearity():
-    """The regression this guards: `delta` is not all nonlinear energy.
-
-    For an encoder that is exactly linear, every bit of `delta` is style, so
-    `delta_content` must come out at zero. Feeding the total into the bound
-    instead attributes style to nonlinearity -- and since the bound squares it,
-    the error is large enough to flip the verdict.
-    """
-    case = _linear_encoder_with_style()
-    delta = metrics.alignment_gap(case['h'], case['h_next'], case['rho'])
-    sigma_sq = metrics.style_variance(case['style_a'], case['style_b'])[
-        'sigma_sq'
-    ]
-    split = metrics.split_alignment_gap(delta, case['rho'], sigma_sq)
-
-    assert split['delta_total'] == pytest.approx(delta)
-    assert split['delta_style'] == pytest.approx(
-        2 * case['rho'] * case['sigma_sq'], rel=0.05
-    )
-    # The encoder is linear, so the nonlinear energy is zero.
-    assert split['delta_content'] == pytest.approx(0.0, abs=1e-2)
-
-    epsilon = metrics.whitening_error(case['h'])
-    honest = metrics.predicted_error(epsilon, split['delta_content'], case['rho'])
-    misattributed = metrics.predicted_error(
-        epsilon, split['delta_total'], case['rho']
-    )
-    assert honest['predicted_error'] < misattributed['predicted_error'] / 100
-    assert not metrics.bound_is_vacuous(
-        honest['predicted_error'], case['n']
-    )['bound_vacuous']
-    assert metrics.bound_is_vacuous(
-        misattributed['predicted_error'], case['n']
-    )['bound_vacuous']
-
-
-def test_delta_is_never_negative_under_sampling_noise():
-    """A negative gap yields a negative D and an uninterpretable bound."""
-    split = metrics.split_alignment_gap(0.01, 0.9, sigma_sq=5.0)
-    assert split['delta_content'] == 0.0
-
-
-def test_compute_all_uses_delta_content_for_the_bound():
-    """End-to-end: the suite must not feed the raw gap into the bound."""
-    case = _linear_encoder_with_style()
-    rng = np.random.default_rng(1)
-    z = rng.standard_normal((len(case['h']), case['n']))
-
-    with_probe = metrics.compute_all(
-        z, case['h'], h_next=case['h_next'], rho=case['rho'],
-        h_style_a=case['style_a'], h_style_b=case['style_b'],
-    )
-    without = metrics.compute_all(
-        z, case['h'], h_next=case['h_next'], rho=case['rho'],
-    )
-
-    assert with_probe['has_style_probe'] is True
-    assert without['has_style_probe'] is False
-    # Absent a probe the two coincide, so the bound is the pessimistic one.
-    assert without['delta_content'] == pytest.approx(without['delta_total'])
-    assert with_probe['delta_content'] < with_probe['delta_total']
-    assert with_probe['predicted_error'] < without['predicted_error']
-    assert with_probe['align_floor'] > with_probe['align_floor_deterministic']
-
-
-def test_training_diagnostics_match_the_metric_suite():
-    """The logged `bound/*` keys must be the same quantities the suite reports.
-
-    They are computed in torch on a batch and in numpy on the eval set, so a
-    unit mismatch between them would be invisible -- and the whole point of the
-    training-time numbers is that they are comparable to the suite's.
-    """
-    torch = pytest.importorskip('torch')
-    from stable_worldmodel.wm.lejepa.losses import alignment_diagnostics
-
-    case = _linear_encoder_with_style()
-    h = torch.stack(
-        [torch.tensor(case['h']), torch.tensor(case['h_next'])]
-    )
-    logged = alignment_diagnostics(h, case['rho'])
-
-    assert logged['epsilon'].item() == pytest.approx(
-        metrics.whitening_error(case['h']), rel=1e-6
-    )
-    assert logged['delta'].item() == pytest.approx(
-        metrics.alignment_gap(case['h'], case['h_next'], case['rho']),
-        rel=1e-6,
-    )
-    # `L` is the paper's sum-over-dims loss, which is 4n times the repo's
-    # per-element `alignment_loss`.
-    from stable_worldmodel.wm.lejepa.losses import alignment_loss
-
-    assert logged['L'].item() == pytest.approx(
-        4 * case['n'] * alignment_loss(h).item(), rel=1e-6
-    )
-
-
-def test_live_recovery_diagnostics_match_the_metric_suite():
-    """`recovery/*` logged during training must be the suite's own numbers.
-
-    They exist to kill a broken run inside the first epoch instead of at the
-    tenth, which only works if they are on the same scale as the scatter
-    columns they share a name with. One is a torch port on a batch, the other
-    numpy on the eval set, so nothing but a test keeps them in step.
-
-    The encoder here is deliberately imperfect -- an anisotropic scaling, a
-    second-Hermite term and observation noise on top of a rotation -- so every
-    metric sits away from its trivial value and a disagreement has room to show.
-    """
-    torch = pytest.importorskip('torch')
-    from stable_worldmodel.wm.lejepa.losses import recovery_diagnostics
-
+def pair():
+    """``(z, z_next)``: one OU step at ``rho``, standard normal marginal."""
     rng = np.random.default_rng(0)
-    n, batch, rho = 10, 4096, 0.9
-    q, _ = np.linalg.qr(rng.standard_normal((n, n)))
-    scale = np.linspace(0.4, 1.3, n)
+    z = rng.standard_normal((SAMPLES, N))
+    z_next = RHO * z + np.sqrt(1.0 - RHO**2) * rng.standard_normal(
+        (SAMPLES, N)
+    )
+    return z, z_next
 
-    z = rng.standard_normal((batch, n))
-    z_next = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((batch, n))
 
-    def encode(x):
-        return (x * scale) @ q.T + 0.12 * (x**2 - 1) + 0.05 * rng.standard_normal(x.shape)
+def mixed(z, n_linear):
+    """``n_linear`` coordinates carried linearly, the rest as ``He2``.
 
-    h, h_next = encode(z), encode(z_next)
+    The canonical "partially recovered" encoder: linearly readable in
+    ``n_linear`` directions, and filling the remaining output dimensions with
+    degree-2 functions of the latents it did not keep. Isotropic either way, so
+    whitening looks finished while most of ``z`` is not recoverable.
+    """
+    return np.concatenate([z[:, :n_linear], he2(z[:, n_linear:])], axis=1)
 
-    # The suite gets exactly what the torch port pools internally: both views
-    # stacked, in the same order.
-    pooled_z = np.concatenate([z, z_next])
-    pooled_h = np.concatenate([h, h_next])
-    expected = {}
-    expected.update(metrics.procrustes_recovery(pooled_z, pooled_h))
-    expected.update(metrics.orthogonality_gap(pooled_z, pooled_h))
-    expected.update(metrics.bidirectional_r2(pooled_z, pooled_h))
 
-    logged = recovery_diagnostics(
-        torch.stack([torch.tensor(h), torch.tensor(h_next)]),
-        torch.stack([torch.tensor(z), torch.tensor(z_next)]),
+# ------------------------------------------------------------- identities
+
+
+def test_procrustes_decodes_from_trace_and_scale(pair):
+    """``mse_per_dim = (tr Cov(h) + n - 2 sum sigma) / n``.
+
+    The identity that makes the metric readable. It is also why the metric is
+    not a fraction-recovered: the decode has ``tr Cov(h)`` in it.
+    """
+    z, _ = pair
+    h = mixed(z, 4)
+    result = procrustes_recovery(z, h)
+    # Empirical traces, not the nominal n: z is unit-variance *by
+    # construction* but not exactly so in any finite sample, and the identity
+    # is about what was measured.
+    expected = (
+        spectrum(h)['trace_cov']
+        + spectrum(z)['trace_cov']
+        - 2.0 * result['procrustes_scale'] * N
+    ) / N
+    assert result['procrustes_mse_per_dim'] == pytest.approx(
+        expected, rel=1e-3
+    )
+
+
+def test_zero_embedding_scores_one_not_two(pair):
+    """``h = 0`` scores 1.0, so a curve starting near 1.0 is leaving the trivial encoder."""
+    z, _ = pair
+    assert procrustes_recovery(z, np.zeros_like(z))[
+        'procrustes_mse_per_dim'
+    ] == pytest.approx(1.0, rel=0.02)
+
+
+def test_isotropic_but_uninformative_embedding_scores_two(pair):
+    """An embedding with full variance and no information scores 2.0, not 1.0."""
+    z, _ = pair
+    noise = np.random.default_rng(1).standard_normal(z.shape)
+    assert procrustes_recovery(z, noise)[
+        'procrustes_mse_per_dim'
+    ] == pytest.approx(2.0, rel=0.02)
+
+
+def test_perfect_rotation_scores_zero(pair):
+    """Theory identifies ``z`` only up to an orthogonal map, so ``h = Qz`` is perfect."""
+    z, _ = pair
+    q = np.linalg.qr(np.random.default_rng(2).standard_normal((N, N)))[0]
+    assert procrustes_recovery(z, z @ q.T)['procrustes_mse_per_dim'] < 1e-9
+
+
+def test_recovered_dimensions_equals_n_times_mean_probe_r2(pair):
+    """``sum sigma^2`` is the same quantity the per-latent probe means."""
+    z, _ = pair
+    h = mixed(z, 4)
+    recovered = canonical_correlations(z, h)['recovered_dimensions']
+    assert recovered == pytest.approx(N * r2(h, z), rel=0.02)
+    assert recovered == pytest.approx(4.0, abs=0.15)
+
+
+def test_canonical_participation_counts_directions_not_strength(pair):
+    """Six directions at 0.7 and three at 1.0 are different facts."""
+    z, _ = pair
+    strong = canonical_correlations(z, mixed(z, 3))
+    spread = canonical_correlations(
+        z, np.sqrt(0.5) * z + np.sqrt(0.5) * he2(z)
+    )
+    assert strong['canonical_participation'] == pytest.approx(3.0, abs=0.2)
+    assert spread['canonical_participation'] == pytest.approx(N, abs=0.5)
+
+
+def test_orthogonality_gap_is_zero_for_a_rotation(pair):
+    z, _ = pair
+    q = np.linalg.qr(np.random.default_rng(3).standard_normal((N, N)))[0]
+    result = orthogonality_gap(z, z @ q.T)
+    assert result['orth_err_normalized'] < 1e-6
+    assert result['cond'] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_cond_blows_up_on_a_starved_direction(pair):
+    """The number that matters downstream: a flat direction in the latent space."""
+    z, _ = pair
+    h = z.copy()
+    h[:, 0] *= 1e-4
+    assert orthogonality_gap(z, h)['cond'] > 1e3
+
+
+# --------------------------------------------------------------- spectrum
+
+
+def test_spectrum_reports_partial_collapse_that_epsilon_hides(pair):
+    """One dead direction moves ``epsilon`` little and ``cov_eig_min`` to zero."""
+    z, _ = pair
+    h = z.copy()
+    h[:, 0] = 0.0
+    result = spectrum(h)
+    assert result['cov_eig_min'] < 1e-9
+    assert result['effective_rank'] == pytest.approx(N - 1, abs=0.3)
+    # The whole point: the aggregate stays in ordinary early-training territory.
+    assert result['epsilon'] == pytest.approx(1.0, abs=0.1)
+
+
+def test_whitened_embedding_has_near_zero_epsilon(pair):
+    z, _ = pair
+    result = spectrum(z)
+    assert result['epsilon'] < 0.15
+    assert result['trace_cov'] == pytest.approx(N, rel=0.02)
+    assert result['effective_rank'] == pytest.approx(N, abs=0.3)
+
+
+def test_sigreg_z_is_small_for_a_gaussian_and_large_otherwise(pair):
+    """``Cov = I`` is not isotropy: the statistic sees the higher moments."""
+    z, _ = pair
+    gaussian = metrics.sigreg_z_score(z, seed=0)['sigreg_z']
+    # He2 of a Gaussian is whitened but strongly non-Gaussian.
+    skewed = metrics.sigreg_z_score(he2(z), seed=0)['sigreg_z']
+    assert abs(gaussian) < 5.0
+    assert skewed > 50.0
+
+
+# ------------------------------------------------------- the bound's floor
+
+
+def test_delta_floor_is_the_unexplained_variance_in_gap_units(pair):
+    """``delta >= 2 rho (1 - rho) (tr Cov(h) - recovered)``, so ``D >= tr - recovered``."""
+    z, _ = pair
+    h = mixed(z, 4)
+    trace = spectrum(h)['trace_cov']
+    recovered = canonical_correlations(z, h)['recovered_dimensions']
+    gate = delta_admissibility(1.0, trace, recovered, RHO)
+    assert gate['delta_floor'] == pytest.approx(
+        2.0 * RHO * (1.0 - RHO) * (trace - recovered), rel=1e-9
+    )
+    assert gate['delta_floor'] / (2.0 * RHO * (1.0 - RHO)) == pytest.approx(
+        trace - recovered, rel=1e-9
+    )
+
+
+def test_degree_two_residual_sits_exactly_at_the_floor(pair):
+    """A purely degree-2 residual is the best case, so it measures degree 2."""
+    z, z_next = pair
+    h, h_next = mixed(z, 4), mixed(z_next, 4)
+    scores = compute_all(z, h, h_next=h_next, rho=RHO, seed=0)
+    assert scores['residual_hermite_degree'] == pytest.approx(2.0, abs=0.1)
+    assert scores['delta_admissible']
+
+
+def test_affine_encoder_has_no_floor_to_violate(pair):
+    """Nothing unexplained means no residual, so the gate is trivially satisfied."""
+    z, z_next = pair
+    scores = compute_all(z, z.copy(), h_next=z_next.copy(), rho=RHO, seed=0)
+    assert scores['recovered_dimensions'] == pytest.approx(N, rel=0.01)
+    assert scores['delta'] < 0.05
+    assert scores['delta_admissible']
+    assert not scores['bound_vacuous']
+
+
+def test_gate_fires_when_the_pair_distance_is_flattered(pair):
+    """The train-mode signature: ``delta`` far below a floor it cannot be below.
+
+    Reproduces what train-mode BatchNorm does to ``h[0] - h[1]`` -- it pulls the
+    two views together without changing ``Cov(h)`` -- and the gate must call it
+    impossible rather than report a small ``delta`` as a converged run.
+    """
+    z, z_next = pair
+    h, h_next = mixed(z, 4), mixed(z_next, 4)
+    flattered = h + 0.5 * (h_next - h)
+    scores = compute_all(z, h, h_next=flattered, rho=RHO, seed=0)
+    assert scores['delta'] < scores['delta_floor']
+    assert scores['residual_hermite_degree'] < 2.0
+    assert not scores['delta_admissible']
+
+
+def test_gate_tolerates_sampling_noise_on_an_honest_row():
+    """An exactly-degree-2 residual measures ~1.97 at 4k samples; that must pass."""
+    rng = np.random.default_rng(4)
+    z = rng.standard_normal((4000, N))
+    z_next = RHO * z + np.sqrt(1 - RHO**2) * rng.standard_normal((4000, N))
+    scores = compute_all(
+        z, mixed(z, 4), h_next=mixed(z_next, 4), rho=RHO, seed=0
+    )
+    assert scores['delta_admissible']
+
+
+def test_bound_is_vacuous_until_enough_is_recovered(pair):
+    """``mean_probe_r2_needed`` is an arithmetic gate, not a target to try harder at."""
+    z, z_next = pair
+    scores = compute_all(
+        z, mixed(z, 4), h_next=mixed(z_next, 4), rho=RHO, seed=0
+    )
+    assert scores['bound_vacuous']
+    assert scores['predicted_error'] > N
+    assert 0.6 < scores['mean_probe_r2_needed'] < 0.85
+    # And the run is below it, which is *why* the bound says nothing.
+    assert scores['probe_linear_r2'] < scores['mean_probe_r2_needed']
+
+
+def test_bound_reach_inverts_the_vacuity_condition():
+    """At the reported requirement, the implied bound lands exactly on ``n``."""
+    reach = bound_reach(N, 0.25, N, RHO)
+    d = reach['d_max_nonvacuous']
+    assert d + (0.25 + d) ** 2 == pytest.approx(float(N), rel=1e-9)
+    assert reach['recovered_dimensions_needed'] == pytest.approx(N - d)
+
+
+def test_predicted_error_uses_content_not_total_delta():
+    """Style leakage charged to nonlinearity is squared by the bound."""
+    total, sigma_sq = 2.5, 1.0
+    split = split_alignment_gap(total, RHO, sigma_sq)
+    assert split['delta_content'] == pytest.approx(total - 2 * RHO * sigma_sq)
+    honest = predicted_error(0.25, split['delta_content'], RHO)
+    naive = predicted_error(0.25, total, RHO)
+    assert naive['predicted_error'] > 2 * honest['predicted_error']
+
+
+def test_alignment_gap_recovers_L_and_its_training_units(pair):
+    """``L = 4 n * align_loss`` at two views -- the unit mismatch that bit."""
+    z, z_next = pair
+    h, h_next = mixed(z, 4), mixed(z_next, 4)
+    result = alignment_gap(h, h_next, RHO)
+    stacked = np.stack([h, h_next])
+    align_loss = ((stacked.mean(0) - stacked) ** 2).mean()
+    assert result['align_loss_equivalent'] == pytest.approx(
+        result['L'] / (4 * N)
+    )
+    assert result['align_loss_equivalent'] == pytest.approx(
+        align_loss, rel=1e-9
+    )
+
+
+def test_alignment_floor_scales_with_achieved_trace_not_n(pair):
+    """A shrinking embedding has a lower floor; comparing against ``n`` reads it as converged."""
+    shrunk = alignment_floor(N, RHO, trace_cov=5.0)
+    full = alignment_floor(N, RHO, trace_cov=float(N))
+    assert (
+        shrunk['align_floor_deterministic'] < full['align_floor_deterministic']
+    )
+    assert full['align_loss_floor'] == pytest.approx((1 - RHO) / 2)
+
+
+def test_style_term_enters_the_floor_with_its_own_weight():
+    """``2 rho`` against the content term's ``2(1 - rho)``: 9:1 at rho = 0.9."""
+    result = alignment_floor(N, RHO, trace_cov=float(N), sigma_sq=0.5)
+    assert result['align_floor_style_term'] == pytest.approx(2 * RHO * 0.5)
+    assert result['align_floor'] > result['align_floor_deterministic']
+
+
+# ----------------------------------------------------------------- probes
+
+
+def test_probes_agree_when_the_coding_is_linear(pair):
+    """A non-linear probe must never be *worse* than linear on linear coding."""
+    z, _ = pair
+    q = np.linalg.qr(np.random.default_rng(5).standard_normal((N, N)))[0]
+    result = probe_accessibility(z @ q.T, z, seed=0)
+    assert result['probe_linear_r2'] > 0.99
+    assert result['probe_mlp_r2'] > 0.98
+    assert result['probe_gap'] > -0.05
+
+
+def test_mlp_probe_finds_what_linear_cannot(pair):
+    """The distinction the metric exists for: present, but not linearised."""
+    z, _ = pair
+    h = np.concatenate([np.tanh(2.0 * z[:, :5]), z[:, 5:]], axis=1)
+    result = probe_accessibility(h, z, seed=0)
+    linear = np.array(result['probe_linear_per_latent'])[:5]
+    mlp = np.array(result['probe_mlp_per_latent'])[:5]
+    assert (mlp > linear + 0.05).all()
+
+
+def test_mlp_probe_does_not_manufacture_absent_signal(pair):
+    """``He2`` destroys the sign of ``z``; no probe can recover it, so R^2 ~ 0.
+
+    Before best-epoch selection the probe overfit and reported -0.24 here,
+    which reads as "worse than knowing nothing" and is not a coherent answer.
+    """
+    z, _ = pair
+    result = probe_accessibility(he2(z), z, seed=0)
+    scores = np.array(result['probe_mlp_per_latent'])
+    assert (scores < 0.05).all()
+    assert (scores > -0.05).all()
+
+
+def test_probe_names_make_the_row_self_describing(pair):
+    z, _ = pair
+    names = [f'latent.{i}' for i in range(N)]
+    result = probe_accessibility(z, z, names=names, seed=0)
+    assert result['probe_latent_names'] == names
+    assert len(result['probe_linear_per_latent']) == N
+
+
+def test_probes_are_deterministic_given_a_seed(pair):
+    z, _ = pair
+    h = mixed(z, 4)
+    a = probe_accessibility(h, z, seed=0)
+    b = probe_accessibility(h, z, seed=0)
+    assert a['probe_mlp_per_latent'] == b['probe_mlp_per_latent']
+
+
+# ---------------------------------------------------------------- ceiling
+
+
+def test_ceiling_excludes_the_latents_the_renderer_starves(pair):
+    """An aggregate over latents of wildly different observability needs its floor stated."""
+    z, _ = pair
+    h = mixed(z, 4)
+    per_latent = probe_accessibility(h, z, seed=0)['probe_linear_per_latent']
+    trace = spectrum(h)['trace_cov']
+    ceiling = observability_ceiling(per_latent, trace, N)
+    assert ceiling['n_dead_latents'] == 6
+    assert ceiling['r2_ceiling'] == pytest.approx(0.4)
+    # The assumption-free floor is a real floor: never crossed.
+    measured = procrustes_recovery(z, h)['procrustes_mse_per_dim']
+    assert measured >= ceiling['procrustes_floor']
+    # The whitened target is tighter, and this encoder is near it -- within the
+    # sampling noise that makes it a target rather than a bound.
+    assert ceiling['procrustes_floor_whitened'] > ceiling['procrustes_floor']
+    assert measured == pytest.approx(
+        ceiling['procrustes_floor_whitened'], abs=0.05
+    )
+
+
+def test_ceiling_is_perfect_when_every_latent_is_recovered(pair):
+    z, _ = pair
+    per_latent = probe_accessibility(z, z, seed=0)['probe_linear_per_latent']
+    ceiling = observability_ceiling(per_latent, float(N), N)
+    assert ceiling['n_dead_latents'] == 0
+    assert ceiling['r2_ceiling'] == pytest.approx(1.0)
+    # With every latent live and the trace at n, both agree on zero.
+    assert ceiling['procrustes_floor'] == pytest.approx(0.0, abs=1e-9)
+    assert ceiling['procrustes_floor_whitened'] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_dead_latent_threshold_is_not_a_gate_on_anything():
+    """It only decides which latents the *reported ceiling* excludes."""
+    assert 0.0 < DEAD_LATENT_R2 < 0.1
+
+
+# ------------------------------------------------------------------ style
+
+
+def test_style_variance_is_half_the_mean_squared_difference():
+    rng = np.random.default_rng(6)
+    a = rng.standard_normal((5000, N))
+    xi = 0.1 * rng.standard_normal((5000, N))
+    result = style_variance(a, a + xi)
+    assert result['sigma_sq'] == pytest.approx(
+        0.5 * ((xi) ** 2).sum(axis=1).mean(), rel=1e-9
+    )
+    assert result['sigma_sq_per_dim'] == pytest.approx(result['sigma_sq'] / N)
+
+
+def test_style_invariance_flags_a_vacuous_probe(pair):
+    """Identical views mean there was no style to resample, not perfect invariance."""
+    z, _ = pair
+    result = style_invariance(z, z.copy())
+    assert result['style_vacuous']
+    assert result['style_sensitivity'] == 0.0
+
+
+def test_style_sensitivity_is_scale_free(pair):
+    z, _ = pair
+    rng = np.random.default_rng(7)
+    xi = 0.2 * rng.standard_normal(z.shape)
+    small = style_invariance(z, z + xi)
+    scaled = style_invariance(10 * z, 10 * (z + xi))
+    assert small['style_sensitivity'] == pytest.approx(
+        scaled['style_sensitivity'], rel=1e-6
+    )
+
+
+# -------------------------------------------------------------- the whole
+
+
+def test_compute_all_is_complete_and_self_describing(pair):
+    z, z_next = pair
+    scores = compute_all(
+        z,
+        mixed(z, 4),
+        h_next=mixed(z_next, 4),
+        rho=RHO,
+        names=[f'l{i}' for i in range(N)],
+        seed=0,
     )
     for key in (
+        'metric_suite_version',
         'procrustes_mse_per_dim',
-        'orth_err_normalized',
-        'cond',
-        'r2_z_to_h',
-        'r2_h_to_z',
+        'procrustes_scale',
+        'canonical_corr',
+        'recovered_dimensions',
+        'probe_linear_per_latent',
+        'probe_mlp_per_latent',
+        'probe_latent_names',
+        'trace_cov',
+        'effective_rank',
+        'epsilon',
+        'delta_floor',
+        'residual_hermite_degree',
+        'delta_admissible',
+        'predicted_error',
+        'bound_vacuous',
+        'mean_probe_r2_needed',
+        'r2_ceiling',
+        'procrustes_floor',
+        'procrustes_floor_whitened',
     ):
-        assert logged[key].item() == pytest.approx(expected[key], rel=1e-6), key
-
-    # Guard against a test that would pass on a degenerate case.
-    assert 0.01 < expected['procrustes_mse_per_dim'] < 10.0
-    assert expected['cond'] > 1.5
-
-
-def test_recovery_diagnostics_refuse_a_v7_width_mismatch():
-    """Under V7 there is no square Q, so there is no recovery number to report.
-
-    Silently scoring a `(B, m)` embedding against a `(B, n)` latent would put a
-    meaningless column next to five meaningful ones.
-    """
-    torch = pytest.importorskip('torch')
-    from stable_worldmodel.wm.lejepa.losses import recovery_diagnostics
-
-    assert recovery_diagnostics(torch.randn(2, 64, 7), torch.randn(2, 64, 10)) == {}
+        assert key in scores, key
+    assert len(scores['canonical_corr']) == N
+    assert scores['has_second_view']
+    assert not scores['has_style_probe']
 
 
-def test_spectrum_diagnostics_see_a_collapse_epsilon_hides():
-    """One dead direction out of n, which the Frobenius aggregate absorbs.
+def test_bound_keys_absent_without_a_second_view(pair):
+    """Absent rather than zero: a missing measurement must not read as a good one."""
+    z, _ = pair
+    scores = compute_all(z, mixed(z, 4), rho=RHO, seed=0)
+    assert not scores['has_second_view']
+    for key in ('delta', 'predicted_error', 'delta_admissible'):
+        assert key not in scores
 
-    This is the whole case for logging the spectrum: `epsilon` barely moves
-    between a whitened embedding and one missing a direction entirely, while
-    the smallest eigenvalue goes to zero and the participation ratio drops by
-    exactly one.
-    """
-    torch = pytest.importorskip('torch')
-    from stable_worldmodel.wm.lejepa.losses import (
-        spectrum_diagnostics,
-        whitening_loss,
+
+def test_style_keys_absent_without_a_probe(pair):
+    z, z_next = pair
+    scores = compute_all(
+        z, mixed(z, 4), h_next=mixed(z_next, 4), rho=RHO, seed=0
     )
-
-    rng = np.random.default_rng(0)
-    n, batch = 10, 8192
-    healthy = rng.standard_normal((2, batch, n))
-    collapsed = healthy.copy()
-    collapsed[..., 3] = 0.0
-
-    healthy_t = torch.tensor(healthy)
-    collapsed_t = torch.tensor(collapsed)
-
-    healthy_spec = spectrum_diagnostics(healthy_t)
-    collapsed_spec = spectrum_diagnostics(collapsed_t)
-
-    assert healthy_spec['cov_eig_min'].item() > 0.8
-    assert collapsed_spec['cov_eig_min'].item() < 1e-9
-    assert healthy_spec['effective_rank'].item() == pytest.approx(n, rel=0.02)
-    assert collapsed_spec['effective_rank'].item() == pytest.approx(n - 1, rel=0.02)
-
-    # And the thing it is there to catch: epsilon hardly reacts.
-    epsilon_shift = abs(
-        whitening_loss(collapsed_t).item() - whitening_loss(healthy_t).item()
-    )
-    assert epsilon_shift < 0.02
+    assert not scores['has_style_probe']
+    assert 'sigma_sq' not in scores
+    # Without sigma_sq the split is degenerate and says so.
+    assert scores['delta_style'] == 0.0
+    assert scores['delta_content'] == pytest.approx(scores['delta'])
