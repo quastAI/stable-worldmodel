@@ -129,6 +129,61 @@ def embed_dataset(model, dataset, max_samples, device, batch_size=64):
     )
 
 
+def resolve_rho(manifest, fallback):
+    """The dataset's scalar rho, across two manifest schemas.
+
+    Datasets collected before 2026-09-11 (the OU sampler's rewrite to
+    scalar-only) carry the OLD `OUSampler.describe()` output, where `rho` is
+    `self.rho.tolist()` -- a per-DIMENSION array left over from an anisotropic
+    sampling capability this pipeline no longer has -- alongside a separate
+    scalar `rho_mean`. The current sampler writes a plain float under `rho`
+    and no `rho_mean` at all. `manifest.get('ou', {}).get('rho', ...)` reads
+    the old array as-is, which is what raised
+    ``TypeError: float() argument must be ... not 'list'`` here.
+
+    This does not silently average over a real spread. The old sampler COULD
+    assign different rho per dimension, and if it did here, the data does not
+    have the single shared rho every rho-dependent metric below assumes
+    (`alignment_floor`, `bound/*`, `residual_hermite_degree`) -- and the
+    paper's own App. F proves isotropy is *necessary* for the simultaneous
+    objective to be well-posed at all. So the per-dimension values are checked
+    for uniformity before `rho_mean` is trusted, and a real spread raises
+    rather than getting quietly averaged away.
+
+    Returns:
+        float: The resolved rho.
+
+    Raises:
+        ValueError: If an old-schema manifest's per-dimension rho is not
+            uniform to within floating-point noise.
+    """
+    ou = manifest.get('ou', {})
+
+    if 'rho_mean' in ou:
+        per_dim = np.asarray(ou.get('rho', ou['rho_mean']), dtype=np.float64)
+        spread = float(per_dim.max() - per_dim.min()) if per_dim.size else 0.0
+        if spread > 1e-6:
+            raise ValueError(
+                f'manifest records a NON-uniform per-dimension rho (spread '
+                f'{spread:.2e}, values {per_dim.tolist()}). This dataset was '
+                'collected under the pre-refactor anisotropic-capable '
+                'sampler and does not satisfy the isotropy every rho-'
+                'dependent metric here assumes -- averaging it away would '
+                'silently misreport `bound/*`. Re-collect with the current '
+                'collect_cube_single_ou.py (isotropic-only) before scoring.'
+            )
+        logging.info(
+            f'manifest is old-schema (pre-2026-09-11 OU sampler); rho is '
+            f'uniform at {ou["rho_mean"]:.6f}, using it'
+        )
+        return float(ou['rho_mean'])
+
+    if 'rho' in ou:
+        return float(ou['rho'])
+
+    return float(fallback)
+
+
 def latent_names(manifest):
     """Flat per-coordinate names for the content latents, in ``z`` order.
 
@@ -272,7 +327,7 @@ def run(cfg: DictConfig):
     )
     dataset.transform = transform
     manifest = load_manifest(cfg.ou_dataset, cfg.get('cache_dir'))
-    rho = float(manifest.get('ou', {}).get('rho', cfg.program_constants.rho))
+    rho = resolve_rho(manifest, cfg.program_constants.rho)
 
     model = model.to(device)
     recalibrated = False

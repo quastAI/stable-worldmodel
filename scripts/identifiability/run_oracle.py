@@ -54,6 +54,7 @@ Usage::
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -74,6 +75,7 @@ import stable_worldmodel as swm  # noqa: E402
 from stable_worldmodel.identifiability import metrics as ident_metrics  # noqa: E402
 from stable_worldmodel.identifiability import results as ident_results  # noqa: E402
 from stable_worldmodel.identifiability.collect import load_manifest  # noqa: E402
+from stable_worldmodel.wm.lejepa.module import state_dict_hash  # noqa: E402
 from stable_worldmodel.wm.lejepa.schedule import (  # noqa: E402
     WarmupHoldCosineLR,
     schedule_kwargs,
@@ -115,31 +117,69 @@ def reinitialise(model):
     return count
 
 
-def load_views(dataset, max_samples, transform):
+def load_views(dataset, max_samples, transform, cache_dir):
     """Both views of every pair, flattened into independent labelled frames.
 
     The OU pair structure is irrelevant here -- there is no alignment term to
     compute -- so each frame is its own training example and the two views
     double the supervised sample at no rendering cost.
 
+    Streamed into a DISK-BACKED memmap, not a Python list fed to
+    ``torch.cat``. The list-then-cat version held both the per-row list and
+    the concatenated output in host RAM at once -- at ``max_samples=20000``
+    and 224px that is ~24 GB for the tensor and ~48 GB at the peak, which is
+    what SIGKILLed this script before a single training epoch ran. A memmap
+    keeps resident RAM bounded to whatever one row's decode needs; ``z`` is
+    small enough (``2B x n`` floats) to keep in RAM outright.
+
+    Args:
+        cache_dir: Where the pixel memmap is written. Caller-owned --
+            ``tempfile.TemporaryDirectory()`` is the intended use, so the file
+            is cleaned up when the run ends rather than left on the pod disk.
+
     Returns:
-        tuple: ``(pixels, z)`` with ``pixels`` a ``(2B, C, H, W)`` float tensor
-        and ``z`` a ``(2B, n)`` float tensor.
+        tuple: ``(pixels, z)``. ``pixels`` is a ``(2B, C, H, W)`` float32
+        ``np.memmap`` -- index it with an integer array via :func:`_as_batch`,
+        not ``.to(device)`` directly, since a memmap slice is a plain
+        ``ndarray``. ``z`` is a ``(2B, n)`` float32 tensor.
     """
     dataset.transform = transform
     n = min(len(dataset), max_samples)
 
-    pixels, z = [], []
-    for i in range(n):
-        row = dataset[i]
-        frames = torch.as_tensor(np.asarray(row['pixels'])).float()
-        latents = torch.as_tensor(
-            np.asarray(row['latent/z']), dtype=torch.float32
-        )
-        pixels.append(frames)
-        z.append(latents)
+    first_row = dataset[0]
+    frame_shape = np.asarray(first_row['pixels'][0], dtype=np.float32).shape
+    n_latent = np.asarray(first_row['latent/z'][0], dtype=np.float32).shape[0]
+    total = 2 * n
 
-    return torch.cat(pixels, dim=0), torch.cat(z, dim=0)
+    pixels = np.memmap(
+        Path(cache_dir) / 'oracle_pixels.f32',
+        dtype=np.float32,
+        mode='w+',
+        shape=(total, *frame_shape),
+    )
+    z = np.empty((total, n_latent), dtype=np.float32)
+
+    for i in range(n):
+        row = first_row if i == 0 else dataset[i]
+        pixels[2 * i : 2 * i + 2] = np.asarray(row['pixels'], dtype=np.float32)
+        z[2 * i : 2 * i + 2] = np.asarray(row['latent/z'], dtype=np.float32)
+    pixels.flush()
+
+    return pixels, torch.from_numpy(z)
+
+
+def _as_batch(pixels, idx):
+    """CPU float tensor for ``idx`` rows of ``pixels``.
+
+    Handles both backends transparently: a ``torch.Tensor`` (as in tests, or a
+    small in-RAM run) indexes and returns a tensor already; a memmap
+    ``ndarray`` (the default path above) returns a plain array holding only
+    the selected rows, which still needs wrapping before ``.to(device)``.
+    """
+    chunk = pixels[idx]
+    return (
+        chunk if torch.is_tensor(chunk) else torch.as_tensor(np.asarray(chunk))
+    )
 
 
 def train_supervised(model, pixels, z, train_idx, cfg, device):
@@ -182,7 +222,7 @@ def train_supervised(model, pixels, z, train_idx, cfg, device):
         running = 0.0
         for step in range(steps_per_epoch):
             rows = order[step * batch : (step + 1) * batch]
-            x = pixels[rows].to(device)
+            x = _as_batch(pixels, rows).to(device)
             y = z[rows].to(device)
 
             prediction = model.head(model.encoder(x))
@@ -210,7 +250,7 @@ def predict(model, pixels, rows, device, batch_size=64):
     out = []
     for start in range(0, len(rows), batch_size):
         chunk = rows[start : start + batch_size]
-        x = pixels[chunk].to(device)
+        x = _as_batch(pixels, chunk).to(device)
         out.append(model.head(model.encoder(x)).cpu().numpy())
     return np.concatenate(out)
 
@@ -257,20 +297,25 @@ def run(cfg: DictConfig):
     manifest = load_manifest(cfg.ou_dataset, cfg.get('cache_dir'))
     names = latent_names(manifest)
 
-    pixels, z = load_views(dataset, int(cfg.max_samples), transform)
-    logging.info(
-        f'{len(pixels)} labelled frames at {img_size}px, n = {z.shape[1]}'
-    )
+    # The pixel cache lives on disk for the run's lifetime only -- see
+    # load_views for why it is not a plain in-RAM tensor.
+    with tempfile.TemporaryDirectory(prefix='lejepa_oracle_') as cache_dir:
+        pixels, z = load_views(
+            dataset, int(cfg.max_samples), transform, cache_dir
+        )
+        logging.info(
+            f'{len(pixels)} labelled frames at {img_size}px, n = {z.shape[1]}'
+        )
 
-    rng = np.random.default_rng(int(cfg.seed))
-    order = rng.permutation(len(pixels))
-    cut = int(round(len(order) * (1.0 - float(cfg.holdout))))
-    train_idx, test_idx = order[:cut], order[cut:]
+        rng = np.random.default_rng(int(cfg.seed))
+        order = rng.permutation(len(pixels))
+        cut = int(round(len(order) * (1.0 - float(cfg.holdout))))
+        train_idx, test_idx = order[:cut], order[cut:]
 
-    model = train_supervised(model, pixels, z, train_idx, cfg, device)
+        model = train_supervised(model, pixels, z, train_idx, cfg, device)
 
-    truth = z[test_idx].numpy()
-    prediction = predict(model, pixels, test_idx, device)
+        truth = z[test_idx].numpy()
+        prediction = predict(model, pixels, test_idx, device)
     scores = per_latent_r2(truth, prediction)
 
     result = {
@@ -306,6 +351,14 @@ def run(cfg: DictConfig):
             cfg.program_constants, resolve=True
         ),
         epoch=_epoch_of(cfg.checkpoint),
+        # False, not left unset: the oracle does not run LeJEPA's BN-staleness
+        # recalibration (there is no eval/train-mode gap here -- the model was
+        # just trained supervised, its running stats are its own). Leaving
+        # this unset reads as a missing column once this row sits in the same
+        # DataFrame as run_metrics.py's rows, and prints as `None`/`nan`
+        # rather than a real answer.
+        bn_recalibrated=False,
+        encoder_hash=state_dict_hash(model),
         n_samples=int(len(test_idx)),
     )
     out = Path(cfg.results_path)
