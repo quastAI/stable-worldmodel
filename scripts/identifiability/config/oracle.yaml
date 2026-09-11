@@ -43,6 +43,13 @@ warmup_steps: 200
 # handicapped by a worse schedule than the thing it bounds.
 constant_frac: 0.5
 
+# WHICH rows the ceiling is measured on. Matches metrics.yaml so the ceiling
+# bounds the rows it is compared against -- a ceiling computed on different
+# pixels is not a bound on anything. The oracle then holds out its OWN 20% of
+# these rows to score itself, which is a separate split from this one.
+split: val
+train_split: 0.9
+
 # 20000 pairs -> 40000 labelled frames, both views used as independent samples.
 max_samples: 20000
 holdout: 0.2

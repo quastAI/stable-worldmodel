@@ -203,6 +203,66 @@ def latent_names(manifest):
     return names
 
 
+def scored_subset(dataset, cfg):
+    """The rows to score: the encoder's **held-out** split, by default.
+
+    This is not a detail. ``run_metrics.py`` used to score the first
+    ``max_samples`` rows of the whole dataset, and ``lejepa.py`` splits that
+    same dataset 90/10 -- so ~90% of every row ever written here was measured
+    on data the encoder had trained on. Two consequences, both observed live
+    on the s3072 50-epoch run:
+
+    * Recovery read optimistically. ``probe_linear_r2`` and friends score a
+      probe on a held-out slice of *frames the encoder had already fit*, which
+      is not the same as held-out recovery and is systematically better.
+    * ``L`` came in at 0.98 against a floor of 1.87 -- below the floor, which
+      is impossible for any function of ``z`` under the declared rho. It is
+      not impossible for an encoder measured on pairs it has memorised: the
+      Hermite floor is a statement about the population, not about a finite
+      sample that was fit. Scored on the held-out split by the training run's
+      own validation, the same weights gave ``delta = 3.6``, admissible.
+
+    The split is reproduced exactly rather than re-drawn: ``lejepa.py`` seeds
+    it with ``torch.Generator().manual_seed(cfg.seed)`` and the same
+    ``lengths``, so the same seed and ``train_split`` here recover the same
+    indices. A mismatch in either would silently score a blend of both splits,
+    which is the failure this function exists to end -- so both are recorded
+    on the row.
+
+    Args:
+        dataset: The full OU dataset, transform already attached.
+        cfg: Needs ``seed``, ``train_split`` and ``split``
+            (``'val'`` | ``'train'`` | ``'all'``).
+
+    Returns:
+        tuple: ``(subset, description)``.
+
+    Raises:
+        ValueError: If ``split`` is not one of the three accepted values.
+    """
+    split = str(cfg.get('split', 'val'))
+    if split == 'all':
+        return dataset, f'all {len(dataset)} pairs (INCLUDES training data)'
+
+    if split not in ('val', 'train'):
+        raise ValueError(
+            f"split must be 'val', 'train' or 'all', got {split!r}"
+        )
+
+    train_split = float(cfg.train_split)
+    generator = torch.Generator().manual_seed(int(cfg.seed))
+    train_set, val_set = spt.data.random_split(
+        dataset,
+        lengths=[train_split, 1.0 - train_split],
+        generator=generator,
+    )
+    subset = val_set if split == 'val' else train_set
+    return subset, (
+        f'{split} split: {len(subset)} of {len(dataset)} pairs '
+        f'(train_split={train_split}, seed={int(cfg.seed)})'
+    )
+
+
 def circular_targets(manifest, z):
     """The circular latents of ``z``, in radians, with their symmetry orders.
 
@@ -329,11 +389,18 @@ def run(cfg: DictConfig):
     manifest = load_manifest(cfg.ou_dataset, cfg.get('cache_dir'))
     rho = resolve_rho(manifest, cfg.program_constants.rho)
 
+    # Held-out by default -- see scored_subset. Everything below (BatchNorm
+    # recalibration included, since its estimate of the input marginal should
+    # come from the same rows the numbers are computed on) uses this, not the
+    # full dataset.
+    scored, split_description = scored_subset(dataset, cfg)
+    logging.info(f'scoring {split_description}')
+
     model = model.to(device)
     recalibrated = False
     if cfg.get('recalibrate_batchnorm', True):
         recalibrated = recalibrate_batchnorm(
-            model, dataset, device, int(cfg.max_samples)
+            model, scored, device, int(cfg.max_samples)
         )
 
     # The style probe is content-matched by construction: its two views share
@@ -386,7 +453,7 @@ def run(cfg: DictConfig):
             )
 
     z, h, _, h_next = embed_dataset(
-        model, dataset, int(cfg.max_samples), device
+        model, scored, int(cfg.max_samples), device
     )
 
     circular_angles, circular_orders, circular_names = circular_targets(
@@ -427,6 +494,11 @@ def run(cfg: DictConfig):
         encoder_hash=state_dict_hash(model),
         bn_recalibrated=recalibrated,
         n_samples=int(len(z)),
+        # Recorded so a row is self-describing about WHICH rows it scored.
+        # Rows written before this existed scored the full dataset -- i.e.
+        # ~90% training data -- and are not comparable to held-out rows.
+        split=str(cfg.get('split', 'val')),
+        train_split=float(cfg.train_split),
     )
     out = Path(cfg.results_path)
     ident_results.append_row(out, row)

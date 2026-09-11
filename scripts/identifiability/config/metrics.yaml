@@ -31,6 +31,29 @@ ou_dataset: ogbench/cube_single_ou_${profile}.lance
 # says which rows have one.
 style_dataset: ogbench/cube_single_ou_style_${profile}.lance
 
+# WHICH rows to score. `val` reproduces the encoder's own held-out split --
+# lejepa.py seeds it with `torch.Generator().manual_seed(seed)` and
+# `random_split([train_split, 1 - train_split])`, so the same `seed` and
+# `train_split` recover the same indices here.
+#
+# This defaulted to the whole dataset until 2026-09-11, which meant ~90% of
+# every row written was measured on data the encoder had trained on. That is
+# not a small bias: on the s3072 50-epoch run it put `L` at 0.98 against a
+# floor of 1.87 -- BELOW the floor, impossible for any function of z under the
+# declared rho, and possible only because the Hermite floor bounds the
+# population rather than a finite sample the encoder had fit. The same weights
+# scored on the held-out split by the run's own validation gave an admissible
+# delta of 3.6. Recovery numbers were optimistic for the same reason.
+#
+# `train` scores the complement (useful precisely to measure that gap);
+# `all` restores the old behaviour and should be used only deliberately.
+# Whichever is chosen is recorded on the row.
+split: val
+
+# MUST match the training run's `train_split`, or the reproduced split is a
+# blend of both halves and the row is neither held-out nor comparable.
+train_split: 0.9
+
 # Refresh BatchNorm running statistics over the eval set before scoring, with
 # the weights frozen. ON by default: the default `momentum=0.1` is a ~10-batch
 # window, and under a constant learning rate the weights never settle, so the

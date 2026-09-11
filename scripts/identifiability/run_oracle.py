@@ -88,6 +88,7 @@ from run_metrics import (  # noqa: E402
     circular_targets,
     encoder_preprocessor,
     latent_names,
+    scored_subset,
 )
 
 
@@ -297,11 +298,18 @@ def run(cfg: DictConfig):
     manifest = load_manifest(cfg.ou_dataset, cfg.get('cache_dir'))
     names = latent_names(manifest)
 
+    # The same rows run_metrics.py scores, so the ceiling bounds the numbers
+    # it is compared against. The oracle then holds out its own 20% of THESE
+    # rows to score itself -- a separate split, nested inside this one.
+    dataset.transform = transform
+    scored, split_description = scored_subset(dataset, cfg)
+    logging.info(f'ceiling measured on {split_description}')
+
     # The pixel cache lives on disk for the run's lifetime only -- see
     # load_views for why it is not a plain in-RAM tensor.
     with tempfile.TemporaryDirectory(prefix='lejepa_oracle_') as cache_dir:
         pixels, z = load_views(
-            dataset, int(cfg.max_samples), transform, cache_dir
+            scored, int(cfg.max_samples), transform, cache_dir
         )
         logging.info(
             f'{len(pixels)} labelled frames at {img_size}px, n = {z.shape[1]}'
@@ -326,6 +334,7 @@ def run(cfg: DictConfig):
         'probe_latent_names': names,
         'oracle_epochs': int(cfg.epochs),
         'n_train_frames': int(len(train_idx)),
+        'split': str(cfg.get('split', 'val')),
     }
 
     angles, orders, circ_names = circular_targets(manifest, truth)
