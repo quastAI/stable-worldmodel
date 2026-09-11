@@ -49,31 +49,54 @@ program_constants:
   #   R^2      0.981   0.989   0.993   0.992
   #   orth     0.461   0.210   0.142   0.062
   #
-  # Orthogonality error is what our recovery metrics actually score, so it is
-  # the row that decides. Note that App. H.6's *prose* names lambda in
-  # {1e-3, 5e-3} as the best setting, which its own table contradicts at
-  # rho=0.9 -- the table is what is cited here. 5e-2 degrades only from 1e-1
-  # (0.847), and at rho=0.99 it falls to 0.493, which is the collapse
-  # `program_constants.rho` above is staying clear of.
+  # All four sit in the paper's good region; note App. H.6's *prose* names
+  # {1e-3, 5e-3} as best, which its own table contradicts at rho=0.9.
   #
-  # The previous 3.0e-3 was 1.5e-3 in paper units under the per-view
-  # convention -- ~30x below the paper's best pixel setting, and only ~15x above
-  # the lambda < 1e-4 regime Fig. 6 shows fails outright at every rho. That is
-  # the wrong side to err on here: `bound/trace_cov` starts near 1.4 against
-  # n=10, so SIGReg has to *inflate* the representation out of near-collapse,
-  # and the risk is asymmetric -- too low fails outright, too high degrades
-  # gracefully (0.847 at 1e-1; only 5e-1 collapses).
+  # WAS 5.0e-2 (the best orthogonality in that column) until the s3072
+  # 50-epoch run, which is why it is 1e-2 now. Three measurements moved it,
+  # none of them available to the paper's grid:
   #
-  # Confirm on the shakedown before spending the seed budget:
-  #   for l in 1.0e-2 5.0e-2; do
-  #     python scripts/train/lejepa.py program_constants.lambda=$l \
-  #         trainer.max_epochs=10 subdir=lam_$l
-  #   done
-  # If `fit/align_loss` stops falling, SIGReg is dominating: drop to 1e-2.
-  # Read `fit/align_loss` against its floor, `(1 - rho) * trace_cov / (2 n)`,
-  # NOT against zero -- and read it in `validate/`, since train-mode BatchNorm
+  #   * `fit/align_loss` ROSE monotonically (0.09 -> 0.13) through the hold
+  #     phase while `sigreg_loss` fell -- and `fit/trace_cov` was already
+  #     plateaued at 10k steps (9.6, against 9.75 final), so this is not the
+  #     alignment floor growing under SIGReg's inflation. The two terms were
+  #     in genuine tension and SIGReg was winning.
+  #   * Held-out alignment finished at 2.93x its floor (validate L 5.47 vs
+  #     floor 1.87), against the paper's converged 0.976x. Alignment was not
+  #     merely slower, it was not being optimised.
+  #   * 24% of the embedding's variance was style (`style_sensitivity` 0.244,
+  #     `sigma_sq` 1.22). Style dimensions are expensive under alignment --
+  #     they differ between views, costing the full 2*sigma^2 rather than
+  #     2(1-rho)*sigma^2 -- so raising alignment's relative weight is the term
+  #     that should squeeze them out, and SIGReg's isotropy then has to be
+  #     paid for by something view-consistent, i.e. content.
+  #
+  # Why the paper's 5e-2 does not transfer: its calibration never had this
+  # profile's independently-resampled style between the two views of a pair
+  # (`resample_style_within_pair: true`). That is extra variance SIGReg must
+  # whiten and alignment must discard, and it shifts the balance point.
+  #
+  # The risk of going lower is collapse, not graceful degradation: `trace_cov`
+  # starts near 1.4 against n=10, so SIGReg has to *inflate* the
+  # representation out of near-collapse. 1e-2 is a 5x step, still inside
+  # Fig. 6's good region (R^2 0.993), and is the value this repo's own
+  # shakedown already named. Do not go below 5e-3 without evidence.
+  #
+  # WHAT TO CHECK FIRST on the next run -- this is a falsifiable prediction,
+  # not a preference:
+  #   * `style_sensitivity` and `sigma_sq` should FALL. If they do and
+  #     `trace_cov` holds near 10, it is working.
+  #   * If `trace_cov` / `effective_rank` collapse, 1e-2 is too low.
+  #   * If style leakage falls but `cube.size` / `cube.yaw` stay at ~0, then
+  #     lambda is NOT the answer: content and style share a rendering channel
+  #     (cube.color is style) and the conflict is structural. The decisive
+  #     test then is pinning cube.color and re-collecting -- see
+  #     LEJEPA_RUN.md. Do not keep sweeping lambda past that point.
+  #
+  # Read `align_loss` against its floor, `(1 - rho) * trace_cov / (2 n)`, NOT
+  # against zero -- and read it in `validate/`, since train-mode BatchNorm
   # flatters anything computed from the two views' difference.
-  lambda: 5.0e-2
+  lambda: 1.0e-2
 
 trainer:
   # A pure budget knob now that `schedule.warmup_steps` is absolute -- see the

@@ -27,7 +27,7 @@ results_path: outputs/lejepa_results.jsonl
 # matched to the run it bounds.
 program_constants:
   rho: 0.9
-  lambda: 5.0e-2
+  lambda: 1.0e-2
 
 # Supervised regression converges far faster than the SSL objective, so this is
 # a short run. Raise `epochs` if the per-latent scores are still climbing: an

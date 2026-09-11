@@ -79,4 +79,4 @@ results_path: outputs/lejepa_results.jsonl
 # used, and a mismatch makes two rows silently incomparable.
 program_constants:
   rho: 0.9
-  lambda: 5.0e-2
+  lambda: 1.0e-2
