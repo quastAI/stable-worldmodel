@@ -508,3 +508,146 @@ def test_style_keys_absent_without_a_probe(pair):
     # Without sigma_sq the split is degenerate and says so.
     assert scores['delta_style'] == 0.0
     assert scores['delta_content'] == pytest.approx(scores['delta'])
+
+
+# --------------------------------------------------------------------------
+# probe_circular -- the harmonic read-out for quotient-valued angles
+# --------------------------------------------------------------------------
+
+
+def _yaw_encoders(n_rows=3000, seed=0):
+    """Three encoders of the same C4 angle, with known answers.
+
+    ``cube.yaw`` is sampled on +-0.95 * pi/4 and has symmetry order 4, so the
+    natural coding is ``(cos 4t, sin 4t)``.
+    """
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(-0.95 * np.pi / 4, 0.95 * np.pi / 4, n_rows)
+    noise = rng.normal(size=(n_rows, 6))
+    return theta, {
+        'harmonic': np.column_stack(
+            [np.cos(4 * theta), np.sin(4 * theta), noise]
+        ),
+        'linear': np.column_stack([theta, noise]),
+        'absent': rng.normal(size=(n_rows, 8)),
+    }
+
+
+def test_probe_circular_recovers_the_harmonic_coding():
+    theta, encoders = _yaw_encoders()
+    out = metrics.probe_circular(
+        encoders['harmonic'], theta[:, None], [4], names=['cube.yaw']
+    )
+    assert out['probe_circular_per_latent'][0] > 0.99
+    assert out['probe_circular_names'] == ['cube.yaw']
+    assert out['probe_circular_orders'] == [4]
+
+
+def test_probe_circular_is_zero_when_the_angle_is_absent():
+    theta, encoders = _yaw_encoders()
+    out = metrics.probe_circular(encoders['absent'], theta[:, None], [4])
+    assert abs(out['probe_circular_per_latent'][0]) < 0.05
+    assert 'probe_circular_names' not in out
+
+
+def test_probe_circular_beats_the_theta_probe_on_harmonic_coding():
+    """The discrimination the metric exists for.
+
+    On a harmonically-coded angle the harmonic probe must win clearly; on a
+    linearly-coded one the ordinary probe must. Without both columns a score
+    near zero cannot be attributed.
+    """
+    theta, encoders = _yaw_encoders()
+    z = theta[:, None]
+
+    harmonic_enc = metrics.probe_circular(encoders['harmonic'], z, [4])
+    harmonic_lin = metrics.probe_accessibility(
+        encoders['harmonic'], z, epochs=20
+    )
+    assert (
+        harmonic_enc['probe_circular_per_latent'][0]
+        > harmonic_lin['probe_linear_per_latent'][0] + 0.2
+    )
+
+    linear_enc = metrics.probe_circular(encoders['linear'], z, [4])
+    linear_lin = metrics.probe_accessibility(encoders['linear'], z, epochs=20)
+    assert (
+        linear_lin['probe_linear_per_latent'][0]
+        > linear_enc['probe_circular_per_latent'][0] + 0.2
+    )
+
+
+def test_probe_circular_order_must_match_the_symmetry():
+    """A wrong order is not a harmless reparametrisation.
+
+    Scoring a C4 angle at order 1 -- plain (cos t, sin t) -- is the mistake the
+    CIRCULAR_ORDER table exists to prevent.
+    """
+    theta, encoders = _yaw_encoders()
+    right = metrics.probe_circular(encoders['harmonic'], theta[:, None], [4])
+    wrong = metrics.probe_circular(encoders['harmonic'], theta[:, None], [1])
+    assert (
+        right['probe_circular_per_latent'][0]
+        > wrong['probe_circular_per_latent'][0] + 0.1
+    )
+
+
+def test_probe_circular_shares_the_split_with_probe_accessibility():
+    """Same seed and holdout must mean the same rows, or the columns lie."""
+    theta, encoders = _yaw_encoders()
+    z = np.column_stack([theta, theta])
+    train_a, test_a = metrics._holdout(len(z), 0.2, 7)
+    train_b, test_b = metrics._holdout(len(z), 0.2, 7)
+    assert np.array_equal(test_a, test_b)
+    out = metrics.probe_circular(
+        encoders['harmonic'], z, [4, 4], holdout=0.2, seed=7
+    )
+    assert len(out['probe_circular_per_latent']) == 2
+
+
+def test_probe_circular_rejects_mismatched_orders():
+    theta, encoders = _yaw_encoders()
+    with pytest.raises(ValueError, match='orders'):
+        metrics.probe_circular(encoders['harmonic'], theta[:, None], [4, 2])
+
+
+def test_compute_all_omits_circular_keys_without_angles():
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(300, 3))
+    h = z + 0.1 * rng.normal(size=(300, 3))
+    out = metrics.compute_all(z, h, rho=0.9)
+    assert out['has_circular_probe'] is False
+    assert 'probe_circular_per_latent' not in out
+
+
+def test_compute_all_includes_circular_keys_with_angles():
+    # m == n, since compute_all runs procrustes_recovery, which needs a
+    # square Q. z[0] is the C4 angle, coded harmonically in h[0:2].
+    rng = np.random.default_rng(0)
+    theta = rng.uniform(-0.95 * np.pi / 4, 0.95 * np.pi / 4, 400)
+    other = rng.normal(size=400)
+    z = np.column_stack([theta, other, rng.normal(size=400)])
+    h = np.column_stack([np.cos(4 * theta), np.sin(4 * theta), other])
+    out = metrics.compute_all(
+        z,
+        h,
+        rho=0.9,
+        circular_angles=theta[:, None],
+        circular_orders=[4],
+        circular_names=['cube.yaw'],
+    )
+    assert out['has_circular_probe'] is True
+    assert out['probe_circular_per_latent'][0] > 0.95
+    assert out['probe_circular_names'] == ['cube.yaw']
+
+
+def test_circular_order_table_matches_the_declared_arcs():
+    """The orders are 2*pi/period, and the periods are the arc constants."""
+    from stable_worldmodel.identifiability import latents as lat
+
+    assert lat.CIRCULAR_ORDER['cube.yaw'] == pytest.approx(
+        2 * np.pi / (2 * lat.YAW_FUNDAMENTAL_HALF_ARC)
+    )
+    assert lat.CIRCULAR_ORDER['effector.yaw'] == pytest.approx(
+        2 * np.pi / (2 * lat.EFFECTOR_YAW_HALF_ARC)
+    )

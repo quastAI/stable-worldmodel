@@ -40,11 +40,21 @@ program_constants:
   rho: 0.9          # mid-range of Fig. 6's best region, clear of the rho=0.99 collapse
 
   # In the PAPER's units -- see `loss.sigreg.kwargs.pool_views` below, which is
-  # what makes that true. Chosen from App. H.11, the paper's own *pixel*
-  # experiment, not from Fig. 6's 2-D grid: Fig. 14 sweeps
-  # lambda in {1e-3, 5e-3, 1e-2, 5e-2} on a CNN and 5e-2 is the best of them at
-  # rho=0.9 (~0.93 against ~0.75-0.82 for the three lower values). Fig. 6 puts
-  # 5e-2 at rho=0.9 in its good region too (0.992), degrading only from 1e-1.
+  # what makes that true. Chosen from the paper's lambda x rho grid (Fig. 6 /
+  # App. H.6) read at OUR rho. At rho=0.9 the four candidates
+  # {1e-3, 5e-3, 1e-2, 5e-2} are indistinguishable on R^2(h->z) and separated
+  # only by orthogonality error, where 5e-2 is the best in the whole column:
+  #
+  #   lambda   1e-3    5e-3    1e-2    5e-2
+  #   R^2      0.981   0.989   0.993   0.992
+  #   orth     0.461   0.210   0.142   0.062
+  #
+  # Orthogonality error is what our recovery metrics actually score, so it is
+  # the row that decides. Note that App. H.6's *prose* names lambda in
+  # {1e-3, 5e-3} as the best setting, which its own table contradicts at
+  # rho=0.9 -- the table is what is cited here. 5e-2 degrades only from 1e-1
+  # (0.847), and at rho=0.99 it falls to 0.493, which is the collapse
+  # `program_constants.rho` above is staying clear of.
   #
   # The previous 3.0e-3 was 1.5e-3 in paper units under the per-view
   # convention -- ~30x below the paper's best pixel setting, and only ~15x above
@@ -128,21 +138,17 @@ optimizer:
   lr: ${encoder_lr}
   weight_decay: ${encoder_weight_decay}
 
-# The LR schedule, made explicit because both of its ends used to ride on
-# `trainer.max_epochs`, so changing the budget moved the budget, the warmup
-# length AND the anneal rate at once and none of the three could be isolated.
+# The LR schedule. Both of its ends used to ride on `trainer.max_epochs`, so
+# changing the budget moved the budget, the warmup length AND the anneal rate at
+# once and none of the three could be isolated. Now: `warmup_steps` is absolute,
+# `constant_frac` sets the shape, and `max_epochs` is a pure budget knob.
 #
-# Measured on the s3072 10-epoch run, read back out of its `epoch009.ckpt`:
-# warmup_steps=70 (1% of 7030), eta_min=0.0, and `_last_lr` at the final step
-# exactly 0.0. Epochs 1-4 carried 70% of the run's total LR; epochs 8-10 carried
-# 4.3% between them, so the last three points of that 10-point trend were three
-# near-duplicate checkpoints, not three observations.
-#
-# One consequence of `constant` that is NOT free, and is the reason
-# run_metrics.py refreshes BatchNorm statistics by default: the weights never
-# stop moving, so BatchNorm's ~10-batch running statistics are permanently
-# stale relative to them and never converge. A cosine anneal to zero hides
-# this by letting the weights settle; this shape cannot.
+# Implemented by `wm/lejepa/schedule.py::WarmupHoldCosineLR` -- linear warmup,
+# a hold at the peak, then cosine to zero. One scheduler, one knob for the
+# shape. It replaced spt's `LinearWarmupCosineAnnealingLR`, which has no hold
+# phase (so the paper's recipe could not be expressed), encoded `constant` as
+# `eta_min == base_lr` (a dropped kwarg would silently give a real anneal), and
+# left its cosine unclamped past `max_steps`.
 schedule:
   # ABSOLUTE, not `int(0.01 * total_steps)`. At 703 steps/epoch the old rule
   # gave a 10-epoch run 70 warmup steps and a 100-epoch run 703 -- a 10x
@@ -150,29 +156,35 @@ schedule:
   # two budgets were comparable. 700 is kept as the fixed reference.
   warmup_steps: 700
 
-  # `constant` -- warmup, then flat forever. The EXPLORATION shape, and the
-  # default here, because it is the only one under which killing a run is free
-  # and the epoch trend is an honest learning curve:
+  # Fraction of the run held at the peak LR before the cosine anneal begins.
+  # The ONLY shape knob:
   #
-  #   * every checkpoint is comparable to every other, so a plateau means the
-  #     model stopped learning rather than the LR having decayed out from under
-  #     it. The s3072 run cannot distinguish those: recovery went flat at epoch
-  #     4 while the mean LR over epochs 4-6 was itself halving (2.21e-3 ->
-  #     1.29e-3).
-  #   * killing at epoch N forfeits nothing, whereas killing a cosine at N
-  #     hands you a checkpoint frozen at high LR that never got its anneal
-  #     (a 100-epoch cosine stopped at 30 sits at 79% of peak).
+  #   0.5  the paper's recipe (App. H.4): "constant learning rate for the first
+  #        half of training, followed by cosine decay to zero". THE DEFAULT.
+  #   0.0  pure cosine from the end of warmup. What this repo ran before, and
+  #        it wastes the budget: lr is already at 50% of peak by the halfway
+  #        point, so a large `max_epochs` buys mostly anneal, not learning.
+  #   1.0  flat forever. The old `shape: constant`.
   #
-  # `cosine` -- warmup, then anneal to zero at `max_steps`. The HEADLINE shape:
-  # run it once, to completion, at whatever budget exploration settled on.
-  # Do not early-stop it.
+  # Why a hold AND an anneal, rather than either alone. The hold is what buys
+  # representation learning; the anneal is what makes the final number mean
+  # anything. A constant LR does not converge, it orbits in a noise ball whose
+  # radius scales with the LR, and `align_loss` is a difference of the two
+  # views' embeddings -- exactly the quantity a jittering encoder inflates.
+  # Measured: the 25-epoch constant run plateaued at 2.29x its alignment floor,
+  # where the paper's annealed runs sit at 0.976x of theirs. That plateau was an
+  # artefact of the LR, not a ceiling. Symmetrically, a pure cosine anneals away
+  # the LR before the representation has had its high-LR phase.
   #
-  # Implementation note: `constant` is expressed as `eta_min = base_lr`, which
-  # cancels the cosine term rather than adding a second scheduler class. That
-  # makes it silently reversible to a real cosine if the kwarg is ever dropped
-  # in transit, so `VerifyScheduleCallback` reads the realised scheduler back at
-  # train start and raises instead of trusting the dict.
-  shape: constant
+  # Consequences to keep in mind:
+  #   * mid-run checkpoints inside the anneal are NOT comparable to each other,
+  #     since each sits at its own LR. Those in the hold phase ARE. Read the
+  #     trend for its shape, not for the epoch at which it turns over.
+  #   * DO NOT early-stop. The anneal is the payoff and there is no resume
+  #     (`ckpt_path=None` in lejepa.py), so a killed run is not a shorter run,
+  #     it is a checkpoint frozen at peak LR. At 0.5 the whole first half is at
+  #     peak, so killing anywhere in it forfeits the entire anneal.
+  constant_frac: 0.5
 
 model:
   _target_: stable_worldmodel.wm.lejepa.LeJEPA

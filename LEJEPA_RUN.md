@@ -211,13 +211,15 @@ python scripts/train/lejepa.py model.head.output_dim=5
 |---|---|---|
 | `output_model_name` | `lejepa` | Checkpoint subfolder. |
 | `subdir` | `${hydra:job.id}` | Where `config.yaml` / `encoder_hash.txt` go — see the warning below. |
-| `program_constants.lambda` | 5.0e-2 | `loss = λ·sigreg + (1-λ)·align`, **in the paper's units** — `loss.sigreg.kwargs.pool_views: true` is what makes that so. Chosen from App. H.11, the paper's own *pixel* sweep, where Fig. 14 puts 5e-2 best at ρ=0.9 (~0.93 vs ~0.75–0.82 for 1e-3/5e-3/1e-2); Fig. 6 agrees it is in the good region, degrading only from 1e-1. Confirm with a 2-point shakedown before spending the seed budget. |
+| `program_constants.lambda` | 5.0e-2 | `loss = λ·sigreg + (1-λ)·align`, **in the paper's units** — `loss.sigreg.kwargs.pool_views: true` is what makes that so. Chosen from the paper's λ×ρ grid (Fig. 6 / App. H.6) read at **our** ρ. At ρ=0.9 the four candidates are indistinguishable on R²(h→z) — 0.981 / 0.989 / 0.993 / 0.992 for 1e-3 / 5e-3 / 1e-2 / 5e-2 — and separated only by orthogonality error, where 5e-2 is the best in the column: 0.461 / 0.210 / 0.142 / **0.062**. Orthogonality is what our recovery metrics score, so it is the row that decides. App. H.6's *prose* names {1e-3, 5e-3} instead, contradicting its own table at ρ=0.9; the table is what is cited here. 5e-2 degrades only from 1e-1 (0.847), and falls to 0.493 at ρ=0.99 — the collapse `rho: 0.9` stays clear of. Confirm with a 2-point shakedown before spending the seed budget. |
 | `loss.sigreg.kwargs.pool_views` | `true` | Pools both views into one set of 2B samples and scales by 2B, as the paper's own implementation does, instead of a per-view statistic averaged over views. Away from the optimum the two differ by exactly 2× (measured 2.00×), so this is what makes λ comparable to the paper's figures instead of leaving a factor of 2 to be remembered. **LeWM keeps the per-view default** — its baselines were trained under it. |
 | `program_constants.rho` | 0.9 | **Not read here** — it is the collector's knob, carried so the metric writer can copy it verbatim. |
-| `trainer.max_epochs` | 100 | Pure budget knob now that `schedule.warmup_steps` is absolute. |
+| `trainer.max_epochs` | 100 | Pure budget knob now that `schedule.warmup_steps` is absolute. 100 × 703 = 70k steps, ≈1.8× the paper's own Reacher budget. |
+| `schedule.constant_frac` | 0.5 | Fraction of the run held at **peak** lr before the cosine anneal to zero begins — the only shape knob. `0.5` is the paper's recipe (App. H.4: "constant learning rate for the first half of training, followed by cosine decay to zero"); `0.0` is a pure cosine; `1.0` is flat forever. The hold buys representation learning, the anneal makes the final number mean something. A constant lr does not converge, it orbits in a noise ball whose radius scales with the lr, and `align_loss` is a difference of the two views' embeddings — exactly what a jittering encoder inflates: the 25-epoch constant run plateaued at **2.29×** its alignment floor where the paper's annealed runs sit at **0.976×**, so that plateau was an artefact of the lr, not a ceiling. A pure cosine has the mirror problem — half the lr is gone by the halfway point, so a large budget buys mostly anneal. Price of any anneal: checkpoints inside it are not comparable to each other (each sits at its own lr), so read the trend for its shape, not the epoch it turns over — and **do not early-stop**, since at 0.5 the whole first half is at peak and killing in it forfeits the entire anneal. |
+| `schedule.warmup_steps` | 700 | **Absolute**, not 1% of total steps — as a fraction it rode on `max_epochs`, so a 10-epoch run got 70 warmup steps where a 100-epoch run got 703 and no two budgets were comparable. |
 | `trainer.precision` / `.accelerator` | `32` / `gpu` | **Not bf16**: SIGReg's inner term is a difference of two O(1) quantities whose true value is O(1/√B), then multiplied by B. For a CPU smoke run: `trainer.accelerator=cpu trainer.precision=32 trainer.devices=1 loader.num_workers=0 loader.persistent_workers=false loader.prefetch_factor=null`. |
 | `loader.batch_size` | 256 | SIGReg is batch-size-scaled, so its absolute magnitude is not comparable across batch sizes. |
-| `optimizer.lr` / `.weight_decay` | `${encoder_lr}` / `${encoder_weight_decay}` | From the encoder group — 3e-3/1e-4 for the CNN, 5e-5/1e-3 for the ViT. Schedule is hardcoded: linear warmup (1% of steps) + cosine, stepped **per optimizer step**. It used to be `interval: 'epoch'` against a step-counted `max_steps`, which left the whole first epoch at lr exactly 0 and capped the peak at 14% of the configured lr with no annealing at all — see §8 defect 6. |
+| `optimizer.lr` / `.weight_decay` | `${encoder_lr}` / `${encoder_weight_decay}` | From the encoder group — 3e-3/1e-4 for the CNN, 5e-5/1e-3 for the ViT. Schedule is the `schedule` block below (`wm/lejepa/schedule.py::WarmupHoldCosineLR`), stepped **per optimizer step**. It used to be `interval: 'epoch'` against a step-counted `max_steps`, which left the whole first epoch at lr exactly 0 and capped the peak at 14% of the configured lr with no annealing at all — see §8 defect 6. |
 | `encoder` | `paper_cnn` | Config group; also sets `embed_dim`, the head shape and the optimizer (§1). |
 | `img_size` | 224 | Shared by both encoders. `patch_size`, `encoder_scale` and `embed_dim` come from the encoder group. |
 | `model.head.output_dim` | `null` | `null` ⇒ take `n` from the dataset's `latent/z` width, so `m = n` by construction. See below. |
@@ -273,8 +275,13 @@ rather than against zero.
 | `validate/bound/delta_floor` | **validate only** | — | The floor `delta` cannot go below. Compare the two *epoch means*: the per-batch flag is not logged because at 256 pairs it false-alarms on honest batches. |
 | `lr-AdamW` | — | rises through warmup, then flat | From `LearningRateMonitor`, which needs a logger — so it is absent when W&B is off. |
 
-**Kill rules.** The realistic saving is not early-stopping a converging run; it
-is killing a broken one in epoch 1 instead of at the end.
+**Kill rules.** There is no such thing as early-stopping a converging run here.
+The anneal is where `align_loss` actually approaches its floor, there is no
+resume (`ckpt_path=None`), and at `constant_frac: 0.5` the entire first half sits
+at peak lr — so a run killed anywhere in it is not a shorter run, it is a
+checkpoint frozen at peak lr with no anneal at all. The only saving is killing a
+*broken* run in epoch 1 instead of at the end, which is what these rules are
+for.
 
 1. `lr-AdamW` exactly 0 for the whole first epoch → the schedule regressed to
    `interval: 'epoch'`. This has happened in this repo before (§8 defect 6) and
@@ -353,11 +360,11 @@ PyTorch's BatchNorm default `momentum=0.1` is an exponential window of roughly
 of the input marginal over the last ~2.5k frames of training. Under this
 profile's style randomisation — all lighting, both backgrounds, every material
 and colour, resampled per frame — that marginal is extremely heterogeneous and
-ten batches is a noisy sample of it. Under `schedule.shape: constant` the
-weights never stop moving either, so the statistics are permanently *stale*
-relative to them and cannot converge by construction. A cosine anneal to zero
-hides this by letting the weights settle at the end; the exploration schedule
-cannot.
+ten batches is a noisy sample of it. The weights are also still moving when
+any mid-run checkpoint is taken, so its statistics are *stale* relative to them
+as well. The anneal fixes that at the source for the **final** checkpoint, by
+letting the weights settle; at `constant_frac: 1.0` they never settle at all and
+the statistics cannot converge by construction.
 
 Every number reported here is computed through those statistics, so
 `run_metrics.py` does one no-grad pass with the parameters untouched and
@@ -379,6 +386,24 @@ separates two very different findings — a latent the trained MLP recovers and
 the linear probe does not is an encoder that *found* the quantity and failed to
 linearise it; one neither recovers was never seen. Both probes are scored on a
 held-out split, which is what makes them comparable.
+
+> **A circular latent needs two columns, not one.** `cube.yaw` and
+> `effector.yaw` live on a quotient — the cube is C4-symmetric about z, so
+> θ and θ+π/2 are *the same pixels*, and the gripper's jaws repeat at π. Every
+> function of the image is therefore periodic with that period, so the lowest
+> coding available to the encoder is `(cos mθ, sin mθ)` with `m` the symmetry
+> order (4 and 2; `latents.CIRCULAR_ORDER`), **not** `(cos θ, sin θ)` and not θ
+> itself. `probe_circular_per_latent` scores that harmonic pair on the same
+> held-out split as the ordinary probe, so the two are read side by side:
+>
+> | θ probe | harmonic probe | reading |
+> |---|---|---|
+> | ~0 | ~0 | the angle is not represented at all |
+> | ~0 | high | represented in its natural circular coding — the θ probe was the wrong instrument, not the encoder wrong |
+> | high | high | represented and linearised |
+>
+> Without the second column a yaw latent reading 0.000 is unattributable, which
+> is exactly where the 25-epoch run left both of them.
 
 **2. The spectrum.** `canonical_corr` (the σᵢ vector),
 `recovered_dimensions` (`Σσ²`, reading as "how many latents' worth of
@@ -421,6 +446,48 @@ Procrustes floors. `procrustes_floor` is a true lower bound (nothing can beat
 it); `procrustes_floor_whitened` assumes whitening holds and is the realistic
 target, which sampling noise can cross slightly. Report the aggregates against
 these rather than against zero.
+
+### The supervised ceiling — `run_oracle.py`
+
+Every number in a metrics row is conditional on the encoder it was handed, so a
+latent scoring ~0 has three explanations the suite cannot separate: the
+objective did not pick it up, this backbone cannot represent it, or **the
+renderer never put it in the pixels**. In the third case no `f` exists with
+`f(g(z)) = Qz`, the theory's optimum is unreachable by construction, and the
+zero is not a result about LeJEPA at all.
+
+`observability_ceiling` looks like it settles this but cannot: it takes the
+probe scores as an *input*, declares a latent dead because the probe read ~0,
+then reports what the aggregates could reach assuming it stays there. Correct
+as an aggregate correction, circular as an attribution.
+
+```bash
+python scripts/identifiability/run_oracle.py \
+    checkpoint=lejepa/weights_epoch_100.pt
+```
+
+It loads the checkpoint for its **architecture**, re-initialises every
+parameter (logged — a silent zero there would turn the ceiling into a fine-tune
+of the encoder it is supposed to bound), and trains the same network on the
+same pixels with the labels handed to it. `oracle_per_latent` is then an upper
+bound for every row scored on that dataset:
+
+| supervised | LeJEPA | reading |
+|---|---|---|
+| ~0 | ~0 | not in the pixels, or not representable by this backbone — **not a LeJEPA failure** |
+| high | ~0 | the information is there and reachable; the objective did not select it |
+| high | high | recovered |
+
+Two things to hold onto. An **under-trained** oracle reports a ceiling that is
+too *low*, which is the dangerous direction — it would excuse a genuine failure
+as unobservability, so raise `epochs` if the per-latent scores are still
+climbing. And a zero here is jointly about the renderer *and* the backbone; to
+separate those, re-run against a checkpoint with a different encoder, since the
+architecture comes from the checkpoint.
+
+`init=pretrained` keeps the LeJEPA weights and fine-tunes instead. That is a
+different question — how far the learned features get with supervision on top —
+and is **not** a bound on them.
 
 ### The style probe
 
@@ -521,7 +588,7 @@ code.
 | 7 | `style.resample_within_pair` existed in `ogb_cube_single_ou.yaml` and was read **nowhere** — that yaml line was its only occurrence in the repo, so style was always resampled per view with no way to turn it off | Wired through `collect_pairs`, recorded in the manifest, and covered by `test_style_may_be_shared_across_a_pair`. Setting it false gives the theory's literal deterministic `x = g(z)` as a control arm |
 | 8 | `excluded` latents were simply never written — `content_payload` handles content axes and `sample_style` handles style axes — so an excluded axis held whatever the opening `reset(options={'variation': ['all']})` drew for it. Since `base_seed` differs per shard, a sharded collection held a **different constant in every shard**: a nuisance perfectly correlated with shard identity, and recorded nowhere | `excluded_payload` pins every excluded variation axis to its axis's `init_value` on every frame, and the manifest records the values as `excluded_pinned` |
 | 10 | The val loader set `drop_last: False`, but SIGReg's statistic is multiplied by the batch size, so the short tail batch (32 of 256 at 20k val samples) reported ~1/8 the statistic and dragged `validate/sigreg_loss_epoch` | `drop_last` stays True on val |
-| 11 | `λ = 3e-3` was read off Fig. 6's 2-D grid, and the repo's per-view SIGReg made it **1.5e-3 in the paper's units** — ~30× below App. H.11's best *pixel* setting at ρ=0.9, and only ~15× above the λ < 1e-4 band Fig. 6 shows fails at every ρ. Wrong side to err on, given `trace_cov` starts near 1.4 against n=10 | `pool_views: true` puts λ in the paper's units, and `λ = 5e-2` matches Fig. 14's best pixel setting at ρ=0.9 |
+| 11 | `λ = 3e-3` was read off Fig. 6's 2-D grid, and the repo's per-view SIGReg made it **1.5e-3 in the paper's units** — ~30× below the grid's best setting at ρ=0.9, and only ~15× above the λ < 1e-4 band Fig. 6 shows fails at every ρ. Wrong side to err on, given `trace_cov` starts near 1.4 against n=10 | `pool_views: true` puts λ in the paper's units, and `λ = 5e-2` is Fig. 6's best orthogonality error at ρ=0.9 (0.062, against 0.142 / 0.210 / 0.461 for 1e-2 / 5e-3 / 1e-3) |
 | 12 | `cube.color` and `background.floor_rgb` are both uniform on [0,1]³ and drawn independently, so the cube occasionally rendered the same colour as the floor and vanished — an undeclared occlusion, and a real injectivity failure, since two cube positions then give the same image. Measured: 4.9% of draws below an L∞ gap of 0.2 | `style.min_contrast: 0.2` redraws those, ~4.9% rejection, style mean essentially unchanged (0.541 → 0.563). Recorded in the manifest as `min_contrast` / `contrast_floor_applies`, and **automatically disabled, loudly, under any profile where `cube.color` is content** — rejecting on a content coordinate would truncate a marginal that is supposed to be Gaussian |
 | — | The camera cannot be reframed: it is a pick-and-place frame and must see the whole workspace. So the cube stays at 20×20 px (0.78% of frame) and `cube.pos_xy`'s x component keeps only ~27 px of travel | **Not fixable — report it.** Expect per-dimension recovery on `cube.pos_xy[0]` to trail `[1]` (27 px vs 96 px of travel) and on `cube.pos_z` to trail both. That is a property of `g`, not of the encoder: Thm 1 quantifies over all measurable `h`, so framing affects reachability and δ, never the optimum. Score those dimensions with a stated ceiling rather than letting them drag the aggregate |
 

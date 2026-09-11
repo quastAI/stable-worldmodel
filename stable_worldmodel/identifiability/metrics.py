@@ -36,7 +36,10 @@ inevitable rather than as a bad run.
 import numpy as np
 
 
-METRIC_SUITE_VERSION = '2.0.0'
+# 2.1.0 added `probe_circular` (the harmonic read-out for quotient-valued
+# angles) and `has_circular_probe`. Additive: every 2.0.0 key is unchanged, so
+# rows of both versions are comparable on everything they share.
+METRIC_SUITE_VERSION = '2.1.0'
 
 #: Per-latent linear R^2 below this counts a coordinate as unrecovered when
 #: computing the observability ceiling. Not a gate on anything -- it only
@@ -391,6 +394,89 @@ def probe_accessibility(
     }
     if names is not None:
         result['probe_latent_names'] = list(names)
+    return result
+
+
+def probe_circular(h, angles, orders, names=None, holdout=0.2, seed=0):
+    """Per-latent read-out of a circular latent's natural harmonic pair.
+
+    The ordinary linear probe in :func:`probe_accessibility` asks whether
+    ``theta`` itself is linearly readable from ``h``. That is a fair question --
+    each angle is sampled on a fundamental domain, where ``theta`` is
+    single-valued -- but it is not the only coding the encoder could have
+    found, and on its own a score of zero is ambiguous.
+
+    An angle whose physical configuration repeats with period ``2 pi / m``
+    produces *identical pixels* at ``theta`` and ``theta + 2 pi / m``, so every
+    function of the image is periodic with that period and the lowest harmonics
+    available to the encoder are ``cos(m theta)`` and ``sin(m theta)``. A
+    representation built from those is the natural one, and a linear probe for
+    ``theta`` reads it as noise. See
+    :data:`~stable_worldmodel.identifiability.latents.CIRCULAR_ORDER` for the
+    orders and why they are what they are.
+
+    Read the two side by side:
+
+    ===============  ==============  =========================================
+    ``theta`` probe  harmonic probe  reading
+    ===============  ==============  =========================================
+    ~0               ~0              the angle is not represented at all
+    ~0               high            represented, in its natural circular
+                                     coding -- the ``theta`` probe was the
+                                     wrong instrument, not the encoder wrong
+    high             high            represented and linearised
+    ===============  ==============  =========================================
+
+    Scored on the **same** held-out split as :func:`probe_accessibility` given
+    the same ``seed`` and ``holdout``, so the two columns are comparable row
+    for row. The harmonic target is two-dimensional, so its ``R^2`` is one
+    global sum-of-squares ratio over both components, matching :func:`r2`.
+
+    Args:
+        h: ``(B, m)`` embeddings, produced in eval mode.
+        angles: ``(B, k)`` the circular latents in **radians**, not z-space.
+        orders: ``k`` integer symmetry orders, one per column of ``angles``.
+        names: Optional names of the ``k`` circular latents.
+        holdout: Fraction of rows held out. Must match
+            :func:`probe_accessibility` for the columns to be comparable.
+        seed: Seed for the split. Must likewise match.
+
+    Returns:
+        dict: ``probe_circular_per_latent``, ``probe_circular_r2`` (the mean),
+        ``probe_circular_orders`` and, when given, ``probe_circular_names``.
+    """
+    h = _as2d(h)
+    angles = _as2d(angles)
+    orders = [int(m) for m in orders]
+    if angles.shape[1] != len(orders):
+        raise ValueError(
+            f'got {angles.shape[1]} angle columns and {len(orders)} orders'
+        )
+
+    train, test = _holdout(len(h), holdout, seed)
+    design = np.concatenate([h[test], np.ones((len(test), 1))], axis=1)
+
+    per_latent = []
+    for j, order in enumerate(orders):
+        phase = order * angles[:, j]
+        target = np.column_stack([np.cos(phase), np.sin(phase)])
+        solution, _ = _lstsq_with_intercept(h[train], target[train])
+        prediction = design @ solution
+
+        truth = target[test]
+        ss_res = ((truth - prediction) ** 2).sum()
+        ss_tot = ((truth - truth.mean(axis=0)) ** 2).sum()
+        per_latent.append(float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0)
+
+    result = {
+        'probe_circular_per_latent': per_latent,
+        'probe_circular_r2': (
+            float(np.mean(per_latent)) if per_latent else float('nan')
+        ),
+        'probe_circular_orders': orders,
+    }
+    if names is not None:
+        result['probe_circular_names'] = list(names)
     return result
 
 
@@ -784,6 +870,9 @@ def compute_all(
     seed=0,
     h_style_a=None,
     h_style_b=None,
+    circular_angles=None,
+    circular_orders=None,
+    circular_names=None,
 ):
     """Run the whole suite on one ``(z, h)`` pair of matrices.
 
@@ -802,6 +891,12 @@ def compute_all(
             well, and without it ``delta`` cannot be split and the bound
             charges style leakage to nonlinearity.
         h_style_b: The other view of that same probe set.
+        circular_angles: ``(B, k)`` circular latents in **radians**. Without
+            them the harmonic probe is absent rather than zero, and a circular
+            latent scoring ~0 on the ordinary probe stays ambiguous between
+            "not represented" and "represented in its natural coding".
+        circular_orders: ``k`` symmetry orders matching those columns.
+        circular_names: ``k`` names, for a self-describing row.
 
     Returns:
         dict: Every metric, flat, plus ``metric_suite_version``.
@@ -815,6 +910,19 @@ def compute_all(
     out.update(spectrum(h))
     out.update(sigreg_z_score(h, seed=seed))
     out.update(probe_accessibility(h, z, names=names, seed=seed))
+    out['has_circular_probe'] = (
+        circular_angles is not None and circular_orders is not None
+    )
+    if out['has_circular_probe']:
+        out.update(
+            probe_circular(
+                h,
+                circular_angles,
+                circular_orders,
+                names=circular_names,
+                seed=seed,
+            )
+        )
     out.update(
         observability_ceiling(
             out['probe_linear_per_latent'], out['trace_cov'], _as2d(z).shape[1]
@@ -875,6 +983,7 @@ __all__ = [
     'orthogonality_gap',
     'predicted_error',
     'probe_accessibility',
+    'probe_circular',
     'procrustes_recovery',
     'r2',
     'sigreg_z_score',

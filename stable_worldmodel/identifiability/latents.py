@@ -145,6 +145,28 @@ DEFAULT_YAW_HALF_ARC = 0.95 * YAW_FUNDAMENTAL_HALF_ARC
 # pi, i.e. [-pi/2, pi/2].
 EFFECTOR_YAW_HALF_ARC = np.pi / 2
 
+#: Symmetry order of each circular latent: how many times its physical
+#: configuration repeats around one full turn, i.e. ``2 * pi / period``.
+#:
+#: This is what a *representation* of the angle has to respect, and it is why a
+#: plain ``(cos theta, sin theta)`` read-out is the wrong probe here. Because
+#: ``theta`` and ``theta + period`` are the same physical state -- identical
+#: pixels -- any function of the image is periodic with that period, so the
+#: lowest harmonics available to the encoder are ``cos(m theta)`` and
+#: ``sin(m theta)``, not ``cos theta`` and ``sin theta``.
+#:
+#: Over the sampled fundamental domain ``m * theta`` covers (almost) exactly one
+#: full circle, so the harmonic pair is a non-degenerate coordinate there:
+#: ``cube.yaw`` spans ``m*theta`` in ``+-0.95 pi`` and ``effector.yaw`` in
+#: ``+-pi``. ``theta`` itself is *also* single-valued on that domain, which is
+#: why the ordinary linear probe is not wrong -- it just asks a different
+#: question. Scoring both is what separates "the angle is not represented" from
+#: "the angle is represented in its natural circular coding".
+CIRCULAR_ORDER = {
+    'cube.yaw': 4,  # C4 about z: period pi/2
+    'effector.yaw': 2,  # jaws symmetric under pi: period pi
+}
+
 
 def _box(low, high, dim):
     return (
@@ -872,6 +894,7 @@ PROFILES = {'physical_content': PHYSICAL_CONTENT_PROFILE}
 
 
 __all__ = [
+    'CIRCULAR_ORDER',
     'NOT_CONTENT_CAPABLE',
     'PHYSICAL_CONTENT_PROFILE',
     'PROFILES',

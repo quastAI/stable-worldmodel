@@ -55,6 +55,10 @@ from stable_worldmodel.wm.lejepa.losses import (
     whitening_loss,
 )
 from stable_worldmodel.wm.lejepa.module import state_dict_hash
+from stable_worldmodel.wm.lejepa.schedule import (
+    WarmupHoldCosineLR,
+    schedule_kwargs,
+)
 from stable_worldmodel.wm.loss import SIGReg
 from stable_worldmodel.wm.utils import save_pretrained
 
@@ -166,13 +170,16 @@ class VerifyScheduleCallback(Callback):
     the whole first epoch at lr exactly 0, capped the peak at 14% of the
     configured value, and nothing logged it.
 
-    ``schedule.shape: constant`` opens a second door to the same failure. It is
-    expressed as ``eta_min == base_lr`` -- an ordinary constructor kwarg -- so a
-    wrapper that quietly drops unknown scheduler kwargs would hand back a real
-    cosine annealing to zero, and the run would look entirely healthy for 100
-    epochs before its trend turned out to be an artefact of the LR. Nothing in
-    the repo currently passes an extra scheduler kwarg, so the pass-through is
-    unproven; this reads the constructed scheduler back and asserts instead.
+    The shape now rides on ``hold_steps`` (see
+    :func:`~stable_worldmodel.wm.lejepa.schedule.schedule_kwargs`), which cannot
+    silently degrade into a different shape the way the old
+    ``eta_min == base_lr`` encoding of ``constant`` could. What is still worth
+    asserting is that the kwargs *arrived*: they travel through
+    ``spt``'s ``create_scheduler``, and a dropped ``hold_steps`` would turn the
+    paper's recipe into a pure cosine -- a run that looks entirely healthy for
+    100 epochs before its trend turns out to be an artefact of the LR. This
+    reads the constructed scheduler back and raises instead of trusting the
+    dict.
 
     Args:
         expected: Scheduler attributes to check, by name.
@@ -207,7 +214,7 @@ class VerifyScheduleCallback(Callback):
                 if got is None:
                     raise RuntimeError(
                         f'scheduler has no attribute {key!r} -- the kwarg did '
-                        'not reach LinearWarmupCosineAnnealingLR'
+                        'not reach WarmupHoldCosineLR'
                     )
                 if abs(float(got) - float(want)) > 1e-12:
                     raise RuntimeError(
@@ -372,38 +379,26 @@ def run(cfg):
 
     total_steps = cfg.trainer.max_epochs * len(train)
 
-    # Warmup is an ABSOLUTE step count, not `int(0.01 * total_steps)`. As a
-    # fraction it rode on `trainer.max_epochs`, so changing the budget also
-    # changed the ramp: at 703 steps/epoch a 10-epoch run got 70 warmup steps
-    # where a 100-epoch run got 703, and no two budgets were comparable.
-    warmup_steps = max(1, min(int(cfg.schedule.warmup_steps), total_steps - 1))
-
-    base_lr = float(cfg.optimizer.lr)
-    if cfg.schedule.shape == 'constant':
-        # LinearWarmupCosineAnnealingLR interpolates
-        #   eta_min + (base_lr - eta_min) * (1 + cos(pi * progress)) / 2,
-        # so eta_min == base_lr zeroes the cosine term and the lr is flat after
-        # warmup. Cheaper than a second scheduler class, and verified at train
-        # start rather than assumed -- see VerifyScheduleCallback.
-        eta_min = base_lr
-    elif cfg.schedule.shape == 'cosine':
-        eta_min = 0.0
-    else:
-        raise ValueError(
-            f'schedule.shape must be "constant" or "cosine", '
-            f'got {cfg.schedule.shape!r}'
-        )
+    # `schedule.warmup_steps` is an ABSOLUTE step count, not
+    # `int(0.01 * total_steps)`: as a fraction it rode on `trainer.max_epochs`,
+    # so changing the budget also changed the ramp -- at 703 steps/epoch a
+    # 10-epoch run got 70 warmup steps where a 100-epoch run got 703, and no two
+    # budgets were comparable. `schedule_kwargs` clamps it to total_steps - 1.
+    #
+    # Warmup, a hold at the peak, then cosine to zero -- one scheduler, with the
+    # shape set by `constant_frac` alone (0.5 = the paper's App. H.4 recipe,
+    # 0.0 = pure cosine, 1.0 = flat forever). Passed as a `partial` because
+    # spt's `create_scheduler` calls a partial with the optimizer directly,
+    # which is what lets a scheduler outside its registry be used at all.
+    sched = schedule_kwargs(
+        cfg.schedule.warmup_steps, total_steps, cfg.schedule.constant_frac
+    )
 
     optimizers = {
         'model_opt': {
             'modules': 'model',
             'optimizer': dict(cfg.optimizer),
-            'scheduler': {
-                'type': 'LinearWarmupCosineAnnealingLR',
-                'warmup_steps': warmup_steps,
-                'max_steps': total_steps,
-                'eta_min': eta_min,
-            },
+            'scheduler': partial(WarmupHoldCosineLR, **sched),
             # 'step', NOT 'epoch'. `total_steps` is counted in optimizer steps
             # (max_epochs * len(train)), so on 'epoch' the scheduler advances
             # once per epoch and its counter only ever reaches `max_epochs` --
@@ -466,15 +461,7 @@ def run(cfg):
             )
         )
     callbacks.append(RecordCkptDirCallback(run_dir))
-    callbacks.append(
-        VerifyScheduleCallback(
-            {
-                'warmup_steps': warmup_steps,
-                'max_steps': total_steps,
-                'eta_min': eta_min,
-            }
-        )
-    )
+    callbacks.append(VerifyScheduleCallback(sched))
 
     if logger is not None:
         # The schedule is the one thing here that has already failed silently:

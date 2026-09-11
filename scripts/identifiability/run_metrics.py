@@ -53,6 +53,9 @@ import stable_worldmodel as swm  # noqa: E402
 from stable_worldmodel.identifiability import metrics as ident_metrics  # noqa: E402
 from stable_worldmodel.identifiability import results as ident_results  # noqa: E402
 from stable_worldmodel.identifiability.collect import load_manifest  # noqa: E402
+from stable_worldmodel.identifiability.latents import (  # noqa: E402
+    CIRCULAR_ORDER,
+)
 from stable_worldmodel.wm.lejepa.module import state_dict_hash  # noqa: E402
 from stable_worldmodel.wm.utils import load_pretrained  # noqa: E402
 
@@ -143,6 +146,55 @@ def latent_names(manifest):
             else [f'{latent["name"]}[{i}]' for i in range(width)]
         )
     return names
+
+
+def circular_targets(manifest, z):
+    """The circular latents of ``z``, in radians, with their symmetry orders.
+
+    An angle sampled on a fundamental domain has two defensible read-outs and
+    the suite reports both -- see
+    :func:`~stable_worldmodel.identifiability.metrics.probe_circular` for why a
+    score of zero on the ordinary probe is ambiguous without this one.
+
+    The conversion is the registry's own affine, read out of the manifest
+    rather than by rebuilding the registry (which would need the environment):
+    ``physical = center + (half_span / sigma_span) * z``, clipped to the
+    declared bounds exactly as :meth:`LatentRegistry.to_physical` does.
+
+    Returns:
+        tuple: ``(angles, orders, names)`` with ``angles`` of shape ``(B, k)``
+        in radians, or ``(None, None, None)`` when the profile has no circular
+        content latent.
+    """
+    described = manifest.get('latents', {})
+    sigma_span = float(described.get('sigma_span', 3.0))
+
+    angles, orders, names = [], [], []
+    offset = 0
+    for latent in described.get('latents', []):
+        width = int(latent.get('dim', 1))
+        if latent.get('role') != 'content':
+            continue
+        order = CIRCULAR_ORDER.get(latent['name'])
+        if order is not None:
+            low = np.asarray(latent['low'], dtype=np.float64).reshape(-1)
+            high = np.asarray(latent['high'], dtype=np.float64).reshape(-1)
+            center = 0.5 * (low + high)
+            half_span = 0.5 * (high - low)
+            for i in range(width):
+                raw = (
+                    center[i] + (half_span[i] / sigma_span) * z[:, offset + i]
+                )
+                angles.append(np.clip(raw, low[i], high[i]))
+                orders.append(order)
+                names.append(
+                    latent['name'] if width == 1 else f'{latent["name"]}[{i}]'
+                )
+        offset += width
+
+    if not angles:
+        return None, None, None
+    return np.column_stack(angles), orders, names
 
 
 @torch.no_grad()
@@ -282,6 +334,15 @@ def run(cfg: DictConfig):
         model, dataset, int(cfg.max_samples), device
     )
 
+    circular_angles, circular_orders, circular_names = circular_targets(
+        manifest, z
+    )
+    if circular_angles is not None:
+        logging.info(
+            f'harmonic probe armed for {circular_names} '
+            f'(orders {circular_orders})'
+        )
+
     scores = ident_metrics.compute_all(
         z,
         h,
@@ -291,6 +352,9 @@ def run(cfg: DictConfig):
         seed=int(cfg.seed),
         h_style_a=h_style_a,
         h_style_b=h_style_b,
+        circular_angles=circular_angles,
+        circular_orders=circular_orders,
+        circular_names=circular_names,
     )
 
     _report(scores)
@@ -341,6 +405,27 @@ def _report(scores):
         f'dead latents (linear R2 < {ident_metrics.DEAD_LATENT_R2}): '
         f'{[names[i] for i in scores["dead_latents"]]}'
     )
+
+    if scores.get('has_circular_probe'):
+        logging.info('circular latents (theta | harmonic read-out):')
+        by_name = dict(zip(names, scores['probe_linear_per_latent']))
+        for name, order, harmonic in zip(
+            scores['probe_circular_names'],
+            scores['probe_circular_orders'],
+            scores['probe_circular_per_latent'],
+        ):
+            theta = by_name.get(name, float('nan'))
+            if harmonic > 0.25 and harmonic > theta + 0.15:
+                verdict = (
+                    f'CIRCULAR CODING (m={order}), theta probe misreads it'
+                )
+            elif max(theta, harmonic) < 0.05:
+                verdict = 'not represented in either coding'
+            else:
+                verdict = 'linearised'
+            logging.info(
+                f'  {name:<20s} {theta:+.4f} | {harmonic:+.4f}   {verdict}'
+            )
     logging.info(
         f'recovered {scores["recovered_dimensions"]:.2f} of '
         f'{scores["trace_cov"]:.2f} embedding dimensions across '

@@ -1,0 +1,50 @@
+# Supervised ceiling on what this architecture can read from these pixels.
+# See scripts/identifiability/run_oracle.py for what the numbers mean and,
+# more importantly, what they do NOT mean.
+
+# Loaded for its ARCHITECTURE, not its weights: `init: scratch` re-initialises
+# every parameter. Pointing this at the checkpoint under test is what keeps the
+# ceiling and the measurement architecturally identical.
+checkpoint: ???
+
+# Must be the dataset the encoder was scored on, or the ceiling bounds a
+# different set of pixels than the one the row was measured against.
+profile: physical_content
+ou_dataset: ogbench/cube_single_ou_${profile}.lance
+
+# `scratch` -- reset every parameter and learn from labels. The ceiling.
+# `pretrained` -- keep the LeJEPA weights and fine-tune. A different question:
+#   how far the learned features get with supervision on top. NOT a bound.
+init: scratch
+
+# Written to the same store as run_metrics.py rows, distinguished by
+# `probe_kind`. One file, so a ceiling and the row it bounds are joinable on
+# (checkpoint, dataset, seed).
+results_path: outputs/lejepa_results.jsonl
+
+# Recorded verbatim into the row, as in metrics.yaml. Not read by anything here
+# -- the oracle has no objective of its own -- but a row without them cannot be
+# matched to the run it bounds.
+program_constants:
+  rho: 0.9
+  lambda: 5.0e-2
+
+# Supervised regression converges far faster than the SSL objective, so this is
+# a short run. Raise `epochs` if the per-latent scores are still climbing: an
+# under-trained oracle reports a ceiling that is too LOW, which is the
+# dangerous direction -- it would excuse a genuine LeJEPA failure as
+# unobservability.
+epochs: 20
+batch_size: 256
+lr: 3.0e-3
+weight_decay: 1.0e-4
+warmup_steps: 200
+# Same shape as training, for the same reason: the ceiling must not be
+# handicapped by a worse schedule than the thing it bounds.
+constant_frac: 0.5
+
+# 20000 pairs -> 40000 labelled frames, both views used as independent samples.
+max_samples: 20000
+holdout: 0.2
+seed: 3072
+device: cuda
