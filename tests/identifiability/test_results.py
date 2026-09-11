@@ -200,6 +200,72 @@ def test_loading_a_missing_table_is_empty_not_an_error(tmp_path):
     assert results.load_rows(tmp_path / 'nope.jsonl') == []
 
 
+def test_oracle_row_does_not_erase_the_metrics_row_it_bounds(tmp_path):
+    """A live regression: `run_oracle.py` writes to the same file, same
+    (checkpoint, dataset), as the `run_metrics.py` row it joins to. Keying
+    the dedup on `(checkpoint, dataset)` alone made the later-appended oracle
+    row silently overwrite the metrics row -- both rows survived in the file,
+    only one survived `load_rows`.
+    """
+    path = tmp_path / 'results.jsonl'
+    results.append_row(
+        path, build(metrics={**METRICS, 'probe_linear_r2': 0.36})
+    )
+    results.append_row(
+        path,
+        build(
+            metrics={
+                'metric_suite_version': '2.1.0',
+                'probe_kind': 'oracle_supervised_scratch',
+                'oracle_r2': 0.83,
+            },
+            bn_recalibrated=False,
+        ),
+    )
+
+    rows = results.load_rows(path)
+    assert len(rows) == 2
+    kinds = {r.get('probe_kind') for r in rows}
+    assert kinds == {None, 'oracle_supervised_scratch'}
+    metrics_row = next(r for r in rows if r.get('probe_kind') is None)
+    assert metrics_row['probe_linear_r2'] == 0.36
+
+
+def test_recalibrated_and_non_recalibrated_rows_both_survive(tmp_path):
+    """The comparison that catches BN recalibration distorting a reading
+    needs both variants to survive scoring the same checkpoint twice.
+    """
+    path = tmp_path / 'results.jsonl'
+    results.append_row(
+        path, build(bn_recalibrated=True, metrics={**METRICS, 'L': 0.98})
+    )
+    results.append_row(
+        path, build(bn_recalibrated=False, metrics={**METRICS, 'L': 5.45})
+    )
+
+    rows = results.load_rows(path)
+    assert len(rows) == 2
+    by_recal = {r['bn_recalibrated']: r['L'] for r in rows}
+    assert by_recal == {True: 0.98, False: 5.45}
+
+
+def test_true_rescore_at_the_same_identity_still_dedups(tmp_path):
+    """The original intent is preserved: an exact re-run (same checkpoint,
+    dataset, probe_kind, bn_recalibrated) is a correction, not a new
+    measurement, and only the latest should read back.
+    """
+    path = tmp_path / 'results.jsonl'
+    results.append_row(
+        path, build(bn_recalibrated=True, metrics={**METRICS, 'L': 1.0})
+    )
+    results.append_row(
+        path, build(bn_recalibrated=True, metrics={**METRICS, 'L': 2.0})
+    )
+    rows = results.load_rows(path)
+    assert len(rows) == 1
+    assert rows[0]['L'] == 2.0
+
+
 def test_schema_version_is_on_every_row():
     """A schema change must be visible rather than silently mixing rows."""
     assert build()['schema_version'] == results.SCHEMA_VERSION

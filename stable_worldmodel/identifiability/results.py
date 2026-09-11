@@ -183,9 +183,23 @@ def load_rows(path, latest_only=True):
 
     Args:
         path: The JSONL file.
-        latest_only: Keep only the last row per ``(checkpoint, dataset)``,
-            which is what an append-only table means when a checkpoint has
-            been re-scored.
+        latest_only: Keep only the last row per identity key -- see below --
+            which is what an append-only table means when something has been
+            re-scored.
+
+    The identity key is ``(checkpoint, dataset, probe_kind, bn_recalibrated)``,
+    not just ``(checkpoint, dataset)``. Two rows can legitimately share a
+    checkpoint and dataset while measuring different things:
+    ``run_oracle.py`` writes to the same file as ``run_metrics.py`` (that is
+    what makes a ceiling row joinable to the rows it bounds -- see
+    ``run_oracle.py``'s module docstring), distinguished only by
+    ``probe_kind``; and a checkpoint scored once with BatchNorm recalibrated
+    and once without -- the comparison that catches recalibration itself
+    distorting a reading -- is distinguished only by ``bn_recalibrated``.
+    Keying on ``(checkpoint, dataset)`` alone made the later-appended row
+    silently overwrite the earlier one whenever those coincided, which is how
+    an oracle row erased its own metrics row here on a live run: both rows
+    survived in the file, but only the oracle row survived this function.
 
     Returns:
         list: Rows, in file order (or last-per-key order when deduplicated).
@@ -203,7 +217,13 @@ def load_rows(path, latest_only=True):
 
     seen = {}
     for row in rows:
-        seen[(row.get('checkpoint'), row.get('dataset'))] = row
+        key = (
+            row.get('checkpoint'),
+            row.get('dataset'),
+            row.get('probe_kind'),
+            row.get('bn_recalibrated'),
+        )
+        seen[key] = row
     return list(seen.values())
 
 
